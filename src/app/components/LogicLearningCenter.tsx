@@ -5,6 +5,7 @@ import { Brain, TrendingUp, Zap, AlertCircle, Edit, Power } from 'lucide-react';
 import { motion } from 'motion/react';
 import { useNavigate } from 'react-router';
 import { useState } from 'react';
+import { CategoryManagementDialog } from './CategoryManagementDialog';
 
 interface LogicRule {
   id: string;
@@ -68,6 +69,11 @@ export function LogicLearningCenter() {
   const navigate = useNavigate();
   const [selectedRule, setSelectedRule] = useState<LogicRule | null>(null);
   const [showEditModal, setShowEditModal] = useState(false);
+  const [rules, setRules] = useState<LogicRule[]>(mockLogicRules);
+
+  const handleDisable = (id: string) => {
+    setRules(prev => prev.filter(r => r.id !== id));
+  };
 
   return (
     <div className="min-h-screen p-6 space-y-6" style={{ background: '#000000' }}>
@@ -83,6 +89,10 @@ export function LogicLearningCenter() {
         </div>
 
         <div className="flex items-center gap-3">
+          <CategoryManagementDialog onCategoryCreated={() => {
+            // Optionally refresh data here
+            console.log('Category created successfully');
+          }} />
           <Button variant="outline" className="border-white/10 hover:bg-white/5 text-white">
             <Brain className="size-4 mr-2" />
             Retrain AI
@@ -189,7 +199,7 @@ export function LogicLearningCenter() {
           <CardTitle className="text-white">Logic Rules</CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          {mockLogicRules.map((rule, index) => (
+          {rules.map((rule, index) => (
             <motion.div
               key={rule.id}
               initial={{ opacity: 0, x: -20 }}

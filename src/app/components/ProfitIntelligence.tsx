@@ -12,16 +12,16 @@ function mapDeptProfitability(dp: DepartmentProfitability): Department {
   return {
     id: dp.departmentId,
     name: dp.departmentName,
-    costPerHour: dp.costPerHour,
+    costPerHour: dp.costPerHour ?? 0,
     teamMembers: dp.headcount,
     monthlyRevenue: dp.revenue,
     monthlyCost: dp.directCosts,
     monthlyProfit: dp.netProfit,
-    profitMargin: dp.profitMargin,
+    profitMargin: dp.profitMargin ?? 0,
     overheadAllocation: dp.allocatedOverhead,
     billableHours: dp.billableHours,
-    totalHours: dp.totalHours,
-    utilization: dp.utilization,
+    totalHours: dp.totalHours ?? 0,
+    utilization: dp.utilization ?? 0,
   };
 }
 
@@ -593,14 +593,7 @@ export function ProfitIntelligence() {
                       cx="50%"
                       cy="50%"
                       labelLine={false}
-                      label={(entry) => {
-                        return {
-                          content: `${entry.department}: ${entry.profitMargin.toFixed(1)}%`,
-                          fill: theme === 'dark' ? '#ffffff' : '#1e293b',
-                          fontSize: 12,
-                          fontWeight: 600,
-                        };
-                      }}
+                      label={(entry: any) => `${entry.department}: ${Number(entry.profitMargin || 0).toFixed(1)}%`}
                       outerRadius={80}
                       fill="#8884d8"
                       dataKey="netProfit"

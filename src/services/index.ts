@@ -60,18 +60,40 @@ export { accountService } from './accountService';
 export { assetService } from './assetService';
 export { inventoryService } from './inventoryService';
 export { budgetService } from './budgetService';
-export { reportService } from './reportService';
+export { getReportService, reportService } from './reportService';
+export type { ReportService } from './reportService';
 export { classificationService } from './classificationService';
 export { patternEngineService } from './patternEngineService';
 export { notificationService } from './notificationService';
 export { importService } from './importService';
 export { platformService } from './platformService';
 export type { PlatformStats, PlatformPlan, PlatformOrgMeta, BillingStats } from './platformService';
+export { platformOrganizationService } from './platformOrganizationService';
+export type {
+  PlatformOrganization,
+  PlatformOrgStatus,
+  PlatformOrgLimits,
+  CreatePlatformOrganizationInput,
+  UpdatePlatformOrganizationInput,
+  OrganizationChangeEvent,
+  RealtimeStatus,
+} from './platformOrganizationService';
 export { recurringTransactionService } from './recurringTransactionService';
 export { auditService } from './auditService';
 export type { AuditLogEntry } from './auditService';
 export { employeeService } from './employeeService';
 export type { Expense, Payslip, TimesheetEntry, TeamMember, Announcement } from './employeeService';
+export { aiAssistantService } from './aiAssistantService';
+export type {
+  AIFinancialSituation,
+  AIProjection,
+  AIProjections,
+  AIInsight,
+  FinancialPattern,
+  AIAnalysisData,
+  AIChatResponse,
+  AIAssistantStatus,
+} from './aiAssistantService';
 
 // HTTP client (API-000) — use when `isHttpBackendConfigured()`; else services use `dataStore`
 export {

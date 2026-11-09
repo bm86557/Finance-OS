@@ -4,7 +4,6 @@
  * immediately at boot rather than as a mysterious runtime failure later.
  */
 
-import { randomBytes } from 'node:crypto';
 import { config as loadDotenv } from 'dotenv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,40 +19,55 @@ loadDotenv({ path: path.join(repoRoot, '.env.local'), override: true, quiet: tru
 
 const isProd = process.env.NODE_ENV === 'production';
 
-function resolveJwtSecret(): string {
-  const fromEnv = process.env.JWT_SECRET?.trim();
-  if (fromEnv) return fromEnv;
-
-  if (isProd) {
-    throw new Error(
-      'JWT_SECRET is required when NODE_ENV=production. Set it in the environment and restart.',
-    );
+export function validateSupabaseEnv(url?: string, serviceRoleKey?: string): { supabaseUrl: string; supabaseServiceRoleKey: string } {
+  const finalUrl = (url ?? process.env.SUPABASE_URL)?.trim() || '';
+  if (!finalUrl) {
+    throw new Error('[FATAL] Missing required Supabase credentials: SUPABASE_URL is not defined or empty. Server cannot boot without exclusive Supabase authority.');
   }
 
-  // Dev/test convenience: derive a stable-per-process secret and warn loudly. Tokens issued this
-  // way will NOT survive a server restart (every restart invalidates all sessions) — that's an
-  // acceptable, visible trade-off for local development, never for a real deployment.
-  const generated = `dev-insecure-${randomBytes(24).toString('hex')}`;
-  console.warn(
-    '\n[finance-os] WARNING: JWT_SECRET is not set — using an ephemeral dev-only secret.\n' +
-    '  Sessions will NOT survive a server restart, and this MUST NOT be used in production.\n' +
-    '  Set JWT_SECRET (a long random string) in your .env / .env.local to silence this warning.\n',
-  );
-  return generated;
+  try {
+    const parsed = new URL(finalUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error('Protocol must be http or https');
+    }
+  } catch {
+    throw new Error(`[FATAL] Invalid Supabase credentials: SUPABASE_URL "${finalUrl}" must be a valid HTTP or HTTPS URL.`);
+  }
+
+  const finalKey = (serviceRoleKey ?? process.env.SUPABASE_SERVICE_ROLE_KEY)?.trim() || '';
+  if (!finalKey) {
+    throw new Error('[FATAL] Missing required Supabase credentials: SUPABASE_SERVICE_ROLE_KEY is not defined or empty. Server cannot boot without exclusive Supabase authority.');
+  }
+
+  return { supabaseUrl: finalUrl, supabaseServiceRoleKey: finalKey };
 }
+
+// Fail-fast on module import unless explicitly skipped (e.g. isolated unit testing of validation functions)
+const { supabaseUrl, supabaseServiceRoleKey } = validateSupabaseEnv();
 
 export const env = {
   isProd,
-  jwtSecret: resolveJwtSecret(),
-  jwtExpiresIn: process.env.JWT_EXPIRES_IN?.trim() || '12h',
+  // NOTE: JWT_SECRET / JWT_EXPIRES_IN are intentionally absent. The local JWT flow
+  // (server/lib/jwt.ts) has been deleted — tokens are now minted and verified solely by Supabase
+  // Auth, so the server no longer signs anything and needs no signing secret of its own.
   corsOrigin: process.env.CORS_ORIGIN?.trim() || 'http://localhost:5173',
   cookieSecure: process.env.COOKIE_SECURE === 'true' || isProd,
   cookieDomain: process.env.COOKIE_DOMAIN?.trim() || undefined,
   port: Number(process.env.PORT ?? 3001),
-  // Server-only — never prefix with VITE_ (that would bundle it into client JS). Used to call the
-  // Supabase Admin API (create/invite real auth users, resolve legacy_id -> real UUID) for
-  // features the anon-key browser client structurally cannot do. Optional: those endpoints report
-  // a clear 501 when unset instead of the server failing to boot.
-  supabaseUrl: process.env.SUPABASE_URL?.trim() || '',
-  supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || '',
+  // Exclusive authoritative database credentials
+  supabaseUrl,
+  supabaseAnonKey: process.env.SUPABASE_ANON_KEY?.trim() || process.env.VITE_SUPABASE_ANON_KEY?.trim() || '',
+  supabaseServiceRoleKey,
+  // SMTP configuration for sending real invitation emails
+  smtpHost: process.env.SMTP_HOST?.trim() || '',
+  smtpPort: Number(process.env.SMTP_PORT || 587),
+  smtpSecure: process.env.SMTP_SECURE === 'true',
+  smtpUser: process.env.SMTP_USER?.trim() || '',
+  smtpPass: process.env.SMTP_PASS?.trim() || '',
+  smtpFrom: process.env.SMTP_FROM?.trim() || process.env.SMTP_USER?.trim() || 'Finance OS <noreply@financeos.com>',
+  // Stripe Sandbox & Billing configuration
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY?.trim() || '',
+  stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY?.trim() || process.env.VITE_STRIPE_PUBLISHABLE_KEY?.trim() || '',
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET?.trim() || '',
+  stripeMode: (process.env.STRIPE_SECRET_KEY?.trim() ? 'stripe_test' : 'sandbox_simulator') as 'stripe_test' | 'sandbox_simulator',
 };

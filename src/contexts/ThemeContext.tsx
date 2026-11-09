@@ -7,7 +7,9 @@ interface ThemeContextType {
   toggleTheme: () => void;
 }
 
-const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
+const THEME_CONTEXT_KEY = Symbol.for('finance_os.theme_context');
+export const ThemeContext = ((globalThis as any)[THEME_CONTEXT_KEY] ||
+  ((globalThis as any)[THEME_CONTEXT_KEY] = createContext<ThemeContextType | undefined>(undefined))) as React.Context<ThemeContextType | undefined>;
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [theme, setTheme] = useState<Theme>(() => {

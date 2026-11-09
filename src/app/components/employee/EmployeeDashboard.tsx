@@ -1,9 +1,10 @@
+import { useState } from 'react';
 import { motion } from 'motion/react';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { PageShell, PageHeader } from '../layout';
 import { 
   DollarSign, Clock, Briefcase, TrendingUp,
-  AlertCircle, FileText, Bell, ChevronRight, Activity
+  AlertCircle, FileText, Bell, ChevronRight, Activity, CheckCircle, CheckSquare, Layers
 } from 'lucide-react';
 import { employeeService } from '@/services/employeeService';
 import { useService } from '@/hooks/useService';
@@ -55,11 +56,11 @@ function KPICard({ title, value, subtitle, icon: Icon, color, delay }: {
 
 export function EmployeeDashboard() {
   const { user, currentOrganization } = useAuth();
-  const orgId = currentOrganization?.id ?? 'org-001';
+  const orgId = currentOrganization?.id || '';
   const userId = user?.id ?? '';
 
   const { data: dashData, loading, error } = useService(
-    () => employeeService.getDashboardSummary(orgId, userId),
+    () => (orgId && userId ? employeeService.getDashboardSummary(orgId, userId) : Promise.resolve({ success: true, data: null })),
     [orgId, userId],
     ['expenses', 'timesheets', 'payslips', 'announcements'],
   );
@@ -80,7 +81,9 @@ export function EmployeeDashboard() {
     recentActivity: dashData?.recentActivity ?? [],
     weeklyHours: dashData?.weeklyHours ?? [],
     announcements: dashData?.announcements ?? [],
+    projectNotifications: dashData?.projectNotifications ?? [],
   };
+  const [notifFilter, setNotifFilter] = useState<'all' | 'projects' | 'announcements'>('all');
   const hoursPercent = data.hoursTarget > 0 ? (data.hoursThisWeek / data.hoursTarget) * 100 : 0;
   const taskPercent = data.totalTasks > 0 ? (data.completedTasks / data.totalTasks) * 100 : 0;
   const hoursRemaining = Math.max(0, data.hoursTarget - data.hoursThisWeek);
@@ -88,6 +91,12 @@ export function EmployeeDashboard() {
     data.hoursThisWeek >= data.hoursTarget && data.hoursTarget > 0
       ? 'Target met for this week'
       : `${hoursRemaining.toFixed(1)}h remaining`;
+
+  const workWeekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
+  const displayWeeklyHours = workWeekDays.map(dayName => {
+    const found = data.weeklyHours.find(d => d.day.toLowerCase() === dayName.toLowerCase());
+    return { day: dayName, hours: found ? found.hours : 0 };
+  });
 
   if (error && !dashData) {
     return (
@@ -142,7 +151,7 @@ export function EmployeeDashboard() {
           color="purple"
           delay={0.2}
         />
-        <KPICard title="LAST NET PAY" value={`$${data.salary.net.toLocaleString()}`} subtitle={data.lastPayPeriod || 'Latest'} icon={TrendingUp} color="green" delay={0.25} />
+        <KPICard title="LAST NET PAY" value={`${data.salary.net.toLocaleString()}`} subtitle={data.lastPayPeriod || 'No payslip issued yet'} icon={TrendingUp} color="green" delay={0.25} />
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
@@ -160,7 +169,7 @@ export function EmployeeDashboard() {
           <div className="flex items-center justify-between mb-6">
             <div>
               <h3 className={AXIOM.typography.sectionTitle}>Weekly Hours</h3>
-              <p className={AXIOM.typography.monoMuted}>This week (Mon–Sun)</p>
+              <p className={AXIOM.typography.monoMuted}>This week (Mon–Fri)</p>
             </div>
             <div className="flex items-center gap-2">
               <div className="px-3 py-1.5 rounded-lg text-xs font-mono" style={{
@@ -174,12 +183,9 @@ export function EmployeeDashboard() {
           </div>
 
           <div className="flex items-end gap-3 h-48">
-            {(data.weeklyHours.length ? data.weeklyHours : [
-              { day: 'Mon', hours: 0 }, { day: 'Tue', hours: 0 }, { day: 'Wed', hours: 0 },
-              { day: 'Thu', hours: 0 }, { day: 'Fri', hours: 0 }, { day: 'Sat', hours: 0 }, { day: 'Sun', hours: 0 },
-            ]).map((day, i) => {
-              const maxH = 8.5;
-              const pct = (day.hours / maxH) * 100;
+            {displayWeeklyHours.map((day, i) => {
+              const maxVal = Math.max(8.5, ...displayWeeklyHours.map(d => d.hours));
+              const pct = Math.min((day.hours / maxVal) * 100, 100);
               return (
                 <motion.div
                   key={day.day}
@@ -207,10 +213,7 @@ export function EmployeeDashboard() {
             })}
           </div>
           <div className="flex gap-3 mt-3">
-            {(data.weeklyHours.length ? data.weeklyHours : [
-              { day: 'Mon', hours: 0 }, { day: 'Tue', hours: 0 }, { day: 'Wed', hours: 0 },
-              { day: 'Thu', hours: 0 }, { day: 'Fri', hours: 0 }, { day: 'Sat', hours: 0 }, { day: 'Sun', hours: 0 },
-            ]).map((day) => (
+            {displayWeeklyHours.map((day) => (
               <div key={day.day} className="flex-1 text-center text-xs text-slate-400 font-mono">{day.day}</div>
             ))}
           </div>
@@ -233,7 +236,7 @@ export function EmployeeDashboard() {
           </div>
         </motion.div>
 
-        {/* Announcements */}
+        {/* Notifications & Project Updates */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -244,39 +247,134 @@ export function EmployeeDashboard() {
             borderRadius: '1rem',
           }}
         >
-          <div className="flex items-center gap-2 mb-6">
-            <Bell className="size-5 text-purple-400" />
-            <h3 className="text-white font-bold">Announcements</h3>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <Bell className="size-5 text-purple-400" />
+              <h3 className="text-white font-bold">Notifications</h3>
+            </div>
+            {/* Filter Pills */}
+            <div className="flex items-center gap-1 bg-black/40 p-1 rounded-lg border border-white/5 text-[11px] font-mono">
+              <button
+                type="button"
+                onClick={() => setNotifFilter('all')}
+                className={`px-2 py-0.5 rounded transition-colors ${notifFilter === 'all' ? 'bg-purple-500/30 text-purple-200 border border-purple-500/40' : 'text-slate-400 hover:text-white'}`}
+              >
+                All ({data.projectNotifications.length + data.announcements.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setNotifFilter('projects')}
+                className={`px-2 py-0.5 rounded transition-colors ${notifFilter === 'projects' ? 'bg-blue-500/30 text-blue-200 border border-blue-500/40' : 'text-slate-400 hover:text-white'}`}
+              >
+                Projects ({data.projectNotifications.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setNotifFilter('announcements')}
+                className={`px-2 py-0.5 rounded transition-colors ${notifFilter === 'announcements' ? 'bg-amber-500/30 text-amber-200 border border-amber-500/40' : 'text-slate-400 hover:text-white'}`}
+              >
+                News ({data.announcements.length})
+              </button>
+            </div>
           </div>
 
-          <div className="space-y-3">
-            {data.announcements.length === 0 && (
-              <p className="text-sm text-slate-500 font-mono">No announcements right now.</p>
-            )}
-            {data.announcements.map((item, i) => (
-              <motion.div
-                key={item.id}
-                initial={{ opacity: 0, x: 10 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: 0.4 + i * 0.1 }}
-                className="p-3 rounded-lg cursor-pointer hover:bg-white/5 transition-colors"
-                style={{
-                  background: 'rgba(0, 0, 0, 0.3)',
-                  border: item.urgent ? '1px solid rgba(245, 158, 11, 0.3)' : '1px solid rgba(148, 163, 184, 0.1)',
-                }}
-              >
-                <div className="flex items-start gap-3">
-                  {item.urgent && (
-                    <AlertCircle className="size-4 text-amber-400 mt-0.5 shrink-0" />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm text-white truncate">{item.title}</p>
-                    <p className="text-xs text-slate-400 font-mono mt-1">{item.date}</p>
+          <div className="space-y-2.5 max-h-[300px] overflow-y-auto pr-1">
+            {/* Unified Notification List */}
+            {(() => {
+              const items: Array<{
+                id: string;
+                title: string;
+                subtitle?: string;
+                date: string;
+                category: 'project' | 'announcement';
+                urgent?: boolean;
+                link?: string;
+              }> = [];
+
+              if (notifFilter === 'all' || notifFilter === 'projects') {
+                for (const pn of data.projectNotifications) {
+                  items.push({
+                    id: pn.id,
+                    title: pn.title,
+                    subtitle: pn.projectName ? `${pn.projectName} • ${pn.message}` : pn.message,
+                    date: pn.date,
+                    category: 'project',
+                    urgent: pn.urgent,
+                    link: pn.link || '/employee?tab=timesheet',
+                  });
+                }
+              }
+
+              if (notifFilter === 'all' || notifFilter === 'announcements') {
+                for (const a of data.announcements) {
+                  items.push({
+                    id: a.id,
+                    title: a.title,
+                    subtitle: 'Company Announcement',
+                    date: a.date,
+                    category: 'announcement',
+                    urgent: a.urgent,
+                    link: '/employee?tab=announcements',
+                  });
+                }
+              }
+
+              if (items.length === 0) {
+                return (
+                  <p className="text-sm text-slate-500 font-mono py-4 text-center">
+                    No notifications in this view.
+                  </p>
+                );
+              }
+
+              return items.map((item, i) => (
+                <motion.div
+                  key={item.id}
+                  initial={{ opacity: 0, x: 10 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: 0.35 + i * 0.05 }}
+                  onClick={() => {
+                    if (item.link) window.location.href = item.link;
+                  }}
+                  className="p-3 rounded-lg cursor-pointer hover:bg-white/5 transition-colors group"
+                  style={{
+                    background: 'rgba(0, 0, 0, 0.3)',
+                    border: item.urgent
+                      ? '1px solid rgba(245, 158, 11, 0.3)'
+                      : item.category === 'project'
+                        ? '1px solid rgba(59, 130, 246, 0.2)'
+                        : '1px solid rgba(148, 163, 184, 0.1)',
+                  }}
+                >
+                  <div className="flex items-start gap-3">
+                    {item.urgent ? (
+                      <AlertCircle className="size-4 text-amber-400 mt-0.5 shrink-0" />
+                    ) : item.category === 'project' ? (
+                      <Briefcase className="size-4 text-blue-400 mt-0.5 shrink-0" />
+                    ) : (
+                      <Bell className="size-4 text-purple-400 mt-0.5 shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded ${
+                          item.category === 'project'
+                            ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
+                            : 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                        }`}>
+                          {item.category === 'project' ? 'PROJECT' : 'ANNOUNCEMENT'}
+                        </span>
+                        <p className="text-sm text-white truncate font-medium">{item.title}</p>
+                      </div>
+                      {item.subtitle && (
+                        <p className="text-xs text-slate-400 font-mono mt-1 truncate">{item.subtitle}</p>
+                      )}
+                      <p className="text-[10px] text-slate-500 font-mono mt-0.5">{item.date}</p>
+                    </div>
+                    <ChevronRight className="size-4 text-slate-500 group-hover:text-white transition-colors shrink-0" />
                   </div>
-                  <ChevronRight className="size-4 text-slate-500 shrink-0" />
-                </div>
-              </motion.div>
-            ))}
+                </motion.div>
+              ));
+            })()}
           </div>
 
           {data.totalTasks > 0 && (

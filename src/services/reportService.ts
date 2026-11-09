@@ -1,317 +1,579 @@
 /**
- * Financial Reporting Service
- * ============================
- * Generates P&L, balance sheet, cash flow, and agency-specific reports.
- *
- * When `VITE_API_BASE_URL` is set, uses org-scoped REST routes under `/reports`; otherwise `dataStore`.
+ * Report Service - Production-ready financial reports using Supabase
+ * All calculations are organization-specific and use real data
  */
 
-import { isHttpBackendConfigured, apiGet } from '@/lib/apiClient';
-import { dataStore, simulateDelay } from './dataStore';
-import type { ServiceResponse, ProfitLossReport, DashboardSummary, CashFlowSummary } from './types';
+import type { 
+  ProfitLossReport, 
+  BalanceSheetReport,
+  CashFlowReport,
+  DepartmentProfitability,
+  ExpenseBreakdown,
+  RevenueBreakdown,
+  DashboardSummary,
+  CashFlowForecast,
+  ServiceResponse
+} from './types';
+import { getSupabaseClient } from '@/lib/supabaseClient';
 
-const REP = (organizationId: string) =>
-  `/organizations/${encodeURIComponent(organizationId)}/reports`;
-
-/** Whole months between the earliest and latest of the given ISO dates, floored at 1 so a burn
- *  rate divisor never hits 0 (and never overstates burn for orgs with under a month of history). */
-function monthsSpannedByDates(dates: string[]): number {
-  const times = dates.map(d => new Date(d).getTime()).filter(t => !Number.isNaN(t));
-  if (times.length === 0) return 1;
-  const spanMs = Math.max(...times) - Math.min(...times);
-  const months = spanMs / (1000 * 60 * 60 * 24 * 30.44);
-  return Math.max(1, Math.round(months));
+export interface DateRange {
+  from?: string;
+  to?: string;
 }
 
-function requireOrg<T>(organizationId: string): ServiceResponse<T> | null {
-  if (!organizationId.trim()) {
-    return { success: false, data: null as unknown as T, error: 'organizationId required' };
+export class ReportService {
+  private baseUrl: string;
+  private cache = new Map<string, { data: any; timestamp: number }>();
+  private readonly TTL_MS = 30_000;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/+$/, '');
   }
-  return null;
-}
 
-export type ExpenseBreakdownRow = {
-  categoryId: string;
-  categoryName: string;
-  amount: number;
-  percentage: number;
-  color: string;
-  transactionCount: number;
-};
-
-export type RevenueBreakdownRow = {
-  projectId: string;
-  projectName: string;
-  clientName: string;
-  revenue: number;
-  percentage: number;
-};
-
-export type ForecastReport = {
-  forecasts: { date: string; income: number; expenses: number; net: number; confidence: number }[];
-  currentCash: number;
-  projectedCash: number;
-  burnRate: number;
-  runway: number;
-};
-
-export const reportService = {
-  async getDashboardSummary(organizationId: string): Promise<ServiceResponse<DashboardSummary>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<DashboardSummary>(organizationId);
-      if (err) return err;
-      return apiGet<DashboardSummary>(`${REP(organizationId)}/dashboard`);
+  /** Invalidate in-memory cache for an organization or all entries */
+  invalidateCache(organizationId?: string): void {
+    if (organizationId) {
+      for (const key of this.cache.keys()) {
+        if (key.includes(organizationId)) {
+          this.cache.delete(key);
+        }
+      }
+    } else {
+      this.cache.clear();
     }
+  }
 
-    await simulateDelay(200);
+  private getCached<T>(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.timestamp > this.TTL_MS) {
+      this.cache.delete(key);
+      return null;
+    }
+    return entry.data as T;
+  }
 
-    const txns = dataStore.transactions.filter(t => t.organizationId === organizationId);
-    const accounts = dataStore.accounts.filter(a => a.organizationId === organizationId);
+  private setCached<T>(key: string, data: T): void {
+    this.cache.set(key, { data, timestamp: Date.now() });
+  }
 
-    const totalRevenue = txns.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
-    const totalExpenses = txns.filter(t => t.type === 'debit').reduce((s, t) => s + Math.abs(t.amount), 0);
-    const netProfit = totalRevenue - totalExpenses;
-    const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
+  /** Attaches the Supabase bearer token so Supabase-backed `/api/v1` routes resolve the caller. */
+  private async authHeaders(): Promise<HeadersInit> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    try {
+      const sb = getSupabaseClient();
+      if (sb) {
+        const { data: { session } } = await sb.auth.getSession();
+        if (session?.access_token) {
+          headers['Authorization'] = `Bearer ${session.access_token}`;
+        }
+      }
+    } catch {
+      /* ignore — request proceeds without a token */
+    }
+    return headers;
+  }
 
-    const cashAccounts = accounts.filter(a => a.subtype === 'bank_account' || a.subtype === 'current_asset');
-    const cashOnHand = cashAccounts.reduce((s, a) => s + a.balance, 0);
+  private async unwrap<T>(response: Response): Promise<T> {
+    if (!response.ok) {
+      // Try to get detailed error from response body
+      let errorMessage = `HTTP ${response.status} ${response.statusText}`;
+      try {
+        const errorData = await response.json();
+        console.error('[ReportService.unwrap] Error response:', errorData);
+        if (errorData?.error) {
+          errorMessage = errorData.error;
+        } else if (errorData?.message) {
+          errorMessage = errorData.message;
+        }
+      } catch (parseErr) {
+        console.error('[ReportService.unwrap] Failed to parse error response:', parseErr);
+      }
+      throw new Error(errorMessage);
+    }
+    
+    try {
+      const json = await response.json();
+      console.log('[ReportService.unwrap] Success response:', json);
+      
+      // Handle both wrapped and unwrapped responses
+      if (json && typeof json === 'object' && 'data' in json) {
+        return json.data as T;
+      }
+      return json as T;
+    } catch (parseErr) {
+      console.error('[ReportService.unwrap] Failed to parse success response:', parseErr);
+      throw new Error('Failed to parse response JSON');
+    }
+  }
 
-    const arAccount = accounts.find(a => a.name.toLowerCase().includes('receivable'));
-    const apAccount = accounts.find(a => a.name.toLowerCase().includes('payable'));
-
-    const pendingTransactions = txns.filter(t => t.status === 'pending').length;
-
-    return {
-      success: true,
-      data: {
-        totalRevenue,
-        totalExpenses,
-        netProfit,
-        profitMargin: Math.round(profitMargin * 10) / 10,
-        cashOnHand,
-        accountsReceivable: arAccount?.balance || 0,
-        accountsPayable: apAccount?.balance || 0,
-        pendingTransactions,
-        revenueChange: 12.7,
-        expenseChange: 8.3,
-        profitChange: 16.7,
-      },
-    };
-  },
-
+  /**
+   * Get Profit & Loss Statement
+   * Returns revenue, COGS, operating expenses, and net income
+   */
   async getProfitLoss(
     organizationId: string,
-    dateFrom?: string,
-    dateTo?: string,
-  ): Promise<ServiceResponse<ProfitLossReport>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<ProfitLossReport>(organizationId);
-      if (err) return err;
-      const q = new URLSearchParams();
-      if (dateFrom) q.set('dateFrom', dateFrom);
-      if (dateTo) q.set('dateTo', dateTo);
-      const qs = q.toString();
-      return apiGet<ProfitLossReport>(`${REP(organizationId)}/profit-loss${qs ? `?${qs}` : ''}`);
+    dateRange?: DateRange
+  ): Promise<ProfitLossReport> {
+    const cacheKey = `pl:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cached = this.getCached<ProfitLossReport>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    if (dateRange?.from) params.set('dateFrom', dateRange.from);
+    if (dateRange?.to) params.set('dateTo', dateRange.to);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/profit-loss?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<ProfitLossReport>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Balance Sheet
+   * Returns assets, liabilities, and equity as of a specific date
+   */
+  async getBalanceSheet(
+    organizationId: string,
+    asOfDate?: string
+  ): Promise<BalanceSheetReport> {
+    const cacheKey = `bs:${organizationId}:${asOfDate || ''}`;
+    const cached = this.getCached<BalanceSheetReport>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    if (asOfDate) params.set('asOfDate', asOfDate);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/balance-sheet?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<BalanceSheetReport>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Cash Flow Statement
+   * Returns monthly cash inflows, outflows, and net cash flow
+   */
+  async getCashFlow(
+    organizationId: string,
+    months: number = 6,
+    dateRange?: DateRange
+  ): Promise<CashFlowReport[]> {
+    const cacheKey = `cf:${organizationId}:${months}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cached = this.getCached<CashFlowReport[]>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    params.set('months', String(months));
+    if (dateRange?.from) params.set('dateFrom', dateRange.from);
+    if (dateRange?.to) params.set('dateTo', dateRange.to);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/cash-flow?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<CashFlowReport[]>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Department P&L Analysis
+   * Returns profitability breakdown by department
+   */
+  async getDepartmentProfitability(
+    organizationId: string,
+    dateRange?: DateRange
+  ): Promise<DepartmentProfitability[]> {
+    const cacheKey = `dept:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cached = this.getCached<DepartmentProfitability[]>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    if (dateRange?.from) params.set('dateFrom', dateRange.from);
+    if (dateRange?.to) params.set('dateTo', dateRange.to);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/department-profitability?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<DepartmentProfitability[]>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Expense Breakdown by Category
+   * Returns expenses grouped by category with percentages
+   */
+  async getExpenseBreakdown(
+    organizationId: string,
+    dateRange?: DateRange
+  ): Promise<ExpenseBreakdown[]> {
+    const cacheKey = `exp:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cached = this.getCached<ExpenseBreakdown[]>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    if (dateRange?.from) params.set('dateFrom', dateRange.from);
+    if (dateRange?.to) params.set('dateTo', dateRange.to);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/expense-breakdown?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<ExpenseBreakdown[]>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Revenue Breakdown by Project
+   * Returns revenue grouped by project with percentages
+   */
+  async getRevenueBreakdown(
+    organizationId: string,
+    dateRange?: DateRange
+  ): Promise<RevenueBreakdown[]> {
+    const cacheKey = `rev:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cached = this.getCached<RevenueBreakdown[]>(cacheKey);
+    if (cached) return cached;
+
+    const params = new URLSearchParams();
+    if (dateRange?.from) params.set('dateFrom', dateRange.from);
+    if (dateRange?.to) params.set('dateTo', dateRange.to);
+
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/revenue-breakdown?${params}`,
+      { headers: await this.authHeaders() }
+    );
+
+    const data = await this.unwrap<RevenueBreakdown[]>(response);
+    this.setCached(cacheKey, data);
+    return data;
+  }
+
+  /**
+   * Get Dashboard Summary
+   * Returns current period summary with month-over-month changes
+   */
+  async getDashboardSummary(
+    organizationId: string,
+    options?: { world?: 'business' | 'personal' | 'all' }
+  ): Promise<ServiceResponse<DashboardSummary>> {
+    const cacheKey = `dash:${organizationId}:${options?.world || 'business'}`;
+    const cached = this.getCached<DashboardSummary>(cacheKey);
+    if (cached) return { success: true, data: cached };
+
+    try {
+      const response = await fetch(
+        `${this.baseUrl}/organizations/${organizationId}/reports/dashboard${options?.world ? `?world=${options.world}` : ''}`,
+        { headers: await this.authHeaders() }
+      );
+
+      const data = await this.unwrap<DashboardSummary>(response);
+      this.setCached(cacheKey, data);
+      return { success: true, data };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to fetch dashboard summary';
+      return { success: false, data: null as any, error: message };
     }
+  }
 
-    await simulateDelay(300);
+  /**
+   * Get Cash Flow Forecast
+   * Returns projected cash position, burn rate, runway, and daily forecast rows
+   */
+  async getForecast(
+    organizationId: string,
 
-    const accounts = dataStore.accounts.filter(a => a.organizationId === organizationId && a.isActive);
-    const incomeAccounts = accounts.filter(a => a.type === 'income');
-    const cogsAccounts = accounts.filter(a => a.subtype === 'cogs');
-    const opexAccounts = accounts.filter(a => a.type === 'expense' && a.subtype !== 'cogs');
+    monthsAhead: number = 3
+  ): Promise<{ kpis: Record<string, unknown>; forecasts: CashFlowForecast[] }> {
+    const horizonDays = monthsAhead * 30;
+    const params = new URLSearchParams();
+    params.set('horizonDays', String(horizonDays));
+    params.set('scenario', 'realistic');
 
-    const totalRevenue = incomeAccounts.reduce((s, a) => s + a.balance, 0);
-    const totalCOGS = cogsAccounts.reduce((s, a) => s + a.balance, 0);
-    const grossProfit = totalRevenue - totalCOGS;
-    const totalOpex = opexAccounts.reduce((s, a) => s + a.balance, 0);
-    const operatingIncome = grossProfit - totalOpex;
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast?${params}`,
+      { headers: await this.authHeaders() }
+    );
 
-    return {
-      success: true,
-      data: {
-        period: `${dateFrom || 'FY Start'} to ${dateTo || 'Current'}`,
-        revenue: incomeAccounts.map(a => ({ accountId: a.id, name: a.name, amount: a.balance })),
-        cogs: cogsAccounts.map(a => ({ accountId: a.id, name: a.name, amount: a.balance })),
-        operatingExpenses: opexAccounts.map(a => ({ accountId: a.id, name: a.name, amount: a.balance })),
-        totalRevenue,
-        totalCOGS,
-        grossProfit,
-        totalOperatingExpenses: totalOpex,
-        operatingIncome,
-        netIncome: operatingIncome,
-      },
-    };
-  },
+    return this.unwrap(response);
+  }
 
-  async getCashFlow(organizationId: string, months: number = 6): Promise<ServiceResponse<CashFlowSummary[]>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<CashFlowSummary[]>(organizationId);
-      if (err) return err;
-      const q = new URLSearchParams();
-      q.set('months', String(months));
-      return apiGet<CashFlowSummary[]>(`${REP(organizationId)}/cash-flow?${q.toString()}`);
+  /**
+   * Export report data to CSV
+   * @param reportType - Type of report to export
+   * @param data - Report data to export
+   * @returns CSV string
+   */
+  exportToCSV(reportType: string, data: any): string {
+    switch (reportType) {
+      case 'profit-loss':
+        return this.exportProfitLossToCSV(data);
+      case 'balance-sheet':
+        return this.exportBalanceSheetToCSV(data);
+      case 'cash-flow':
+        return this.exportCashFlowToCSV(data);
+      case 'department-pl':
+        return this.exportDepartmentPLToCSV(data);
+      default:
+        throw new Error(`Unknown report type: ${reportType}`);
     }
+  }
 
-    await simulateDelay(200);
-
-    const txns = dataStore.transactions.filter(t => t.organizationId === organizationId);
-
-    const monthMap = new Map<string, { inflow: number; outflow: number }>();
-    const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-    for (const txn of txns) {
-      const date = new Date(txn.date);
-      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
-      const existing = monthMap.get(key) || { inflow: 0, outflow: 0 };
-
-      if (txn.type === 'credit') {
-        existing.inflow += txn.amount;
-      } else {
-        existing.outflow += Math.abs(txn.amount);
-      }
-      monthMap.set(key, existing);
-    }
-
-    const result: CashFlowSummary[] = Array.from(monthMap.entries())
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(-months)
-      .map(([key, data]) => {
-        const monthIdx = parseInt(key.split('-')[1]) - 1;
-        return {
-          month: monthNames[monthIdx] || key,
-          inflow: Math.round(data.inflow),
-          outflow: Math.round(data.outflow),
-          net: Math.round(data.inflow - data.outflow),
-        };
+  private exportProfitLossToCSV(data: ProfitLossReport): string {
+    let csv = 'Profit & Loss Statement\n';
+    const periodStr = typeof data.period === 'string' ? data.period : `${(data.period as any)?.from || ''} to ${(data.period as any)?.to || ''}`;
+    csv += `Period: ${periodStr}\n\n`;
+    
+    csv += 'Category,Account,Amount\n';
+    
+    // Revenue
+    csv += 'Revenue,,\n';
+    if (Array.isArray(data.revenue)) {
+      data.revenue.forEach((item: any) => {
+        csv += `,${item.name},${item.amount}\n`;
       });
-
-    if (result.length < months) {
-      const supplemental: CashFlowSummary[] = [
-        { month: 'Jan', inflow: 125000, outflow: 89000, net: 36000 },
-        { month: 'Feb', inflow: 142000, outflow: 95000, net: 47000 },
-        { month: 'Mar', inflow: 138000, outflow: 92000, net: 46000 },
-        { month: 'Apr', inflow: 165000, outflow: 102000, net: 63000 },
-        { month: 'May', inflow: 158000, outflow: 98000, net: 60000 },
-        { month: 'Jun', inflow: 178000, outflow: 108000, net: 70000 },
-      ];
-      return { success: true, data: supplemental.slice(0, months) };
     }
-
-    return { success: true, data: result };
-  },
-
-  async getExpenseBreakdown(organizationId: string): Promise<ServiceResponse<ExpenseBreakdownRow[]>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<ExpenseBreakdownRow[]>(organizationId);
-      if (err) return err;
-      return apiGet<ExpenseBreakdownRow[]>(`${REP(organizationId)}/expense-breakdown`);
+    csv += `,Total Revenue,${data.totalRevenue}\n\n`;
+    
+    // COGS
+    csv += 'Cost of Goods Sold,,\n';
+    if (Array.isArray(data.cogs)) {
+      data.cogs.forEach((item: any) => {
+        csv += `,${item.name},${item.amount}\n`;
+      });
     }
+    csv += `,Total COGS,${data.totalCOGS}\n`;
+    csv += `,Gross Profit,${data.grossProfit}\n\n`;
+    
+    // Operating Expenses
+    csv += 'Operating Expenses,,\n';
+    if (Array.isArray(data.operatingExpenses)) {
+      data.operatingExpenses.forEach((item: any) => {
+        csv += `,${item.name},${item.amount}\n`;
+      });
+    }
+    csv += `,Total Operating Expenses,${data.totalOperatingExpenses}\n`;
+    csv += `,Operating Income,${data.operatingIncome}\n`;
+    csv += `,Net Income,${data.netIncome}\n`;
+    
+    return csv;
+  }
 
-    await simulateDelay();
+  private exportBalanceSheetToCSV(data: BalanceSheetReport): string {
+    let csv = 'Balance Sheet\n';
+    csv += `As of: ${data.asOfDate}\n\n`;
+    
+    csv += 'Category,Account,Amount\n';
+    
+    // Assets
+    csv += 'Assets,,\n';
+    if (Array.isArray(data.assets)) {
+      data.assets.forEach((item: any) => {
+        csv += `,${item.name},${item.balance}\n`;
+      });
+    }
+    csv += `,Total Assets,${data.totalAssets}\n\n`;
+    
+    // Liabilities
+    csv += 'Liabilities,,\n';
+    if (Array.isArray(data.liabilities)) {
+      data.liabilities.forEach((item: any) => {
+        csv += `,${item.name},${item.balance}\n`;
+      });
+    }
+    csv += `,Total Liabilities,${data.totalLiabilities}\n\n`;
+    
+    // Equity
+    csv += 'Equity,,\n';
+    if (Array.isArray(data.equity)) {
+      data.equity.forEach((item: any) => {
+        csv += `,${item.name},${item.balance}\n`;
+      });
+    }
+    csv += `,Total Equity,${data.totalEquity}\n`;
+    
+    return csv;
+  }
 
-    const txns = dataStore.transactions.filter(
-      t => t.organizationId === organizationId && t.type === 'debit',
+  private exportCashFlowToCSV(data: CashFlowReport[]): string {
+    let csv = 'Cash Flow Statement\n\n';
+    csv += 'Month,Inflow,Outflow,Net\n';
+    
+    data.forEach(item => {
+      csv += `${item.month},${item.inflow},${item.outflow},${item.net}\n`;
+    });
+    
+    return csv;
+  }
+
+  private exportDepartmentPLToCSV(data: DepartmentProfitability[]): string {
+    let csv = 'Department P&L Analysis\n\n';
+    csv += 'Department,Revenue,Expenses,Profit,Margin %,Headcount\n';
+    
+    data.forEach(dept => {
+      const expenses = (dept as any).expenses ?? (dept.directCosts + (dept.allocatedOverhead || 0));
+      const profit = (dept as any).profit ?? dept.netProfit;
+      csv += `${dept.departmentName},${dept.revenue},${expenses},${profit},${dept.profitMargin},${dept.headcount}\n`;
+    });
+    
+    return csv;
+  }
+
+  /**
+   * Get Reconciliation Summary & Equations status (§15)
+   */
+  async getReconciliationSummary(organizationId: string): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/reconciliation-summary`,
+      { headers: await this.authHeaders() }
     );
-    const categories = dataStore.categories.filter(c => c.organizationId === organizationId);
+    return this.unwrap(response);
+  }
 
-    const totalExpenses = txns.reduce((s, t) => s + Math.abs(t.amount), 0);
-
-    const breakdown = categories
-      .filter(c => c.type === 'expense')
-      .map(cat => {
-        const catTxns = txns.filter(t => t.categoryId === cat.id);
-        const amount = catTxns.reduce((s, t) => s + Math.abs(t.amount), 0);
-        return {
-          categoryId: cat.id,
-          categoryName: cat.name,
-          amount,
-          percentage: totalExpenses > 0 ? Math.round((amount / totalExpenses) * 1000) / 10 : 0,
-          color: cat.color,
-          transactionCount: catTxns.length,
-        };
-      })
-      .sort((a, b) => b.amount - a.amount);
-
-    return { success: true, data: breakdown };
-  },
-
-  async getRevenueBreakdown(organizationId: string): Promise<ServiceResponse<RevenueBreakdownRow[]>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<RevenueBreakdownRow[]>(organizationId);
-      if (err) return err;
-      return apiGet<RevenueBreakdownRow[]>(`${REP(organizationId)}/revenue-breakdown`);
-    }
-
-    await simulateDelay();
-
-    const txns = dataStore.transactions.filter(
-      t => t.organizationId === organizationId && t.type === 'credit',
+  /**
+   * Get Client Profitability Rollup
+   */
+  async getClientProfitability(organizationId: string): Promise<any[]> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/profitability/clients`,
+      { headers: await this.authHeaders() }
     );
-    const projects = dataStore.projects.filter(p => p.organizationId === organizationId);
-    const totalRevenue = txns.reduce((s, t) => s + t.amount, 0);
+    return this.unwrap(response);
+  }
 
-    const breakdown = projects.map(proj => {
-      const projTxns = txns.filter(t => t.projectId === proj.id);
-      const revenue = projTxns.reduce((s, t) => s + t.amount, 0);
-      return {
-        projectId: proj.id,
-        projectName: proj.name,
-        clientName: proj.clientName,
-        revenue,
-        percentage: totalRevenue > 0 ? Math.round((revenue / totalRevenue) * 1000) / 10 : 0,
-      };
-    }).sort((a, b) => b.revenue - a.revenue);
+  /**
+   * Get Profit Forecast (Recognized / Accrued Revenue & Costs)
+   */
+  async getProfitForecast(
+    organizationId: string,
+    scenario = 'realistic',
+    horizonMonths = 6
+  ): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/profit?scenario=${scenario}&horizonMonths=${horizonMonths}`,
+      { headers: await this.authHeaders() }
+    );
+    return this.unwrap(response);
+  }
 
-    return { success: true, data: breakdown };
-  },
+  /**
+   * Get Capacity Forecast (Hours, Rates & Utilization)
+   */
+  async getCapacityForecast(
+    organizationId: string,
+    scenario = 'realistic',
+    horizonMonths = 6
+  ): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/capacity?scenario=${scenario}&horizonMonths=${horizonMonths}`,
+      { headers: await this.authHeaders() }
+    );
+    return this.unwrap(response);
+  }
 
-  async getForecast(organizationId: string, monthsAhead: number = 3): Promise<ServiceResponse<ForecastReport>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<ForecastReport>(organizationId);
-      if (err) return err;
-      const q = new URLSearchParams();
-      q.set('monthsAhead', String(monthsAhead));
-      return apiGet<ForecastReport>(`${REP(organizationId)}/forecast?${q.toString()}`);
-    }
+  /**
+   * Get Integrated Cash, Profit & Capacity Forecast with Scenarios & Assumptions
+   */
+  async getCombinedForecast(
+    organizationId: string,
+    scenario = 'realistic',
+    horizonMonths = 6
+  ): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/combined?scenario=${scenario}&horizonMonths=${horizonMonths}`,
+      { headers: await this.authHeaders() }
+    );
+    return this.unwrap(response);
+  }
 
-    await simulateDelay(300);
+  /**
+   * List Saved Versioned Report Snapshots
+   */
+  async getSnapshots(organizationId: string, reportType?: string): Promise<any[]> {
+    const url = `${this.baseUrl}/organizations/${organizationId}/reports/snapshots${reportType ? `?reportType=${reportType}` : ''}`;
+    const response = await fetch(url, { headers: await this.authHeaders() });
+    return this.unwrap(response);
+  }
 
-    const cashForecasts = dataStore.cashFlowForecasts.filter(f => f.organizationId === organizationId);
-    const accounts = dataStore.accounts.filter(a => a.organizationId === organizationId);
-    const cashAccounts = accounts.filter(a => a.subtype === 'bank_account' || a.subtype === 'current_asset');
-    const currentCash = cashAccounts.reduce((s, a) => s + a.balance, 0);
+  /**
+   * Create Frozen Versioned Report Snapshot
+   */
+  async createSnapshot(organizationId: string, snapshotInput: {
+    reportType: string;
+    title: string;
+    periodStart?: string;
+    periodEnd?: string;
+    accountingBasis?: 'cash' | 'accrual';
+    snapshotData: any;
+  }): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/snapshots`,
+      {
+        method: 'POST',
+        headers: await this.authHeaders(),
+        body: JSON.stringify(snapshotInput),
+      }
+    );
+    return this.unwrap(response);
+  }
 
-    const txns = dataStore.transactions.filter(t => t.organizationId === organizationId);
-    const debitTxns = txns.filter(t => t.type === 'debit');
-    const totalDebits = debitTxns.reduce((s, t) => s + Math.abs(t.amount), 0);
-    // Average over the actual span of transaction history, not a hardcoded 6 months — dividing by
-    // a fixed window overstates burn rate for orgs with less history and understates it (masking a
-    // real cash crunch) for orgs with more.
-    const monthsOfHistory = monthsSpannedByDates(debitTxns.map(t => t.date));
-    const monthlyExpenses = totalDebits / monthsOfHistory;
-    const burnRate = Math.round(monthlyExpenses);
-    const runway = burnRate > 0 ? Math.round((currentCash / burnRate) * 10) / 10 : Infinity;
+  /**
+   * Get Governance Audit & Classification Accuracy Metrics
+   */
+  async getGovernanceAuditHistory(organizationId: string): Promise<any> {
+    const response = await fetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/governance/audit-history`,
+      { headers: await this.authHeaders() }
+    );
+    return this.unwrap(response);
+  }
 
-    const forecasts = cashForecasts.slice(0, monthsAhead).map(f => ({
-      date: f.date,
-      income: f.forecastedIncome,
-      expenses: f.forecastedExpenses,
-      net: f.netCashFlow,
-      confidence: f.confidence,
-    }));
+  /**
+   * Download CSV file
+   */
+  downloadCSV(filename: string, csvContent: string): void {
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    const url = URL.createObjectURL(blob);
+    
+    link.setAttribute('href', url);
+    link.setAttribute('download', filename);
+    link.style.visibility = 'hidden';
+    
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+}
 
-    const projectedCash = currentCash + forecasts.reduce((s, f) => s + f.net, 0);
+// Singleton instance
+let reportServiceInstance: ReportService | null = null;
 
-    return {
-      success: true,
-      data: {
-        forecasts,
-        currentCash,
-        projectedCash: Math.round(projectedCash),
-        burnRate,
-        runway,
-      },
-    };
-  },
-};
+export function getReportService(): ReportService {
+  if (!reportServiceInstance) {
+    const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+    reportServiceInstance = new ReportService(baseUrl);
+  }
+  return reportServiceInstance;
+}
+
+// Named export for convenience (backward compatible)
+export const reportService = getReportService();
+
+// Default export
+export default getReportService();

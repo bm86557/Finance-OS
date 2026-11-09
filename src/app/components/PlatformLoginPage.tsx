@@ -8,9 +8,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/
 import { Building2, Lock, Mail, ArrowLeft } from 'lucide-react';
 import { mockUsers } from '@/data/mockDatabase';
 import { useTheme } from '@/contexts/ThemeContext';
+import { authService } from '@/services/authService';
+import type { PortalType } from '@/services/authSessionTypes';
+import { useLocation } from 'react-router';
 
 interface PlatformLoginPageProps {
-  onLogin: (email: string, password: string) => Promise<void>;
+  onLogin: (email: string, password: string, orgSlug?: string, portalType?: PortalType) => Promise<void>;
 }
 
 export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
@@ -18,9 +21,28 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
   const [password, setPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [scanProgress, setScanProgress] = useState(0);
+  const [hasAdmin, setHasAdmin] = useState(true);
+  const [isResetting, setIsResetting] = useState(false);
+  const [infoMessage, setInfoMessage] = useState('');
   const navigate = useNavigate();
+  const location = useLocation();
   const { theme } = useTheme();
+
+  useEffect(() => {
+    let isMounted = true;
+    void authService.hasExistingPlatformAdmin().then((exists) => {
+      if (isMounted) setHasAdmin(exists);
+    });
+    const params = new URLSearchParams(location.search);
+    if (params.get('notice') === 'admin_exists') {
+      setNotice('A platform administrator account is already configured. Direct registration is disabled.');
+    }
+    return () => {
+      isMounted = false;
+    };
+  }, [location.search]);
 
   useEffect(() => {
     if (isLoading && scanProgress < 100) {
@@ -31,6 +53,28 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
     }
   }, [isLoading, scanProgress]);
 
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      setError('Please enter your administrator email address first, then click "Forgot password?".');
+      return;
+    }
+    setIsResetting(true);
+    setError('');
+    setInfoMessage('');
+    try {
+      const res = await authService.resetPassword(email.trim());
+      if (res.success) {
+        setInfoMessage('Password reset link sent! Please check your email inbox.');
+      } else {
+        setError(res.error || 'Failed to send password reset email.');
+      }
+    } catch {
+      setError('Failed to send password reset request.');
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
@@ -38,10 +82,10 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
     setError('');
 
     try {
-      await onLogin(email, password);
+      await onLogin(email, password, undefined, 'platform_admin');
       navigate('/platform');
     } catch (err) {
-      setError('Invalid platform credentials.');
+      setError('Invalid platform credentials or no platform admin account found.');
     } finally {
       setIsLoading(false);
       setScanProgress(0);
@@ -56,10 +100,10 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
     setError('');
 
     try {
-      await onLogin(demoEmail, 'demo');
+      await onLogin(demoEmail, 'demo', undefined, 'platform_admin');
       navigate('/platform');
     } catch (err) {
-      setError('Login failed.');
+      setError('Login failed or no platform admin account found.');
     } finally {
       setIsLoading(false);
       setScanProgress(0);
@@ -159,7 +203,17 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
 
                 {/* Password Input */}
                 <div className="space-y-2">
-                  <Label className={`${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'} font-mono`}>Password</Label>
+                  <div className="flex items-center justify-between">
+                    <Label className={`${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'} font-mono`}>Password</Label>
+                    <button
+                      type="button"
+                      onClick={handleForgotPassword}
+                      disabled={isResetting || isLoading}
+                      className="text-xs font-mono text-blue-400 hover:text-blue-300 transition-colors disabled:opacity-50"
+                    >
+                      {isResetting ? 'Sending link...' : 'Forgot password?'}
+                    </button>
+                  </div>
                   <div className="relative">
                     <Lock className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-blue-400" />
                     <Input
@@ -172,6 +226,28 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
                     />
                   </div>
                 </div>
+
+                {/* Notice Message */}
+                {notice && !error && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg"
+                  >
+                    <p className="text-blue-300 text-xs font-mono">{notice}</p>
+                  </motion.div>
+                )}
+
+                {/* Info Message */}
+                {infoMessage && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-lg"
+                  >
+                    <p className="text-emerald-300 text-xs font-mono">{infoMessage}</p>
+                  </motion.div>
+                )}
 
                 {/* Error Message */}
                 {error && (
@@ -232,7 +308,7 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
                   </div>
 
                   {/* Demo Platform Accounts */}
-                  <div className="space-y-2">
+                  {/* <div className="space-y-2">
                     {platformUsers.map((user, index) => (
                       <motion.button
                         key={user.email}
@@ -256,12 +332,21 @@ export function PlatformLoginPage({ onLogin }: PlatformLoginPageProps) {
                         </div>
                       </motion.button>
                     ))}
-                  </div>
-
+                  </div> */}
                   {/* Footer Note */}
-                  <p className={`text-xs text-center ${theme === 'dark' ? 'text-slate-500' : 'text-slate-600'} font-mono`}>
-                    Demo account — click a name above to sign in instantly
-                  </p>
+                  <div className="text-center space-y-2">
+                    <p className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-slate-600'} font-mono`}>
+                      Platform administrator portal — sign in with your administrator credentials
+                    </p>
+                    {!hasAdmin && (
+                      <p className={`text-sm ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'} font-mono`}>
+                        No platform admin configured yet.{' '}
+                        <a href="/signup/platform" className={`${theme === 'dark' ? 'text-purple-400 hover:text-purple-300' : 'text-purple-600 hover:text-purple-700'} transition-colors`}>
+                          Create initial admin here
+                        </a>
+                      </p>
+                    )}
+                  </div>
                 </>
               )}
             </CardContent>

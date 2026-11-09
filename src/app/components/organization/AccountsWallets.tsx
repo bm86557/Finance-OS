@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'motion/react';
+import { useAuth } from '@/contexts/AuthContext';
+import { organizationService } from '@/services/organizationService';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useServiceArray } from '@/hooks/useService';
 import { formatCurrency } from '@/lib/formatters';
+import { convertCurrency } from '@/lib/currencyUtils';
+import { usePlatformSettings } from '@/hooks/usePlatformSettings';
 import type { BankAccount } from '@/services/types';
 import {
   Plus,
@@ -31,7 +35,7 @@ type WalletKind = 'cash' | 'bank' | 'online_wallet' | 'card';
 
 function getAccountCategory(accountType: BankAccount['accountType']): AccountCategory {
   if (accountType === 'cash') return 'cash';
-  if (accountType === 'checking' || accountType === 'savings') return 'bank';
+  if (accountType === 'checking' || accountType === 'savings' || accountType === 'debit_card' || accountType === 'prepaid_card') return 'bank';
   if (
     accountType === 'credit_card' ||
     accountType === 'line_of_credit' ||
@@ -58,21 +62,16 @@ function accountTypesForWalletKind(kind: WalletKind): BankAccount['accountType']
     case 'online_wallet':
       return ['online_wallet'];
     case 'card':
-      return ['credit_card', 'line_of_credit'];
+      return ['debit_card', 'credit_card', 'line_of_credit', 'prepaid_card'];
     default:
       return ['checking'];
   }
 }
 
-function pkrApprox(balance: number, currency: string): number {
-  const b = Number(balance);
-  if (!Number.isFinite(b)) return 0;
-  if (currency === 'PKR') return b;
-  return b * 280;
-}
-
 export function AccountsWallets() {
   const { theme } = useTheme();
+  const { currentOrganization, applyOrganizationUpdate } = useAuth();
+  const baseCurrency = currentOrganization?.currency || 'USD';
   const goToOrgView = useOrgWorkspaceNav();
   const [selectedType, setSelectedType] = useState<'all' | AccountCategory>('all');
   const [createOpen, setCreateOpen] = useState(false);
@@ -85,7 +84,8 @@ export function AccountsWallets() {
   const [formBankName, setFormBankName] = useState('');
   const [formAccountNumber, setFormAccountNumber] = useState('');
   const [formAccountType, setFormAccountType] = useState<BankAccount['accountType']>('checking');
-  const [formCurrency, setFormCurrency] = useState('PKR');
+  const [formCurrency, setFormCurrency] = useState(baseCurrency);
+  const [formSetAsBase, setFormSetAsBase] = useState(false);
   const [formBalance, setFormBalance] = useState('');
   const [formChartAccountId, setFormChartAccountId] = useState('');
   const [formIsActive, setFormIsActive] = useState(true);
@@ -96,10 +96,10 @@ export function AccountsWallets() {
 
   const svc = useOrgServices();
 
-  const { data: bankAccounts, loading, error } = useServiceArray(
+  const { data: bankAccounts, loading, error, refetch } = useServiceArray(
     () => svc.accounts.getBankAccounts(),
     [svc.orgId],
-    ['bankAccounts'],
+    ['bankAccounts', 'transactions'],
   );
 
   const { data: chartAccounts } = useServiceArray(
@@ -109,11 +109,13 @@ export function AccountsWallets() {
   );
 
   const assetChartOptions = useMemo(
-    () => chartAccounts.filter((a) => a.type === 'asset' && a.isActive),
+    () => chartAccounts.filter((a) => (a.type === 'asset' || a.type === 'liability') && a.isActive),
     [chartAccounts],
   );
 
   const typesForKind = useMemo(() => accountTypesForWalletKind(formWalletKind), [formWalletKind]);
+  const { getSelectableCurrencyCodes } = usePlatformSettings();
+  const selectableCurrencies = getSelectableCurrencyCodes(formCurrency || baseCurrency);
 
   useEffect(() => {
     const list = accountTypesForWalletKind(formWalletKind);
@@ -128,35 +130,45 @@ export function AccountsWallets() {
   const totalBankBalance = useMemo(
     () =>
       bankAccounts
-        .filter((a) => getAccountCategory(a.accountType) === 'bank')
-        .reduce((sum, a) => sum + pkrApprox(a.balance, a.currency), 0),
-    [bankAccounts],
+        .filter((a) => a.accountType === 'checking' || a.accountType === 'savings' || a.accountType === 'debit_card' || a.accountType === 'prepaid_card')
+        .reduce((sum, a) => sum + convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency), 0),
+    [bankAccounts, baseCurrency],
   );
 
-  const totalVirtual = useMemo(
+  const totalOnlineWallets = useMemo(
     () =>
       bankAccounts
-        .filter((a) => getAccountCategory(a.accountType) === 'virtual')
-        .reduce((sum, a) => sum + pkrApprox(a.balance, a.currency), 0),
-    [bankAccounts],
+        .filter((a) => a.accountType === 'online_wallet')
+        .reduce((sum, a) => sum + convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency), 0),
+    [bankAccounts, baseCurrency],
+  );
+
+  const totalCreditLiabilities = useMemo(
+    () =>
+      bankAccounts
+        .filter((a) => a.accountType === 'credit_card' || a.accountType === 'line_of_credit')
+        .reduce((sum, a) => sum + Math.abs(convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency)), 0),
+    [bankAccounts, baseCurrency],
   );
 
   const totalCash = useMemo(
     () =>
       bankAccounts
-        .filter((a) => getAccountCategory(a.accountType) === 'cash')
-        .reduce((sum, a) => sum + pkrApprox(a.balance, a.currency), 0),
-    [bankAccounts],
+        .filter((a) => a.accountType === 'cash')
+        .reduce((sum, a) => sum + convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency), 0),
+    [bankAccounts, baseCurrency],
   );
 
-  const totalBalance = totalBankBalance + totalCash + totalVirtual;
+  const netBalance = totalBankBalance + totalCash + totalOnlineWallets - totalCreditLiabilities;
+  const totalVirtualAndCards = totalOnlineWallets - totalCreditLiabilities;
 
   const resetForm = () => {
     setFormWalletKind('bank');
     setFormBankName('');
     setFormAccountNumber('');
     setFormAccountType('checking');
-    setFormCurrency('PKR');
+    setFormCurrency(baseCurrency);
+    setFormSetAsBase(bankAccounts.length === 0);
     setFormBalance('');
     setFormIban('');
     setFormSwift('');
@@ -180,6 +192,7 @@ export function AccountsWallets() {
     setFormAccountNumber(account.accountNumber);
     setFormAccountType(account.accountType);
     setFormCurrency(account.currency);
+    setFormSetAsBase(account.currency === baseCurrency || bankAccounts.length <= 1);
     setFormBalance(String(Number.isFinite(account.balance) ? account.balance : 0));
     setFormChartAccountId(account.accountId);
     setFormIsActive(account.isActive);
@@ -188,6 +201,18 @@ export function AccountsWallets() {
     setFormRouting(account.routingNumber ?? '');
     setFormUsage(account.usage ?? 'business');
     setEditOpen(true);
+  };
+
+  const handleCurrencyChange = (newCurr: string) => {
+    const oldCurr = formCurrency;
+    if (oldCurr !== newCurr && formBalance) {
+      const parsed = parseFloat(formBalance.replace(/,/g, ''));
+      if (Number.isFinite(parsed) && parsed > 0) {
+        const converted = convertCurrency(parsed, oldCurr, newCurr);
+        setFormBalance(String(Math.round(converted * 100) / 100));
+      }
+    }
+    setFormCurrency(newCurr);
   };
 
   const parseBalance = (): number | null => {
@@ -202,11 +227,13 @@ export function AccountsWallets() {
     return t ? t : undefined;
   };
 
-  const validateIdentifiers = (name: string, num: string, iban: string): boolean => {
+  const validateIdentifiers = (name: string, num: string, iban: string, isEdit = false): boolean => {
     if (!name) {
       toast.error('Enter a name.');
       return false;
     }
+    // On edit, identifiers are optional — user may only be changing balance/type/currency
+    if (isEdit) return true;
     if (formWalletKind === 'cash') return true;
     if (formWalletKind === 'bank') {
       if (!num && !iban) {
@@ -222,13 +249,7 @@ export function AccountsWallets() {
       }
       return true;
     }
-    if (formWalletKind === 'card') {
-      if (!num) {
-        toast.error('Enter a card or account reference.');
-        return false;
-      }
-      return true;
-    }
+    // Cards: reference optional (last 4 digits may be unknown)
     return true;
   };
 
@@ -244,11 +265,7 @@ export function AccountsWallets() {
     const num = formAccountNumber.trim();
     const iban = formIban.trim();
     if (!validateIdentifiers(name, num, iban)) return;
-    const chartId = formChartAccountId || assetChartOptions[0]?.id;
-    if (!chartId) {
-      toast.error('No chart of accounts asset to link. Add one in your books first.');
-      return;
-    }
+    const chartId = formChartAccountId || assetChartOptions[0]?.id || '';
     const bal = parseBalance();
     if (bal === null) {
       toast.error('Enter a valid current balance.');
@@ -256,7 +273,7 @@ export function AccountsWallets() {
     }
     setSaving(true);
     try {
-      const res = await svc.accounts.createBankAccount({
+      const payload: any = {
         accountId: chartId,
         bankName: name,
         accountNumber: resolvedAccountNumber(num, iban),
@@ -268,11 +285,23 @@ export function AccountsWallets() {
         swiftCode: trimOpt(formSwift),
         routingNumber: trimOpt(formRouting),
         usage: formUsage,
-      });
+        setAsBaseCurrency: formSetAsBase,
+      };
+      const res = await svc.accounts.createBankAccount(payload);
       if (res.success) {
+        if (formSetAsBase && currentOrganization) {
+          void organizationService.update(currentOrganization.id, { currency: formCurrency }).then(orgRes => {
+            if (orgRes.success && orgRes.data) {
+              applyOrganizationUpdate(orgRes.data);
+            } else {
+              applyOrganizationUpdate({ ...currentOrganization, currency: formCurrency });
+            }
+          });
+        }
         toast.success(res.message ?? 'Account added');
         setCreateOpen(false);
         resetForm();
+        await refetch();
       } else {
         toast.error(res.error ?? 'Could not add account.');
       }
@@ -286,12 +315,8 @@ export function AccountsWallets() {
     const name = formBankName.trim();
     const num = formAccountNumber.trim();
     const iban = formIban.trim();
-    if (!validateIdentifiers(name, num, iban)) return;
-    const chartId = formChartAccountId || assetChartOptions[0]?.id;
-    if (!chartId) {
-      toast.error('Choose a linked chart account.');
-      return;
-    }
+    if (!validateIdentifiers(name, num, iban, true)) return;
+    const chartId = formChartAccountId || assetChartOptions[0]?.id || '';
     const bal = parseBalance();
     if (bal === null) {
       toast.error('Enter a valid balance.');
@@ -299,7 +324,7 @@ export function AccountsWallets() {
     }
     setSaving(true);
     try {
-      const res = await svc.accounts.updateBankAccount(editingId, {
+      const payload: any = {
         accountId: chartId,
         bankName: name,
         accountNumber: resolvedAccountNumber(num, iban),
@@ -311,11 +336,23 @@ export function AccountsWallets() {
         swiftCode: trimOpt(formSwift),
         routingNumber: trimOpt(formRouting),
         usage: formUsage,
-      });
+        setAsBaseCurrency: formSetAsBase,
+      };
+      const res = await svc.accounts.updateBankAccount(editingId, payload);
       if (res.success) {
+        if (formSetAsBase && currentOrganization) {
+          void organizationService.update(currentOrganization.id, { currency: formCurrency }).then(orgRes => {
+            if (orgRes.success && orgRes.data) {
+              applyOrganizationUpdate(orgRes.data);
+            } else {
+              applyOrganizationUpdate({ ...currentOrganization, currency: formCurrency });
+            }
+          });
+        }
         toast.success('Account updated');
         setEditOpen(false);
         resetForm();
+        await refetch();
       } else {
         toast.error(res.error ?? 'Could not update account.');
       }
@@ -495,7 +532,7 @@ export function AccountsWallets() {
         {(formWalletKind === 'bank' || formWalletKind === 'card') && (
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-400">
-              {formWalletKind === 'bank' ? 'Checking or savings' : 'Card type'}
+              {formWalletKind === 'bank' ? 'Account type' : 'Card nature & type'}
             </label>
             <select
               value={formAccountType}
@@ -508,7 +545,15 @@ export function AccountsWallets() {
                     ? 'Cash wallet'
                     : t === 'online_wallet'
                       ? 'Online wallet'
-                      : t.replace(/_/g, ' ')}
+                      : t === 'debit_card'
+                        ? 'Debit Card (Asset — Available Funds)'
+                        : t === 'prepaid_card'
+                          ? 'Prepaid Card (Asset — Loaded Funds)'
+                          : t === 'credit_card'
+                            ? 'Credit Card (Liability — Debt / Owed)'
+                            : t === 'line_of_credit'
+                              ? 'Line of Credit (Liability — Revolving Debt)'
+                              : t.replace(/_/g, ' ')}
                 </option>
               ))}
             </select>
@@ -518,20 +563,46 @@ export function AccountsWallets() {
           <label className="mb-1 block text-xs font-medium text-slate-400">Currency</label>
           <select
             value={formCurrency}
-            onChange={(e) => setFormCurrency(e.target.value)}
+            onChange={(e) => handleCurrencyChange(e.target.value)}
             className={inputClass}
           >
-            <option value="PKR">PKR</option>
-            <option value="USD">USD</option>
-            <option value="AED">AED</option>
-            <option value="EUR">EUR</option>
-            <option value="GBP">GBP</option>
+            {selectableCurrencies.map((code) => (
+              <option key={code} value={code}>{code}</option>
+            ))}
+
+
+
+
+
           </select>
         </div>
       </div>
 
+      <div className="flex items-center gap-2 rounded-xl border border-blue-500/30 bg-blue-500/10 p-3">
+        <input
+          id="setAsBaseCurrencyCheckbox"
+          type="checkbox"
+          checked={formSetAsBase}
+          onChange={(e) => setFormSetAsBase(e.target.checked)}
+          className="size-4 rounded border-slate-700 bg-slate-800 text-blue-500 focus:ring-blue-500 cursor-pointer"
+        />
+        <label htmlFor="setAsBaseCurrencyCheckbox" className="text-xs text-blue-200 cursor-pointer select-none">
+          <strong>Organization Base Currency:</strong> Use <strong>{formCurrency}</strong> as the base currency for all overall dashboard features, KPIs, and reports.
+        </label>
+      </div>
+
+      {(formAccountType === 'credit_card' || formAccountType === 'line_of_credit') && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+          ⚠️ <strong>Credit Card & Line of Credit:</strong> The entered balance is treated as outstanding debt owed to the card issuer (Liability). It will be subtracted from your organization&apos;s Net Balance. If this is a card with available cash (funds you own), select <strong>Debit Card</strong> instead.
+        </div>
+      )}
+
       <div>
-        <label className="mb-1 block text-xs font-medium text-slate-400">Current balance</label>
+        <label className="mb-1 block text-xs font-medium text-slate-400">
+          {formAccountType === 'credit_card' || formAccountType === 'line_of_credit'
+            ? 'Current balance owed (Debt / Liability)'
+            : 'Current balance (Available Funds / Asset)'}
+        </label>
         <input
           type="text"
           inputMode="decimal"
@@ -547,19 +618,15 @@ export function AccountsWallets() {
         <select
           value={formChartAccountId}
           onChange={(e) => setFormChartAccountId(e.target.value)}
-          disabled={!assetChartOptions.length}
-          className={`${inputClass} disabled:opacity-50`}
+          className={inputClass}
         >
-          <option value="">Select…</option>
+          <option value="">Auto-assign standard chart account</option>
           {assetChartOptions.map((a) => (
             <option key={a.id} value={a.id}>
-              {a.code} — {a.name}
+              {a.code} — {a.name} ({a.type})
             </option>
           ))}
         </select>
-        {!assetChartOptions.length && (
-          <p className="mt-1 text-xs text-amber-200/90">No asset accounts in chart of accounts yet.</p>
-        )}
       </div>
 
       <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
@@ -676,8 +743,7 @@ export function AccountsWallets() {
               <div className="mt-4 flex flex-wrap gap-2">
                 <button
                   type="button"
-                  disabled={!assetChartOptions.length}
-                  className="flex items-center gap-2 rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
+                  className="flex items-center gap-2 rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500"
                   onClick={openCreate}
                 >
                   <Plus className="size-4" />
@@ -707,8 +773,8 @@ export function AccountsWallets() {
         >
           <div className="flex items-center justify-between">
             <div>
-              <p className="mb-1 text-sm text-slate-400">Total balance (PKR approx.)</p>
-              <p className="text-2xl font-bold text-white">{formatCurrency(totalBalance, 'PKR')}</p>
+              <p className="mb-1 text-sm text-slate-400">Net balance ({baseCurrency})</p>
+              <p className="text-2xl font-bold text-white">{formatCurrency(netBalance, baseCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -732,7 +798,7 @@ export function AccountsWallets() {
           <div className="flex items-center justify-between">
             <div>
               <p className="mb-1 text-sm text-slate-400">Bank accounts</p>
-              <p className="text-2xl font-bold text-cyan-400">{formatCurrency(totalBankBalance, 'PKR')}</p>
+              <p className="text-2xl font-bold text-cyan-400">{formatCurrency(totalBankBalance, baseCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -756,7 +822,7 @@ export function AccountsWallets() {
           <div className="flex items-center justify-between">
             <div>
               <p className="mb-1 text-sm text-slate-400">Cash in hand</p>
-              <p className="text-2xl font-bold text-emerald-400">{formatCurrency(totalCash, 'PKR')}</p>
+              <p className="text-2xl font-bold text-emerald-400">{formatCurrency(totalCash, baseCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -779,8 +845,8 @@ export function AccountsWallets() {
         >
           <div className="flex items-center justify-between">
             <div>
-              <p className="mb-1 text-sm text-slate-400">Online wallets, cards &amp; credit</p>
-              <p className="text-2xl font-bold text-purple-400">{formatCurrency(totalVirtual, 'PKR')}</p>
+              <p className="mb-1 text-sm text-slate-400">Online wallets &amp; cards</p>
+              <p className="text-2xl font-bold text-purple-400">{formatCurrency(totalVirtualAndCards, baseCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -941,6 +1007,15 @@ export function AccountsWallets() {
                         <span className="text-xs capitalize" style={{ color: AXIOM.text.slate400 }}>
                           {account.accountType.replace(/_/g, ' ')}
                         </span>
+                        {account.accountType === 'credit_card' || account.accountType === 'line_of_credit' ? (
+                          <span className="rounded-lg px-2 py-0.5 text-xs font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                            Liability (Debt)
+                          </span>
+                        ) : (
+                          <span className="rounded-lg px-2 py-0.5 text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                            Asset (Funds)
+                          </span>
+                        )}
                         <span
                           className="rounded-lg px-2 py-0.5 text-xs font-medium"
                           style={
@@ -957,10 +1032,21 @@ export function AccountsWallets() {
                 </div>
 
                 <div className="mb-6">
-                  <p className="mb-1 text-xs text-slate-400">Current balance</p>
-                  <p className="font-mono text-3xl font-bold text-white">
-                    {formatCurrency(Number.isFinite(account.balance) ? account.balance : 0, account.currency)}
-                  </p>
+                  {account.accountType === 'credit_card' || account.accountType === 'line_of_credit' ? (
+                    <>
+                      <p className="mb-1 text-xs font-medium text-rose-400">Current balance owed (Liability)</p>
+                      <p className="font-mono text-3xl font-bold text-rose-300">
+                        {formatCurrency(Number.isFinite(account.balance) ? account.balance : 0, account.currency)}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="mb-1 text-xs text-slate-400">Current available balance</p>
+                      <p className="font-mono text-3xl font-bold text-white">
+                        {formatCurrency(Number.isFinite(account.balance) ? account.balance : 0, account.currency)}
+                      </p>
+                    </>
+                  )}
                 </div>
 
                 <div className="mb-6 space-y-3">
@@ -1096,7 +1182,7 @@ export function AccountsWallets() {
             </button>
             <button
               type="button"
-              disabled={saving || !assetChartOptions.length}
+              disabled={saving}
               className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
               onClick={() => void submitEdit()}
             >

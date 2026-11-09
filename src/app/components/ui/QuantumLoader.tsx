@@ -26,6 +26,7 @@ export function QuantumLoader({
               top: '50%',
               marginLeft: -size / 12,
               marginTop: -size / 12,
+              transformOrigin: `${size / 3}px 0px`,
             }}
             animate={{
               rotate: 360,
@@ -35,9 +36,6 @@ export function QuantumLoader({
               repeat: Infinity,
               ease: 'linear',
               delay: index * 0.4,
-            }}
-            style={{
-              transformOrigin: `${size / 3}px 0px`,
             }}
           />
         ))}

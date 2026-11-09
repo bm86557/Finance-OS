@@ -36,11 +36,25 @@ function requireOrg<T>(organizationId: string): ServiceResponse<T> | null {
   return null;
 }
 
-function auditLogsQuery(filters?: { severity?: string; action?: string; search?: string }): string {
+export interface AuditLogFilters {
+  severity?: string;
+  action?: string;
+  entityType?: string;
+  userId?: string;
+  startDate?: string;
+  endDate?: string;
+  search?: string;
+}
+
+function auditLogsQuery(filters?: AuditLogFilters): string {
   if (!filters) return '';
   const q = new URLSearchParams();
   if (filters.severity) q.set('severity', filters.severity);
-  if (filters.action) q.set('action', filters.action);
+  if (filters.action && filters.action !== 'all') q.set('action', filters.action);
+  if (filters.entityType && filters.entityType !== 'all') q.set('entityType', filters.entityType);
+  if (filters.userId) q.set('userId', filters.userId);
+  if (filters.startDate) q.set('startDate', filters.startDate);
+  if (filters.endDate) q.set('endDate', filters.endDate);
   if (filters.search) q.set('search', filters.search);
   const s = q.toString();
   return s ? `?${s}` : '';
@@ -49,7 +63,7 @@ function auditLogsQuery(filters?: { severity?: string; action?: string; search?:
 export const auditService = {
   async getAll(
     organizationId: string,
-    filters?: { severity?: string; action?: string; search?: string },
+    filters?: AuditLogFilters,
   ): Promise<ServiceResponse<AuditLogEntry[]>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<AuditLogEntry[]>(organizationId);
@@ -60,7 +74,7 @@ export const auditService = {
     await simulateDelay();
     let logs = seedLogs.filter(l => l.organizationId === organizationId);
     if (filters?.severity) logs = logs.filter(l => l.severity === filters.severity);
-    if (filters?.action) logs = logs.filter(l => l.action === filters.action);
+    if (filters?.action && filters.action !== 'all') logs = logs.filter(l => l.action === filters.action);
     if (filters?.search) {
       const q = filters.search.toLowerCase();
       logs = logs.filter(l => l.details.toLowerCase().includes(q) || l.userName.toLowerCase().includes(q));

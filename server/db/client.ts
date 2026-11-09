@@ -1,23 +1,16 @@
-import Database from 'better-sqlite3';
-import { drizzle } from 'drizzle-orm/better-sqlite3';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import * as schema from './schema.js';
+/**
+ * @deprecated Decommissioned in Milestone 1. Finance OS operates exclusively on Supabase PostgreSQL.
+ * Direct SQLite connections via better-sqlite3 have been eliminated.
+ */
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.join(__dirname, '../..');
-const dataDir = path.join(repoRoot, 'data');
-const defaultPath = path.join(dataDir, 'finance-os.db');
+export const db: any = new Proxy({}, {
+  get(_target, prop) {
+    throw new Error(`Direct SQLite access (db.${String(prop)}) is decommissioned. All persistence is strictly Supabase PostgreSQL.`);
+  },
+});
 
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
-}
-
-const dbFilePath = process.env.DATABASE_PATH ?? defaultPath;
-
-const sqlite = new Database(dbFilePath);
-sqlite.pragma('journal_mode = WAL');
-
-export const db = drizzle(sqlite, { schema });
-export { sqlite };
+export const sqlite: any = new Proxy({}, {
+  get(_target, prop) {
+    throw new Error(`Direct SQLite access (sqlite.${String(prop)}) is decommissioned. All persistence is strictly Supabase PostgreSQL.`);
+  },
+});

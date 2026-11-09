@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { ModernTable, Column, TableAction } from '../components/table/ModernTable';
 import { BulkActionsBar } from '../components/bulk-actions/BulkActionsBar';
-import { AdvancedFilter } from '../components/filter/AdvancedFilter';
+import { AdvancedFilter } from '../components/filters/AdvancedFilter';
 import { Button } from '../components/ui/button';
 import { Card, CardContent } from '../components/ui/card';
 import { PremiumStatCard } from '../components/widgets/DataWidgets';

@@ -1,26 +1,81 @@
 import { useMemo, useState } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../ui/dialog';
 import { useTheme } from '@/contexts/ThemeContext';
-// ── Phase 9A: Department profitability wired through service layer ────────────
+import { useAuth } from '@/contexts/AuthContext';
+// ── Phase 9B: Real data integration with Profit Intelligence ─────────────────
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService } from '@/hooks/useService';
-import type { DepartmentProfitability } from '@/services/types';
+import type { DepartmentProfitability, SquareFootProfitability } from '@/services/types';
+import { profitIntelligenceService } from '@/services/profitIntelligenceService';
+import { overheadAllocationService } from '@/services/overheadAllocationService';
+
+interface ProjectDetailsModalData {
+  project?: {
+    id: string;
+    name: string;
+    clientName?: string;
+    status: string;
+    quotedAmount?: number;
+    budget?: number;
+  };
+  summary?: {
+    totalRevenue: number;
+    totalCosts: number;
+    directCosts?: number;
+    laborCost?: number;
+    actualCost?: number;
+    netProfit: number;
+    marginPct?: number;
+    margin?: number;
+    variancePct: number;
+    loggedHours?: number;
+  };
+  income?: Array<{
+    id: string;
+    date: string;
+    description: string;
+    amount: number;
+    category?: string;
+    narration?: string;
+  }>;
+  expenses?: Array<{
+    id: string;
+    date: string;
+    description: string;
+    amount: number;
+    category?: string;
+    narration?: string;
+  }>;
+  laborEntries?: Array<{
+    id: string;
+    userId: string;
+    userName: string;
+    date: string;
+    hours: number;
+    effectiveHourlyRate: number;
+    cost: number;
+    description?: string;
+    billable?: boolean;
+    status?: string;
+  }>;
+}
 
 /** Maps service DepartmentProfitability → local rendering shape */
 function mapDeptProfitability(dp: DepartmentProfitability): Department {
   return {
     id: dp.departmentId,
     name: dp.departmentName,
-    costPerHour: dp.costPerHour,
+    costPerHour: dp.costPerHour ?? 0,
     teamMembers: dp.headcount,
     monthlyRevenue: dp.revenue,
     monthlyCost: dp.directCosts,
     monthlyProfit: dp.netProfit,
-    profitMargin: dp.profitMargin,
+    profitMargin: dp.profitMargin ?? 0,
     overheadAllocation: dp.allocatedOverhead,
     billableHours: dp.billableHours,
-    totalHours: dp.totalHours,
-    utilization: dp.utilization,
+    totalHours: dp.totalHours ?? 0,
+    utilization: dp.utilization ?? 0,
   };
 }
 
@@ -42,55 +97,8 @@ interface OverheadExpense {
   allocationType: 'equal' | 'revenue-based' | 'headcount-based';
   departments: string[];
 }
-interface ProfitAnalysis {
-  byDepartment: { department: string; revenue: number; directCost: number; allocatedOverhead: number; netProfit: number; profitMargin: number }[];
-  byScope: { scope: 'business' | 'personal'; income: number; expense: number; profit: number }[];
-  byClient: { client: string; revenue: number; cost: number; profit: number; projects: number }[];
-  overall: { totalRevenue: number; totalDirectCost: number; totalOverhead: number; grossProfit: number; netProfit: number; grossMargin: number; netMargin: number };
-}
-interface WhatIfScenario {
-  id: string; name: string;
-  changes: { type: 'cost-increase' | 'revenue-increase' | 'overhead-reduction' | 'rate-change'; target: string; percentage: number }[];
-  projectedProfit: number; projectedMargin: number; impact: number;
-}
 
-// mockDepartments REMOVED — now fetched via svc.departments.getProfitability() below
-const mockProjects: Project[] = [
-  { id: 'proj-1', name: 'E-commerce Platform', client: 'TechCorp Ltd', department: 'Development', quotedAmount: 850000, actualCost: 620000, actualProfit: 230000, profitMargin: 27.1, status: 'in-progress', hoursQuoted: 200, hoursActual: 151, startDate: '2025-12-01' },
-  { id: 'proj-2', name: 'Brand Identity', client: 'StartupXYZ', department: 'Design', quotedAmount: 320000, actualCost: 240000, actualProfit: 80000, profitMargin: 25.0, status: 'completed', hoursQuoted: 95, hoursActual: 86, startDate: '2025-11-15', endDate: '2025-12-20' },
-  { id: 'proj-3', name: 'Social Media Campaign', client: 'FashionBrand', department: 'Marketing', quotedAmount: 180000, actualCost: 150000, actualProfit: 30000, profitMargin: 16.7, status: 'completed', hoursQuoted: 72, hoursActual: 60, startDate: '2025-12-01', endDate: '2025-12-31' },
-  { id: 'proj-4', name: 'Mobile App Development', client: 'FinTech Solutions', department: 'Development', quotedAmount: 1200000, actualCost: 0, actualProfit: 0, profitMargin: 0, status: 'quoted', hoursQuoted: 300, hoursActual: 0, startDate: '2026-01-15' },
-];
-const mockOverheads: OverheadExpense[] = [
-  { id: 'oh-1', category: 'Office Rent', amount: 200000, frequency: 'monthly', allocationType: 'equal', departments: ['Design', 'Development', 'Marketing', 'Sales & BD'] },
-  { id: 'oh-2', category: 'Utilities', amount: 45000, frequency: 'monthly', allocationType: 'headcount-based', departments: ['Design', 'Development', 'Marketing', 'Sales & BD'] },
-  { id: 'oh-3', category: 'Software Licenses', amount: 85000, frequency: 'monthly', allocationType: 'revenue-based', departments: ['Design', 'Development', 'Marketing'] },
-  { id: 'oh-4', category: 'Admin Salaries', amount: 90000, frequency: 'monthly', allocationType: 'headcount-based', departments: ['Design', 'Development', 'Marketing', 'Sales & BD'] },
-];
-const mockProfitAnalysis: ProfitAnalysis = {
-  byDepartment: [
-    { department: 'Design', revenue: 680000, directCost: 448000, allocatedOverhead: 112000, netProfit: 120000, profitMargin: 17.6 },
-    { department: 'Development', revenue: 985600, directCost: 738000, allocatedOverhead: 168000, netProfit: 79600, profitMargin: 8.1 },
-    { department: 'Marketing', revenue: 375000, directCost: 300000, allocatedOverhead: 84000, netProfit: -9000, profitMargin: -2.4 },
-    { department: 'Sales & BD', revenue: 256000, directCost: 204800, allocatedOverhead: 56000, netProfit: -4800, profitMargin: -1.9 },
-  ],
-  byScope: [
-    { scope: 'business', income: 2296600, expense: 2110800, profit: 185800 },
-    { scope: 'personal', income: 0, expense: 85000, profit: -85000 },
-  ],
-  byClient: [
-    { client: 'TechCorp Ltd', revenue: 850000, cost: 620000, profit: 230000, projects: 1 },
-    { client: 'StartupXYZ', revenue: 320000, cost: 240000, profit: 80000, projects: 1 },
-    { client: 'FashionBrand', revenue: 180000, cost: 150000, profit: 30000, projects: 1 },
-    { client: 'FinTech Solutions', revenue: 1200000, cost: 900000, profit: 300000, projects: 1 },
-  ],
-  overall: { totalRevenue: 2296600, totalDirectCost: 1690800, totalOverhead: 420000, grossProfit: 605800, netProfit: 185800, grossMargin: 26.4, netMargin: 8.1 },
-};
-const mockWhatIfScenarios: WhatIfScenario[] = [
-  { id: 'wif-1', name: 'Increase Developer Rates by 15%', changes: [{ type: 'rate-change', target: 'Development', percentage: 15 }], projectedProfit: 333550, projectedMargin: 13.1, impact: 147750 },
-  { id: 'wif-2', name: 'Reduce Overhead by 20%', changes: [{ type: 'overhead-reduction', target: 'All', percentage: 20 }], projectedProfit: 269800, projectedMargin: 11.1, impact: 84000 },
-  { id: 'wif-3', name: 'Increase Revenue by 10%', changes: [{ type: 'revenue-increase', target: 'All', percentage: 10 }], projectedProfit: 291460, projectedMargin: 11.5, impact: 105660 },
-];
+// Mock data removed - now using real data from services
 
 import {
   TrendingUp,
@@ -107,7 +115,8 @@ import {
   Home,
   Maximize2,
   BarChart3,
-  PieChart as PieChartIcon
+  PieChart as PieChartIcon,
+  Clock
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { motion } from 'motion/react';
@@ -119,36 +128,149 @@ export function ProfitIntelligenceView() {
   const { theme } = useTheme();
   const svc = useOrgServices();
 
-  // ── Phase 9A: Department profitability from service ──────────────────────
+  // ── Phase 9B: Real data from Profit Intelligence services ────────────────
+  const { currentOrganization } = useAuth();
+  const currency = currentOrganization?.currency ?? 'USD';
+
+  const [period, setPeriod] = useState<'1M' | '3M' | '1Y' | 'ALL'>('ALL');  // Default to ALL to show all dates
+  const [projectPeriod, setProjectPeriod] = useState<'1M' | '3M' | '12M'>('3M');
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+
+  // Calculate date range from period
+  const dateRange = useMemo(() => {
+    if (period === 'ALL') {
+      // ALL: use very wide date range to capture all transactions (including future-dated ones)
+      return { from: '2000-01-01', to: '2099-12-31' };
+    }
+    const now = new Date();
+    const toDate = now.toISOString().slice(0, 10);
+    const daysBack = period === '1M' ? 30 : period === '3M' ? 90 : 365;
+    const fromDateObj = new Date(now);
+    fromDateObj.setDate(fromDateObj.getDate() - daysBack);
+    return { from: fromDateObj.toISOString().slice(0, 10), to: toDate };
+  }, [period]);
+
+  // Department profitability with date range
   const {
     data: rawDeptProfit,
     loading: deptProfitLoading,
     error: deptProfitError,
-  } = useService(() => svc.departments.getProfitability(), [svc.orgId]);
-  const mockDepartments: Department[] = (rawDeptProfit || []).map(mapDeptProfitability);
+  } = useService(
+    () => svc.departments.getProfitability({ from: dateRange.from, to: dateRange.to }),
+    [svc.orgId, dateRange]
+  );
+  const liveDepartments: Department[] = (rawDeptProfit || []).map(mapDeptProfitability);
 
-  const [period, setPeriod] = useState<'1M' | '3M' | '1Y'>('1M');
+  // Project profitability
+  const {
+    data: rawProjectProfit,
+    loading: projectProfitLoading,
+  } = useService(
+    () => svc.projects.getProfitability({ period: projectPeriod }),
+    [svc.orgId, projectPeriod]
+  );
 
-  const hasLiveDeptData = mockDepartments.length > 0;
-  const periodFactor = period === '1M' ? 1 : period === '3M' ? 3 : 12;
+  // Client profitability
+  const {
+    data: clientRows,
+    loading: clientLoading,
+  } = useService(
+    () => svc.profitIntelligence.getClientProfitability({ from: dateRange.from, to: dateRange.to }),
+    [svc.orgId, dateRange]
+  );
+
+  // Overhead summary
+  const {
+    data: overheadData,
+    loading: overheadLoading,
+  } = useService(
+    () => svc.profitIntelligence.getOverheadSummary(),
+    [svc.orgId]
+  );
+
+  // Business vs Personal
+  const {
+    data: businessPersonalData,
+    loading: bvpLoading,
+  } = useService(
+    () => svc.profitIntelligence.getBusinessVsPersonal({ from: dateRange.from, to: dateRange.to }),
+    [svc.orgId, dateRange]
+  );
+
+  // Simulator scenarios
+  const {
+    data: whatIfScenarios,
+    loading: scenariosLoading,
+  } = useService(
+    () => svc.simulator.getAllScenarios(),
+    [svc.orgId]
+  );
+
+  // Project details (for modal)
+  const {
+    data: projectDetails,
+    loading: projectDetailsLoading,
+  } = useService<ProjectDetailsModalData | null>(
+    () => selectedProjectId
+      ? svc.projects.getProjectDetails(selectedProjectId)
+      : Promise.resolve({ success: true, data: null as any }),
+    [selectedProjectId, svc.orgId]
+  );
+
+  // Organization-level summary (includes ALL transactions, even unassigned)
+  const {
+    data: orgSummary,
+    loading: summaryLoading,
+  } = useService(
+    () => svc.profitIntelligence.getSummary({ from: dateRange.from, to: dateRange.to }),
+    [svc.orgId, dateRange]
+  );
+
+  // Space profitability and floor efficiency metrics (§12.5)
+  const { data: spaceMetrics = [] } = useService(
+    () => profitIntelligenceService.getSpaceProfitability(svc.orgId, { from: dateRange.from, to: dateRange.to }),
+    [svc.orgId, dateRange]
+  );
+
+  const hasLiveDeptData = liveDepartments.length > 0;
 
   const liveOverall = useMemo(() => {
-    if (mockDepartments.length === 0) return null;
-    const f = periodFactor;
+    // Prioritize organization summary (includes ALL transactions)
+    if (orgSummary) {
+      const rawRev = orgSummary.totalRevenue ?? (orgSummary as any).revenue ?? 0;
+      const rawExp = orgSummary.totalExpense ?? (orgSummary as any).expenses ?? 0;
+      const rawOverhead = orgSummary.totalOverhead ?? (orgSummary as any).overhead ?? 0;
+      const totalRevenue = Number(rawRev || 0);
+      const totalExpense = Number(rawExp || 0);
+      const totalOverhead = Number(rawOverhead || 0);
+      const totalDirectCost = Number(orgSummary.totalDirectCost ?? (orgSummary as any).direct_cost ?? Math.max(0, totalExpense - totalOverhead));
+      const grossProfit = Number(orgSummary.grossProfit ?? (orgSummary as any).gross_profit ?? (totalRevenue - totalDirectCost));
+      const netProfit = Number(orgSummary.netProfit ?? (orgSummary as any).net_profit ?? (totalRevenue - totalExpense));
+      const grossMargin = totalRevenue > 0 ? (grossProfit / totalRevenue) * 100 : 0;
+      const netMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
+      return {
+        totalRevenue,
+        totalDirectCost,
+        totalOverhead,
+        grossProfit,
+        netProfit,
+        grossMargin,
+        netMargin,
+      };
+    }
+    // Fallback: sum from departments (only shows assigned transactions)
+    if (liveDepartments.length === 0) return null;
     let tr = 0;
     let td = 0;
     let to = 0;
     let tn = 0;
-    for (const d of mockDepartments) {
+    for (const d of liveDepartments) {
       tr += d.monthlyRevenue;
       td += d.monthlyCost;
       to += d.overheadAllocation;
       tn += d.monthlyProfit;
     }
-    tr *= f;
-    td *= f;
-    to *= f;
-    tn *= f;
     const grossProfit = tr - td;
     const grossMargin = tr > 0 ? (grossProfit / tr) * 100 : 0;
     const netMargin = tr > 0 ? (tn / tr) * 100 : 0;
@@ -161,10 +283,17 @@ export function ProfitIntelligenceView() {
       grossMargin,
       netMargin,
     };
-  }, [mockDepartments, periodFactor]);
+  }, [orgSummary, liveDepartments]);
 
-  const demoOverall = mockProfitAnalysis.overall;
-  const displayOverall = liveOverall ?? demoOverall;
+  const displayOverall = liveOverall ?? {
+    totalRevenue: 0,
+    totalDirectCost: 0,
+    totalOverhead: 0,
+    grossProfit: 0,
+    netProfit: 0,
+    grossMargin: 0,
+    netMargin: 0,
+  };
 
   const overheadSharePct = useMemo(() => {
     const rev = displayOverall.totalRevenue;
@@ -172,21 +301,33 @@ export function ProfitIntelligenceView() {
   }, [displayOverall.totalRevenue, displayOverall.totalOverhead]);
 
   const deptBreakdownRows = useMemo(() => {
-    if (!hasLiveDeptData) return [];
-    const f = periodFactor;
-    return mockDepartments.map((d) => ({
+    if (!liveDepartments || liveDepartments.length === 0) return [];
+    return liveDepartments.map((d: Department) => ({
       department: d.name,
-      revenue: d.monthlyRevenue * f,
-      directCost: d.monthlyCost * f,
-      allocatedOverhead: d.overheadAllocation * f,
-      netProfit: d.monthlyProfit * f,
+      revenue: d.monthlyRevenue,
+      directCost: d.monthlyCost,
+      allocatedOverhead: d.overheadAllocation,
+      netProfit: d.monthlyProfit,
       profitMargin: d.profitMargin,
     }));
-  }, [mockDepartments, periodFactor, hasLiveDeptData]);
+  }, [liveDepartments]);
 
   const hasDeptBreakdown = deptBreakdownRows.length > 0;
-  const clientRows = mockProfitAnalysis.byClient;
-  const hasClientRows = clientRows.length > 0;
+  const hasClientRows = (clientRows || []).length > 0;
+
+  const totalSpaceSqft = useMemo(() => {
+    return (spaceMetrics || []).reduce((sum, s) => sum + Number(s.squareFootage || 0), 0);
+  }, [spaceMetrics]);
+
+  const avgRevPerSqft = useMemo(() => {
+    const totRev = (spaceMetrics || []).reduce((sum, s) => sum + Number(s.revenue || 0), 0);
+    return totalSpaceSqft > 0 ? totRev / totalSpaceSqft : 0;
+  }, [spaceMetrics, totalSpaceSqft]);
+
+  const avgCostPerSqft = useMemo(() => {
+    const totCost = (spaceMetrics || []).reduce((sum, s) => sum + Number(s.cost || 0), 0);
+    return totalSpaceSqft > 0 ? totCost / totalSpaceSqft : 0;
+  }, [spaceMetrics, totalSpaceSqft]);
 
   const periodLabel = !hasLiveDeptData
     ? 'Sample data'
@@ -194,7 +335,9 @@ export function ProfitIntelligenceView() {
       ? 'This month'
       : period === '3M'
         ? 'Last 3 months (monthly × 3)'
-        : 'Last 12 months (monthly × 12)';
+        : period === '1Y'
+          ? 'Last 12 months (monthly × 12)'
+          : 'All Time (all transactions)';
 
   return (
     <div 
@@ -234,33 +377,33 @@ export function ProfitIntelligenceView() {
         <div className="mt-4 ml-0 sm:ml-[60px] flex flex-col gap-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-slate-500">Period</span>
-            {(['1M', '3M', '1Y'] as const).map((p) => (
+            {(['1M', '3M', '1Y', 'ALL'] as const).map((p) => (
               <button
                 key={p}
                 type="button"
-                disabled={!hasLiveDeptData}
+                disabled={!hasLiveDeptData && p !== 'ALL'}
                 title={
-                  hasLiveDeptData
+                  p === 'ALL'
+                    ? 'Show all transactions (including future-dated)'
+                    : hasLiveDeptData
                     ? 'Scale monthly department figures by this range (totals and department charts).'
                     : 'Available when your org has at least one department with profitability data.'
                 }
                 onClick={() => setPeriod(p)}
                 className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors min-h-9 touch-manipulation ${
-                  !hasLiveDeptData
+                  (!hasLiveDeptData && p !== 'ALL')
                     ? 'cursor-not-allowed opacity-45 bg-slate-800/30 text-slate-500'
                     : period === p
                       ? 'bg-purple-500/30 text-white ring-1 ring-purple-400/40'
                       : 'bg-slate-800/50 text-slate-400 hover:bg-slate-800'
                 }`}
               >
-                {p === '1M' ? '1 month' : p === '3M' ? '3 months' : '1 year'}
+                {p === '1M' ? '1 month' : p === '3M' ? '3 months' : p === '1Y' ? '1 year' : 'All Time'}
               </button>
             ))}
           </div>
           <p className="text-xs text-slate-500 max-w-xl">
-            {hasLiveDeptData
-              ? 'Totals and department charts scale monthly figures by the selected range (demo-quality until date filters are wired to the API).'
-              : 'Period is disabled until at least one department returns from your org. Top KPIs below show static sample numbers.'}
+            Totals and department metrics reflect transactions and overhead allocations within the selected period.
           </p>
         </div>
         {deptProfitLoading && (
@@ -327,7 +470,7 @@ export function ProfitIntelligenceView() {
                   WebkitTextFillColor: 'transparent',
                 }}
               >
-                PKR {Math.round(displayOverall.totalRevenue / 1000)}K
+                {currency} {Math.round(displayOverall.totalRevenue / 1000)}K
               </p>
               <p className="text-xs mt-1" style={{ color: theme === 'dark' ? '#64748b' : '#94a3b8' }}>{periodLabel}</p>
             </div>
@@ -385,7 +528,7 @@ export function ProfitIntelligenceView() {
                   WebkitTextFillColor: 'transparent',
                 }}
               >
-                PKR {Math.round(displayOverall.grossProfit / 1000)}K
+                {currency} {Math.round(displayOverall.grossProfit / 1000)}K
               </p>
               <p className="text-xs mt-1" style={{ color: theme === 'dark' ? '#64748b' : '#94a3b8' }}>
                 Margin: {displayOverall.grossMargin.toFixed(1)}% · {periodLabel}
@@ -434,7 +577,7 @@ export function ProfitIntelligenceView() {
                   <Target className="w-5 h-5" style={{ color: theme === 'dark' ? 'rgb(216, 180, 254)' : 'rgb(168, 85, 247)' }} />
                 </div>
               </div>
-              <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Net Profit</p>
+              <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Operating Profit</p>
               <p 
                 className="text-3xl font-bold"
                 style={{
@@ -445,10 +588,15 @@ export function ProfitIntelligenceView() {
                   WebkitTextFillColor: 'transparent',
                 }}
               >
-                PKR {Math.round(displayOverall.netProfit / 1000)}K
+                {currency} {Math.round(displayOverall.netProfit / 1000)}K
               </p>
               <p className="text-xs mt-1" style={{ color: theme === 'dark' ? '#64748b' : '#94a3b8' }}>
                 Margin: {displayOverall.netMargin.toFixed(1)}% · {periodLabel}
+                {orgSummary?.profitVelocity && (
+                  <span className="ml-2 font-medium" style={{ color: 'rgb(216, 180, 254)' }}>
+                    · Velocity: {currency}{orgSummary.profitVelocity.velocityAmount.toFixed(0)}/day
+                  </span>
+                )}
               </p>
             </div>
           </div>
@@ -505,7 +653,7 @@ export function ProfitIntelligenceView() {
                   WebkitTextFillColor: 'transparent',
                 }}
               >
-                PKR {Math.round(displayOverall.totalOverhead / 1000)}K
+                {currency} {Math.round(displayOverall.totalOverhead / 1000)}K
               </p>
               <p className="text-xs mt-1" style={{ color: theme === 'dark' ? '#64748b' : '#94a3b8' }}>
                 {overheadSharePct.toFixed(1)}% of revenue · {periodLabel}
@@ -679,7 +827,7 @@ export function ProfitIntelligenceView() {
                         fill="#8884d8"
                         dataKey="netProfit"
                       >
-                        {deptBreakdownRows.map((entry, index) => (
+                        {deptBreakdownRows.map((entry: any, index: number) => (
                           <Cell key={`cell-${entry.department}-${index}`} fill={COLORS[index % COLORS.length]} />
                         ))}
                       </Pie>
@@ -728,13 +876,13 @@ export function ProfitIntelligenceView() {
             </div>
 
             <div className="space-y-4">
-              {mockDepartments.length === 0 && (
+              {liveDepartments.length === 0 && (
                 <p className="text-slate-400 text-sm py-6 text-center border border-dashed border-slate-600/50 rounded-2xl">
                   No department profitability rows yet. Add departments and post transactions tagged to a department — charts
                   above stay empty until then (top KPIs may show sample figures).
                 </p>
               )}
-              {mockDepartments.map((dept, idx) => (
+              {liveDepartments.map((dept, idx) => (
                 <motion.div
                   key={dept.id}
                   initial={{ opacity: 0, x: -20 }}
@@ -752,41 +900,41 @@ export function ProfitIntelligenceView() {
                       <p className="text-sm text-slate-400">👥 {dept.teamMembers} members · ⚡ {dept.utilization.toFixed(1)}% utilization</p>
                     </div>
                     <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                      dept.profitMargin >= 15 
+                      (dept.profitMargin || 0) >= 15 
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30' 
-                        : dept.profitMargin >= 10 
+                        : (dept.profitMargin || 0) >= 10 
                         ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30' 
                         : 'bg-red-500/20 text-red-300 border border-red-400/30'
                     }`}>
-                      {dept.profitMargin.toFixed(1)}% margin
+                      {(dept.profitMargin || 0).toFixed(1)}% margin
                     </div>
                   </div>
                   <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                     <div>
                       <p className="text-xs text-slate-400 mb-1">Cost/Hour</p>
-                      <p className="font-bold text-white">PKR {dept.costPerHour.toLocaleString()}</p>
+                      <p className="font-bold text-white">{currency} {(dept.costPerHour || 0).toLocaleString()}</p>
                     </div>
                     <div>
                       <p className="text-xs text-slate-400 mb-1">Revenue</p>
-                      <p className="font-bold text-green-400">PKR {(dept.monthlyRevenue / 1000).toFixed(0)}K</p>
+                      <p className="font-bold text-green-400">{currency} {((dept.monthlyRevenue || 0) / 1000).toFixed(0)}K</p>
                     </div>
                     <div>
                       <p className="text-xs text-slate-400 mb-1">Direct Cost</p>
-                      <p className="font-bold text-orange-400">PKR {(dept.monthlyCost / 1000).toFixed(0)}K</p>
+                      <p className="font-bold text-orange-400">{currency} {((dept.monthlyCost || 0) / 1000).toFixed(0)}K</p>
                     </div>
                     <div>
                       <p className="text-xs text-slate-400 mb-1">Overhead</p>
-                      <p className="font-bold text-purple-400">PKR {(dept.overheadAllocation / 1000).toFixed(0)}K</p>
+                      <p className="font-bold text-purple-400">{currency} {((dept.overheadAllocation || 0) / 1000).toFixed(0)}K</p>
                     </div>
                     <div>
                       <p className="text-xs text-slate-400 mb-1">Net Profit</p>
-                      <p className="font-bold text-cyan-400">PKR {(dept.monthlyProfit / 1000).toFixed(0)}K</p>
+                      <p className="font-bold text-cyan-400">{currency} {((dept.monthlyProfit || 0) / 1000).toFixed(0)}K</p>
                     </div>
                   </div>
                   <div className="mt-3">
                     <div className="flex justify-between text-xs text-slate-400 mb-1">
-                      <span>Billable Hours: {dept.billableHours} / {dept.totalHours}</span>
-                      <span>Avg Rate: PKR {dept.billableHours > 0 ? Math.round(dept.monthlyRevenue / dept.billableHours) : 0}/hr</span>
+                      <span>Billable Hours: {dept.billableHours || 0} / {dept.totalHours || 0}</span>
+                      <span>Avg Rate: {currency} {(dept.billableHours || 0) > 0 ? Math.round((dept.monthlyRevenue || 0) / (dept.billableHours || 1)) : 0}/hr</span>
                     </div>
                   </div>
                 </motion.div>
@@ -808,81 +956,167 @@ export function ProfitIntelligenceView() {
               boxShadow: '0 20px 60px -20px rgba(0, 0, 0, 0.8)',
             }}
           >
-            <div className="flex items-center gap-3 mb-6">
-              <div 
-                className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
-                style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
-              >
-                <Briefcase className="w-6 h-6 text-white" />
+            <div className="flex items-center justify-between mb-6">
+              <div className="flex items-center gap-3">
+                <div 
+                  className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
+                  style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
+                >
+                  <Briefcase className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <h2 className="text-2xl font-bold text-white">Project Profitability</h2>
+                  <p className="text-slate-400 text-sm">Direct expense & timesheet labor burn analysis</p>
+                </div>
               </div>
-              <div>
-                <h2 className="text-2xl font-bold text-white">Project Profitability</h2>
-                <p className="text-slate-400 text-sm">Quoted vs Actual analysis</p>
+              
+              {/* Period filter buttons */}
+              <div className="flex gap-2">
+                {(['1M', '3M', '12M'] as const).map(p => (
+                  <button
+                    key={p}
+                    onClick={() => setProjectPeriod(p)}
+                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                      projectPeriod === p 
+                        ? 'bg-purple-600 text-white shadow-lg' 
+                        : 'bg-white/10 text-gray-400 hover:bg-white/20'
+                    }`}
+                  >
+                    {p === '1M' ? 'Last Month' : p === '3M' ? 'Last 3 Months' : 'Last Year'}
+                  </button>
+                ))}
               </div>
             </div>
 
-            <div className="space-y-4">
-              {mockProjects.map((project, idx) => (
-                <motion.div
-                  key={project.id}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.5 + idx * 0.05 }}
-                  className="p-5 rounded-2xl"
-                  style={{
-                    background: 'rgba(0, 0, 0, 0.3)',
-                    border: '1px solid rgba(148, 163, 184, 0.1)',
-                  }}
-                >
-                  <div className="flex items-center justify-between mb-3">
-                    <div>
-                      <h3 className="font-bold text-white">{project.name}</h3>
-                      <p className="text-sm text-slate-400">{project.client} · {project.department}</p>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                        project.status === 'completed' 
-                          ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
-                          : project.status === 'in-progress' 
-                          ? 'bg-blue-500/20 text-blue-300 border border-blue-400/30' 
-                          : 'bg-slate-500/20 text-slate-300 border border-slate-400/30'
-                      }`}>
-                        {project.status}
+            {projectProfitLoading ? (
+              <div className="flex items-center justify-center py-12">
+                <div className="text-slate-400">Loading project data...</div>
+              </div>
+            ) : !rawProjectProfit || rawProjectProfit.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12">
+                <Briefcase className="w-12 h-12 text-slate-600 mb-4" />
+                <p className="text-slate-400 text-center">No project data yet</p>
+                <p className="text-slate-500 text-sm text-center mt-2">
+                  Create projects and tag transactions to see profitability analysis
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {rawProjectProfit.map((profitData, idx) => {
+                  // Map API response to local rendering shape
+                  const project = {
+                    id: profitData.projectId,
+                    name: profitData.projectName,
+                    client: profitData.clientName,
+                    quotedAmount: profitData.quotedAmount,
+                    actualCost: profitData.actualCost,
+                    directCost: profitData.directCost ?? 0,
+                    laborCost: profitData.laborCost ?? 0,
+                    actualProfit: profitData.profit,
+                    profitMargin: profitData.profitMargin,
+                    status: profitData.status === 'active' ? 'in-progress' as const : profitData.status as 'quoted' | 'in-progress' | 'completed',
+                    budgetVariance: profitData.budgetVariance,
+                    revenue: profitData.revenue || 0,
+                    loggedHours: profitData.loggedHours || 0,
+                    contributorCount: profitData.contributorCount || 0,
+                  };
+
+                  return (
+                    <motion.div
+                      key={project.id}
+                      initial={{ opacity: 0, x: -20 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ delay: 0.5 + idx * 0.05 }}
+                      className="p-5 rounded-2xl"
+                      style={{
+                        background: 'rgba(0, 0, 0, 0.3)',
+                        border: '1px solid rgba(148, 163, 184, 0.1)',
+                      }}
+                    >
+                      <div className="flex items-center justify-between mb-3">
+                        <div>
+                          <h3 className="font-bold text-white">{project.name}</h3>
+                          <p className="text-sm text-slate-400">{project.client}</p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                            project.status === 'completed' 
+                              ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
+                              : project.status === 'in-progress' 
+                              ? 'bg-blue-500/20 text-blue-300 border border-blue-400/30' 
+                              : 'bg-slate-500/20 text-slate-300 border border-slate-400/30'
+                          }`}>
+                            {project.status}
+                          </div>
+                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                            project.profitMargin >= 20 
+                              ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
+                              : project.profitMargin >= 10 
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30' 
+                              : 'bg-red-500/20 text-red-300 border border-red-400/30'
+                          }`}>
+                            {project.profitMargin.toFixed(1)}%
+                          </div>
+                          {/* Budget variance indicator */}
+                          {project.budgetVariance !== 0 && (
+                            <div className={`px-3 py-1 rounded-lg text-xs font-medium flex items-center gap-1 ${
+                              project.budgetVariance > 0 
+                                ? 'bg-red-500/20 text-red-300 border border-red-400/30' 
+                                : 'bg-green-500/20 text-green-300 border border-green-400/30'
+                            }`}>
+                              {project.budgetVariance > 0 ? (
+                                <TrendingUp className="w-3 h-3" />
+                              ) : (
+                                <TrendingDown className="w-3 h-3" />
+                              )}
+                              {Math.abs(project.budgetVariance).toFixed(1)}%
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                        project.profitMargin >= 20 
-                          ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
-                          : project.profitMargin >= 10 
-                          ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30' 
-                          : 'bg-red-500/20 text-red-300 border border-red-400/30'
-                      }`}>
-                        {project.profitMargin.toFixed(1)}%
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div>
+                          <p className="text-xs text-slate-400 mb-1">Quoted Amount</p>
+                          <p className="font-bold text-blue-400">{currency} {(project.quotedAmount / 1000).toFixed(0)}K</p>
+                          <p className="text-[11px] text-slate-400">
+                            {project.loggedHours > 0 ? `${project.loggedHours.toFixed(1)}h logged` : '0h logged'}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-slate-400 mb-1">Actual Cost</p>
+                          <p className="font-bold text-orange-400">
+                            {currency} {project.actualCost >= 1000 ? `${(project.actualCost / 1000).toFixed(1)}K` : project.actualCost.toFixed(0)}
+                          </p>
+                          <p className="text-[11px] text-slate-400 font-mono">
+                            Direct: {currency} {project.directCost >= 1000 ? `${(project.directCost / 1000).toFixed(1)}K` : project.directCost.toFixed(0)} · Labor: {currency} {project.laborCost.toFixed(0)}
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-slate-400 mb-1">Revenue</p>
+                          <p className="font-bold text-cyan-400">{currency} {(project.revenue / 1000).toFixed(0)}K</p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-slate-400 mb-1">Operating Profit</p>
+                          <p className={`font-bold ${project.actualProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {currency} {(project.actualProfit / 1000).toFixed(0)}K
+                          </p>
+                          <p className="text-[11px] text-slate-400">{project.profitMargin.toFixed(1)}% margin</p>
+                        </div>
                       </div>
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                    <div>
-                      <p className="text-xs text-slate-400 mb-1">Quoted Amount</p>
-                      <p className="font-bold text-blue-400">PKR {(project.quotedAmount / 1000).toFixed(0)}K</p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-400 mb-1">Actual Cost</p>
-                      <p className="font-bold text-orange-400">PKR {(project.actualCost / 1000).toFixed(0)}K</p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-400 mb-1">Actual Profit</p>
-                      <p className={`font-bold ${project.actualProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        PKR {(project.actualProfit / 1000).toFixed(0)}K
-                      </p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-slate-400 mb-1">Hours</p>
-                      <p className="font-bold text-white">{project.hoursActual} / {project.hoursQuoted}</p>
-                    </div>
-                  </div>
-                </motion.div>
-              ))}
-            </div>
+                      <button
+                        onClick={() => {
+                          setSelectedProjectId(project.id);
+                          setIsProjectModalOpen(true);
+                        }}
+                        className="mt-3 text-sm text-purple-400 hover:text-purple-300 underline transition-colors"
+                      >
+                        View Details & Attributions
+                      </button>
+                    </motion.div>
+                  );
+                })}
+              </div>
+            )}
           </motion.div>
         </TabsContent>
 
@@ -922,10 +1156,10 @@ export function ProfitIntelligenceView() {
 
               {hasClientRows ? (
                 <ResponsiveContainer width="100%" height={400}>
-                  <BarChart data={clientRows}>
+                  <BarChart data={clientRows || []}>
                     <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.08)" vertical={false} />
                     <XAxis
-                      dataKey="client"
+                      dataKey="clientName"
                       stroke="rgba(148, 163, 184, 0.5)"
                       style={{ fontSize: '12px', fontWeight: 500 }}
                       tickLine={false}
@@ -997,32 +1231,41 @@ export function ProfitIntelligenceView() {
                 </div>
 
                 <ResponsiveContainer width="100%" height={300}>
-                  <PieChart>
-                    <Pie
-                      data={mockOverheads}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={(entry) => `${entry.category}: PKR ${(entry.amount / 1000).toFixed(0)}K`}
-                      outerRadius={100}
-                      fill="#8884d8"
-                      dataKey="amount"
-                    >
-                      {mockOverheads.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip 
-                      contentStyle={{ 
-                        backgroundColor: 'rgba(15, 23, 42, 0.98)', 
-                        border: '1px solid rgba(245, 158, 11, 0.3)',
-                        backdropFilter: 'blur(20px)',
-                        borderRadius: '12px',
-                        padding: '12px 16px',
-                        boxShadow: '0 10px 30px rgba(0, 0, 0, 0.2)',
-                      }}
-                    />
-                  </PieChart>
+                  {overheadData && overheadData.items && overheadData.items.length > 0 ? (
+                    <PieChart>
+                      <Pie
+                        data={(overheadData.items || []).map(item => ({
+                          category: item.name,
+                          amount: item.pool
+                        }))}
+                        cx="50%"
+                        cy="50%"
+                        labelLine={false}
+                        label={(entry) => `${entry.category}: ${currency} ${(entry.amount / 1000).toFixed(0)}K`}
+                        outerRadius={100}
+                        fill="#8884d8"
+                        dataKey="amount"
+                      >
+                        {(overheadData.items || []).map((entry, index) => (
+                          <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip 
+                        contentStyle={{ 
+                          backgroundColor: 'rgba(15, 23, 42, 0.98)', 
+                          border: '1px solid rgba(245, 158, 11, 0.3)',
+                          backdropFilter: 'blur(20px)',
+                          borderRadius: '12px',
+                          padding: '12px 16px',
+                          boxShadow: '0 10px 30px rgba(0, 0, 0, 0.2)',
+                        }}
+                      />
+                    </PieChart>
+                  ) : (
+                    <div className="h-[300px] flex items-center justify-center bg-slate-900/50 border border-slate-700 rounded-2xl">
+                      <p className="text-slate-400">Loading overhead data...</p>
+                    </div>
+                  )}
                 </ResponsiveContainer>
               </div>
             </motion.div>
@@ -1052,9 +1295,9 @@ export function ProfitIntelligenceView() {
               </div>
 
               <div className="space-y-4">
-                {mockOverheads.map((overhead, idx) => (
+                {(overheadData?.items || []).map((overhead, idx) => (
                   <motion.div 
-                    key={idx} 
+                    key={overhead.id} 
                     initial={{ opacity: 0, x: -20 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: 0.6 + idx * 0.1 }}
@@ -1065,12 +1308,12 @@ export function ProfitIntelligenceView() {
                     }}
                   >
                     <div className="flex justify-between items-center mb-2">
-                      <h4 className="font-bold text-white">{overhead.category}</h4>
-                      <p className="font-bold text-orange-400">PKR {(overhead.amount / 1000).toFixed(0)}K</p>
+                      <h4 className="font-bold text-white">{overhead.name}</h4>
+                      <p className="font-bold text-orange-400">{currency} {(overhead.pool / 1000).toFixed(0)}K</p>
                     </div>
                     <div className="flex justify-between text-sm">
-                      <span className="text-slate-400">{overhead.frequency}</span>
-                      <span className="text-slate-400">{overhead.allocationType}</span>
+                      <span className="text-slate-400 capitalize">{overhead.allocationBase.replace('_', ' ')}</span>
+                      <span className="text-slate-400">{overhead.allocationType || 'Direct'}</span>
                     </div>
                     <div className="mt-2 text-xs text-slate-500">
                       Allocated to: {overhead.departments.join(', ')}
@@ -1105,69 +1348,102 @@ export function ProfitIntelligenceView() {
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {mockWhatIfScenarios.map((scenario, idx) => (
-              <motion.div
-                key={scenario.id}
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ delay: 0.4 + idx * 0.1 }}
-                className="p-6 rounded-3xl"
-                style={{
-                  background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.5) 0%, rgba(0, 0, 0, 0.3) 100%)',
-                  border: '1px solid rgba(148, 163, 184, 0.1)',
-                  boxShadow: '0 20px 60px -20px rgba(0, 0, 0, 0.8)',
-                }}
-              >
-                <div className="flex justify-between items-start mb-4">
-                  <div>
-                    <h3 className="text-xl font-bold text-white mb-1">{scenario.name}</h3>
-                    <p className="text-slate-400 text-sm">
-                      {scenario.changes
-                        .map((c) => `${c.type.replace(/-/g, ' ')} · ${c.target}`)
-                        .join(' · ')}
-                    </p>
-                  </div>
-                  <div
-                    className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                      scenario.impact >= 0
-                        ? 'bg-green-500/20 text-green-300 border border-green-400/30'
-                        : 'bg-red-500/20 text-red-300 border border-red-400/30'
-                    }`}
-                  >
-                    Impact PKR {(scenario.impact / 1000).toFixed(0)}K
-                  </div>
-                </div>
+            {scenariosLoading ? (
+              <div className="col-span-2 flex items-center justify-center py-12">
+                <div className="text-slate-400">Loading scenarios...</div>
+              </div>
+            ) : (whatIfScenarios || []).length === 0 ? (
+              <div className="col-span-2 p-12 text-center rounded-3xl" style={{
+                background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.5) 0%, rgba(0, 0, 0, 0.3) 100%)',
+                border: '1px solid rgba(148, 163, 184, 0.1)',
+              }}>
+                <Zap className="w-16 h-16 mx-auto mb-4 text-slate-600" />
+                <h3 className="text-xl font-bold text-white mb-2">No Scenarios Yet</h3>
+                <p className="text-slate-400 mb-6">Create what-if scenarios to model different business outcomes</p>
+                <button className="px-6 py-3 rounded-xl text-sm font-medium text-white" style={{
+                  background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.3), rgba(236, 72, 153, 0.3))',
+                  border: '1px solid rgba(168, 85, 247, 0.5)',
+                }}>
+                  <Plus className="size-4 inline mr-2" />
+                  Create Your First Scenario
+                </button>
+              </div>
+            ) : (whatIfScenarios || []).map((scenarioItem, idx) => {
+              const scenario = scenarioItem as any;
+              const impact = scenarioItem.lastResult?.profitChange ?? scenario.impact ?? 0;
+              const projectedProfit = scenarioItem.lastResult?.profit ?? scenario.projectedProfit ?? 0;
+              const projectedMargin = scenarioItem.lastResult?.margin ?? scenario.projectedMargin ?? 0;
+              const description = scenario.description || (scenarioItem.isPreset ? 'Preset scenario' : 'Custom what-if model');
+              const adjustments = scenario.adjustments || [
+                ...(scenarioItem.revenueChangePct ? [{ label: 'Revenue change', value: scenarioItem.revenueChangePct }] : []),
+                ...(scenarioItem.expenseChangePct ? [{ label: 'Expense change', value: scenarioItem.expenseChangePct }] : []),
+                ...(scenarioItem.priceIncreasePct ? [{ label: 'Price increase', value: scenarioItem.priceIncreasePct }] : []),
+                ...(scenarioItem.utilizationRatePct ? [{ label: 'Utilization', value: scenarioItem.utilizationRatePct }] : []),
+                ...(scenarioItem.newHires ? [{ label: `New hires (${scenarioItem.newHires})`, value: scenarioItem.newHires }] : []),
+              ];
 
-                <div className="grid grid-cols-3 gap-4 mb-4">
-                  <div>
-                    <p className="text-xs text-slate-400 mb-1">Projected profit</p>
-                    <p className="font-bold text-white">PKR {(scenario.projectedProfit / 1000).toFixed(0)}K</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-400 mb-1">Projected margin</p>
-                    <p className="font-bold text-green-400">{scenario.projectedMargin.toFixed(1)}%</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-400 mb-1">vs baseline</p>
-                    <p className="font-bold text-cyan-400">
-                      {scenario.projectedProfit >= displayOverall.netProfit ? '+' : ''}
-                      PKR {((scenario.projectedProfit - displayOverall.netProfit) / 1000).toFixed(0)}K
-                    </p>
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  {scenario.changes.map((change, cidx) => (
-                    <div key={cidx} className="flex justify-between text-sm">
-                      <span className="text-slate-400 capitalize">
-                        {change.type.replace(/-/g, ' ')} · {change.target}
-                      </span>
-                      <span className="text-white font-medium">{change.percentage}%</span>
+              return (
+                <motion.div
+                  key={scenarioItem.id}
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ delay: 0.4 + idx * 0.1 }}
+                  className="p-6 rounded-3xl"
+                  style={{
+                    background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.5) 0%, rgba(0, 0, 0, 0.3) 100%)',
+                    border: '1px solid rgba(148, 163, 184, 0.1)',
+                    boxShadow: '0 20px 60px -20px rgba(0, 0, 0, 0.8)',
+                  }}
+                >
+                  <div className="flex justify-between items-start mb-4">
+                    <div>
+                      <h3 className="text-xl font-bold text-white mb-1">{scenarioItem.name}</h3>
+                      <p className="text-slate-400 text-sm">{description}</p>
                     </div>
-                  ))}
-                </div>
-              </motion.div>
-            ))}
+                    <div
+                      className={`px-3 py-1 rounded-lg text-xs font-medium ${
+                        impact >= 0
+                          ? 'bg-green-500/20 text-green-300 border border-green-400/30'
+                          : 'bg-red-500/20 text-red-300 border border-red-400/30'
+                      }`}
+                    >
+                      Impact {currency} {(impact / 1000).toFixed(0)}K
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-4 mb-4">
+                    <div>
+                      <p className="text-xs text-slate-400 mb-1">Projected profit</p>
+                      <p className="font-bold text-white">{currency} {(projectedProfit / 1000).toFixed(0)}K</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 mb-1">Projected margin</p>
+                      <p className="font-bold text-green-400">{projectedMargin.toFixed(1)}%</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 mb-1">vs baseline</p>
+                      <p className="font-bold text-cyan-400">
+                        {projectedProfit >= displayOverall.netProfit ? '+' : ''}
+                        {currency} {((projectedProfit - displayOverall.netProfit) / 1000).toFixed(0)}K
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    {adjustments.map((adjustment: any, cidx: number) => (
+                      <div key={cidx} className="flex justify-between text-sm">
+                        <span className="text-slate-400 capitalize">
+                          {adjustment.label || adjustment.type || 'Adjustment'}
+                        </span>
+                        <span className="text-white font-medium">
+                          {adjustment.value != null ? `${adjustment.value > 0 ? '+' : ''}${adjustment.value}%` : 'N/A'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </motion.div>
+              );
+            })}
           </div>
         </TabsContent>
 
@@ -1199,67 +1475,83 @@ export function ProfitIntelligenceView() {
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div>
-                <ResponsiveContainer width="100%" height={300}>
-                  <PieChart>
-                    <Pie
-                      data={[
-                        { name: 'Business', value: 1890000, fill: '#3b82f6' },
-                        { name: 'Personal', value: 450000, fill: '#10b981' },
-                      ]}
-                      cx="50%"
-                      cy="50%"
-                      labelLine={false}
-                      label={(entry) => `${entry.name}: PKR ${(entry.value / 1000).toFixed(0)}K`}
-                      outerRadius={100}
-                      dataKey="value"
-                    >
-                      <Cell fill="#3b82f6" />
-                      <Cell fill="#10b981" />
-                    </Pie>
-                    <Tooltip 
-                      contentStyle={{ 
-                        backgroundColor: 'rgba(15, 23, 42, 0.98)', 
-                        border: '1px solid rgba(148, 163, 184, 0.3)',
-                        backdropFilter: 'blur(20px)',
-                        borderRadius: '12px',
-                        padding: '12px 16px',
-                      }}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
+                {businessPersonalData && businessPersonalData.length > 0 ? (
+                  <>
+                    <ResponsiveContainer width="100%" height={300}>
+                      <PieChart>
+                        <Pie
+                          data={[
+                            { name: 'Business', value: (businessPersonalData?.find(d => d.scope === 'business')?.income || 0), fill: '#3b82f6' },
+                            { name: 'Personal', value: (businessPersonalData?.find(d => d.scope === 'personal')?.income || 0), fill: '#10b981' },
+                          ].filter(d => d.value > 0)}
+                          cx="50%"
+                          cy="50%"
+                          labelLine={false}
+                          label={(entry) => `${entry.name}: ${currency} ${(entry.value / 1000).toFixed(0)}K`}
+                          outerRadius={100}
+                          dataKey="value"
+                        >
+                          <Cell fill="#3b82f6" />
+                          <Cell fill="#10b981" />
+                        </Pie>
+                        <Tooltip 
+                          contentStyle={{ 
+                            backgroundColor: 'rgba(15, 23, 42, 0.98)', 
+                            border: '1px solid rgba(148, 163, 184, 0.3)',
+                            backdropFilter: 'blur(20px)',
+                            borderRadius: '12px',
+                            padding: '12px 16px',
+                          }}
+                        />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </>
+                ) : (
+                  <div className="h-[300px] flex items-center justify-center bg-slate-900/50 border border-slate-700 rounded-2xl">
+                    <p className="text-slate-400">Loading business vs personal data...</p>
+                  </div>
+                )}
               </div>
               <div className="space-y-4">
                 <div className="p-5 bg-blue-600/20 border border-blue-500/30 rounded-lg">
-                  <h3 className="text-lg font-bold text-white mb-2">Business Expenses</h3>
-                  <p className="text-3xl font-bold text-blue-400 mb-2">PKR 1,890K</p>
-                  <p className="text-sm text-blue-200">80.8% of total expenses</p>
+                  <h3 className="text-lg font-bold text-white mb-2">Business Income</h3>
+                  <p className="text-3xl font-bold text-blue-400 mb-2">{currency} {((businessPersonalData?.find(d => d.scope === 'business')?.income || 0) / 1000).toFixed(0)}K</p>
+                  <p className="text-sm text-blue-200">
+                    {businessPersonalData ? 
+                      `${(((businessPersonalData.find(d => d.scope === 'business')?.income || 0) / 
+                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) + 
+                         (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income` 
+                      : '0% of total income'}
+                  </p>
                   <div className="mt-3 space-y-1 text-sm text-blue-100">
                     <div className="flex justify-between">
-                      <span>Salaries & Wages</span>
-                      <span>PKR 1,200K</span>
+                      <span>Expenses</span>
+                      <span>{currency} {((businessPersonalData?.find(d => d.scope === 'business')?.expense || 0) / 1000).toFixed(0)}K</span>
                     </div>
                     <div className="flex justify-between">
-                      <span>Office & Tools</span>
-                      <span>PKR 420K</span>
-                    </div>
-                    <div className="flex justify-between">
-                      <span>Marketing</span>
-                      <span>PKR 270K</span>
+                      <span>Net</span>
+                      <span>{currency} {((businessPersonalData?.find(d => d.scope === 'business')?.net || 0) / 1000).toFixed(0)}K</span>
                     </div>
                   </div>
                 </div>
                 <div className="p-5 bg-green-600/20 border border-green-500/30 rounded-lg">
-                  <h3 className="text-lg font-bold text-white mb-2">Personal Expenses</h3>
-                  <p className="text-3xl font-bold text-green-400 mb-2">PKR 450K</p>
-                  <p className="text-sm text-green-200">19.2% of total expenses</p>
+                  <h3 className="text-lg font-bold text-white mb-2">Personal Income</h3>
+                  <p className="text-3xl font-bold text-green-400 mb-2">{currency} {((businessPersonalData?.find(d => d.scope === 'personal')?.income || 0) / 1000).toFixed(0)}K</p>
+                  <p className="text-sm text-green-200">
+                    {businessPersonalData ? 
+                      `${(((businessPersonalData.find(d => d.scope === 'personal')?.income || 0) / 
+                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) + 
+                         (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income` 
+                      : '0% of total income'}
+                  </p>
                   <div className="mt-3 space-y-1 text-sm text-green-100">
                     <div className="flex justify-between">
-                      <span>Owner Drawings</span>
-                      <span>PKR 300K</span>
+                      <span>Expenses</span>
+                      <span>{currency} {((businessPersonalData?.find(d => d.scope === 'personal')?.expense || 0) / 1000).toFixed(0)}K</span>
                     </div>
                     <div className="flex justify-between">
-                      <span>Personal Tax</span>
-                      <span>PKR 150K</span>
+                      <span>Net</span>
+                      <span>{currency} {((businessPersonalData?.find(d => d.scope === 'personal')?.net || 0) / 1000).toFixed(0)}K</span>
                     </div>
                   </div>
                 </div>
@@ -1268,7 +1560,7 @@ export function ProfitIntelligenceView() {
           </motion.div>
         </TabsContent>
 
-        {/* Per Sq Ft Tab */}
+        {/* Per Sq Ft Tab — §12.5 Space Efficiency & Square Foot Profitability */}
         <TabsContent value="sqft" className="space-y-6">
           <motion.div
             initial={{ opacity: 0, y: 30 }}
@@ -1276,9 +1568,9 @@ export function ProfitIntelligenceView() {
             transition={{ delay: 0.4 }}
             className="p-8 rounded-3xl"
             style={{
-              background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.5) 0%, rgba(0, 0, 0, 0.3) 100%)',
-              border: '1px solid rgba(148, 163, 184, 0.1)',
-              boxShadow: '0 20px 60px -20px rgba(0, 0, 0, 0.8)',
+              background: 'linear-gradient(135deg, rgba(30, 15, 50, 0.6) 0%, rgba(10, 5, 20, 0.8) 100%)',
+              border: '1px solid rgba(168, 85, 247, 0.2)',
+              boxShadow: '0 20px 60px -20px rgba(168, 85, 247, 0.5)',
             }}
           >
             <div className="flex items-center gap-3 mb-6">
@@ -1289,64 +1581,274 @@ export function ProfitIntelligenceView() {
                 <Maximize2 className="w-6 h-6 text-white" />
               </div>
               <div>
-                <h2 className="text-2xl font-bold text-white">Revenue & Profit Per Square Foot</h2>
-                <p className="text-slate-400 text-sm">Space efficiency analysis</p>
+                <h3 className="text-xl font-bold text-white">Square-Foot Profitability & Space Efficiency (§12.5)</h3>
+                <p className="text-sm text-slate-400">
+                  Floor area productivity and operating cost density across departmental office allocations
+                </p>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-              <div className="p-6 bg-blue-600/20 border border-blue-500/30 rounded-lg">
-                <h3 className="text-sm text-blue-200 mb-2">Total Office Space</h3>
-                <p className="text-4xl font-bold text-white mb-1">2,800 sq ft</p>
-                <p className="text-sm text-blue-300">Monthly rent: PKR 200K</p>
+            {/* Space Metrics KPI Cards */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+              <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-700/60">
+                <p className="text-xs text-slate-400 mb-1">Total Assigned Space</p>
+                <p className="text-2xl font-bold text-white">
+                  {totalSpaceSqft > 0 ? `${totalSpaceSqft.toLocaleString()} sqft` : 'Not configured'}
+                </p>
+                <p className="text-xs text-slate-500 mt-1">Active Department Area</p>
               </div>
-              <div className="p-6 bg-green-600/20 border border-green-500/30 rounded-lg">
-                <h3 className="text-sm text-green-200 mb-2">Revenue per Sq Ft</h3>
-                <p className="text-4xl font-bold text-white mb-1">PKR 820</p>
-                <p className="text-sm text-green-300">Per month</p>
+              <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-700/60">
+                <p className="text-xs text-slate-400 mb-1">Average Revenue / Sq Ft</p>
+                <p className="text-2xl font-bold text-emerald-400">
+                  {currency} {avgRevPerSqft.toFixed(2)}
+                </p>
+                <p className="text-xs text-slate-500 mt-1">Per square foot</p>
               </div>
-              <div className="p-6 bg-purple-600/20 border border-purple-500/30 rounded-lg">
-                <h3 className="text-sm text-purple-200 mb-2">Profit per Sq Ft</h3>
-                <p className="text-4xl font-bold text-white mb-1">PKR 66</p>
-                <p className="text-sm text-purple-300">Net profit per month</p>
+              <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-700/60">
+                <p className="text-xs text-slate-400 mb-1">Average Cost / Sq Ft</p>
+                <p className="text-2xl font-bold text-amber-400">
+                  {currency} {avgCostPerSqft.toFixed(2)}
+                </p>
+                <p className="text-xs text-slate-500 mt-1">Direct + allocated OH</p>
+              </div>
+              <div className="p-4 rounded-2xl bg-slate-900/60 border border-slate-700/60">
+                <p className="text-xs text-slate-400 mb-1">Operating Profit / Sq Ft</p>
+                <p className={`text-2xl font-bold ${avgRevPerSqft >= avgCostPerSqft ? 'text-purple-300' : 'text-red-400'}`}>
+                  {currency} {(avgRevPerSqft - avgCostPerSqft).toFixed(2)}
+                </p>
+                <p className="text-xs text-slate-500 mt-1">Net space productivity</p>
               </div>
             </div>
 
-            <div className="space-y-4">
-              <h3 className="text-lg font-bold text-white">Department Space Allocation</h3>
-              {[
-                { dept: 'Design', sqft: 800, revenue: 665600, color: 'blue' },
-                { dept: 'Development', sqft: 1200, revenue: 1000000, color: 'green' },
-                { dept: 'Marketing', sqft: 500, revenue: 375000, color: 'orange' },
-                { dept: 'Admin', sqft: 300, revenue: 0, color: 'purple' },
-              ].map((item, idx) => (
-                <motion.div
-                  key={idx}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: 0.5 + idx * 0.1 }}
-                  className="p-5 rounded-2xl"
-                  style={{
-                    background: 'rgba(0, 0, 0, 0.3)',
-                    border: '1px solid rgba(148, 163, 184, 0.1)',
-                  }}
-                >
-                  <div className="flex justify-between items-center">
-                    <div>
-                      <h4 className="font-bold text-white">{item.dept}</h4>
-                      <p className="text-sm text-slate-400">{item.sqft} sq ft ({((item.sqft / 2800) * 100).toFixed(1)}% of total)</p>
-                    </div>
-                    <div className="text-right">
-                      <p className="font-bold text-white">PKR {Math.round(item.revenue / item.sqft)}/sq ft</p>
-                      <p className="text-sm text-slate-400">Monthly revenue</p>
-                    </div>
-                  </div>
-                </motion.div>
-              ))}
+            {/* Department Space Breakdown Table */}
+            {spaceMetrics && spaceMetrics.length > 0 ? (
+              <div className="overflow-x-auto rounded-2xl border border-slate-700/60 bg-slate-900/40">
+                <table className="w-full text-left text-sm text-slate-300">
+                  <thead className="bg-slate-800/60 text-xs uppercase text-slate-400 border-b border-slate-700/60">
+                    <tr>
+                      <th className="py-3 px-4">Department</th>
+                      <th className="py-3 px-4 text-right">Floor Area</th>
+                      <th className="py-3 px-4 text-right">Space Share</th>
+                      <th className="py-3 px-4 text-right">Revenue</th>
+                      <th className="py-3 px-4 text-right">Full Cost</th>
+                      <th className="py-3 px-4 text-right">Rev / Sqft</th>
+                      <th className="py-3 px-4 text-right">Cost / Sqft</th>
+                      <th className="py-3 px-4 text-right">Profit / Sqft</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/60">
+                    {spaceMetrics.map((sm) => (
+                      <tr key={sm.departmentId} className="hover:bg-slate-800/30 transition-colors">
+                        <td className="py-3.5 px-4 font-medium text-white">{sm.departmentName}</td>
+                        <td className="py-3.5 px-4 text-right text-slate-200">
+                          {sm.squareFootage > 0 ? `${sm.squareFootage.toLocaleString()} sqft` : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right text-cyan-400">
+                          {sm.spaceSharePct > 0 ? `${sm.spaceSharePct.toFixed(1)}%` : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right text-emerald-400 font-medium">
+                          {currency} {sm.revenue.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-3.5 px-4 text-right text-amber-400 font-medium">
+                          {currency} {sm.cost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-3.5 px-4 text-right text-white">
+                          {sm.squareFootage > 0 ? `${currency} ${sm.revPerSqft.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right text-white">
+                          {sm.squareFootage > 0 ? `${currency} ${sm.costPerSqft.toFixed(2)}` : '—'}
+                        </td>
+                        <td className={`py-3.5 px-4 text-right font-bold ${sm.profit >= 0 ? 'text-purple-300' : 'text-red-400'}`}>
+                          {sm.squareFootage > 0 ? `${currency} ${sm.profitPerSqft.toFixed(2)}` : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="p-8 text-center bg-slate-900/40 rounded-2xl border border-slate-800">
+                <p className="text-slate-400 text-sm">No departments available to compute space metrics.</p>
+              </div>
+            )}
+
+            {/* Policy Disclosure Footer (§12.5) */}
+            <div className="mt-4 p-3 rounded-xl bg-slate-800/40 border border-slate-700/50 flex items-center justify-between text-xs text-slate-400">
+              <span>Policy version: <strong className="text-slate-200">v1.2-costing</strong></span>
+              <span>Calculation: <strong className="text-slate-200">Occupied departmental space excluding common core</strong></span>
+              <span>Freshness: <strong className="text-emerald-400">Real-time DB query</strong></span>
             </div>
           </motion.div>
         </TabsContent>
       </Tabs>
+
+      {/* Project Transactions Modal */}
+      <Dialog open={isProjectModalOpen} onOpenChange={setIsProjectModalOpen}>
+        <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto bg-slate-900 border-slate-700">
+          <DialogHeader>
+            <DialogTitle className="text-2xl font-bold text-white">
+              {projectDetails?.project?.name || 'Project Transactions'}
+            </DialogTitle>
+            {projectDetails?.project && (
+              <div className="flex items-center gap-3 mt-2">
+                <p className="text-slate-400">{projectDetails.project.clientName}</p>
+                <div className={`px-2 py-1 rounded text-xs font-medium ${
+                  projectDetails.project.status === 'completed' 
+                    ? 'bg-green-500/20 text-green-300' 
+                    : projectDetails.project.status === 'active' 
+                    ? 'bg-blue-500/20 text-blue-300' 
+                    : 'bg-slate-500/20 text-slate-300'
+                }`}>
+                  {projectDetails.project.status}
+                </div>
+              </div>
+            )}
+          </DialogHeader>
+
+          {projectDetailsLoading ? (
+            <div className="py-8 text-center text-slate-400">Loading transaction details...</div>
+          ) : projectDetails?.summary ? (
+            <div className="space-y-6 mt-4">
+              {/* Summary Cards */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
+                  <p className="text-xs text-slate-400 mb-1">Revenue</p>
+                  <p className="text-lg font-bold text-cyan-400">
+                    {currency} {(projectDetails.summary.totalRevenue / 1000).toFixed(1)}K
+                  </p>
+                </div>
+                <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
+                  <p className="text-xs text-slate-400 mb-1">Costs</p>
+                  <p className="text-lg font-bold text-orange-400">
+                    {currency} {((projectDetails.summary.actualCost ?? projectDetails.summary.totalCosts) / 1000).toFixed(1)}K
+                  </p>
+                  <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                    Direct: {currency} {((projectDetails.summary.directCosts ?? projectDetails.summary.totalCosts) / 1000).toFixed(1)}K · Labor: {currency} {Math.round(projectDetails.summary.laborCost || 0)}
+                  </p>
+                </div>
+                <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
+                  <p className="text-xs text-slate-400 mb-1">Operating Profit</p>
+                  <p className={`text-lg font-bold ${
+                    projectDetails.summary.netProfit >= 0 ? 'text-green-400' : 'text-red-400'
+                  }`}>
+                    {currency} {(projectDetails.summary.netProfit / 1000).toFixed(1)}K
+                  </p>
+                </div>
+                <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
+                  <p className="text-xs text-slate-400 mb-1">vs Quoted</p>
+                  <p className={`text-lg font-bold ${
+                    projectDetails.summary.variancePct <= 0 ? 'text-green-400' : 'text-red-400'
+                  }`}>
+                    {projectDetails.summary.variancePct > 0 ? '+' : ''}
+                    {projectDetails.summary.variancePct.toFixed(1)}%
+                  </p>
+                </div>
+              </div>
+
+              {/* Income Transactions */}
+              {projectDetails.income && projectDetails.income.length > 0 && (
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-3 flex items-center gap-2">
+                    <TrendingUp className="w-5 h-5 text-green-400" />
+                    Income Transactions
+                  </h3>
+                  <div className="space-y-2">
+                    {projectDetails.income.map((txn: any) => (
+                      <div 
+                        key={txn.id} 
+                        className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
+                      >
+                        <div className="flex-1">
+                          <p className="font-medium text-white">{txn.description}</p>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {new Date(txn.date).toLocaleDateString()} {txn.narration && `• ${txn.narration}`}
+                          </p>
+                        </div>
+                        <p className="font-bold text-green-400">
+                          {currency} {txn.amount.toLocaleString()}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Expense Transactions */}
+              {projectDetails.expenses && projectDetails.expenses.length > 0 && (
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-3 flex items-center gap-2">
+                    <TrendingDown className="w-5 h-5 text-red-400" />
+                    Expense Transactions
+                  </h3>
+                  <div className="space-y-2">
+                    {projectDetails.expenses.map((txn: any) => (
+                      <div 
+                        key={txn.id} 
+                        className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
+                      >
+                        <div className="flex-1">
+                          <p className="font-medium text-white">{txn.description}</p>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {new Date(txn.date).toLocaleDateString()} {txn.narration && `• ${txn.narration}`}
+                          </p>
+                        </div>
+                        <p className="font-bold text-red-400">
+                          {currency} {Math.abs(txn.amount).toLocaleString()}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Attributed Timesheet Labor Entries */}
+              {projectDetails.laborEntries && projectDetails.laborEntries.length > 0 && (
+                <div>
+                  <h3 className="text-lg font-semibold text-white mb-3 flex items-center justify-between">
+                    <span className="flex items-center gap-2">
+                      <Clock className="w-5 h-5 text-cyan-400" />
+                      Attributed Timesheet Labor ({projectDetails.summary.loggedHours?.toFixed(1) || '0.0'} hrs)
+                    </span>
+                    <span className="text-sm font-mono text-cyan-400 font-normal">
+                      Total: {currency} {Math.round(projectDetails.summary.laborCost || 0).toLocaleString()}
+                    </span>
+                  </h3>
+                  <div className="space-y-2">
+                    {projectDetails.laborEntries.map((l: any) => (
+                      <div 
+                        key={l.id} 
+                        className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
+                      >
+                        <div className="flex-1">
+                          <p className="font-medium text-white">{l.userName || 'Employee'}</p>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {new Date(l.date).toLocaleDateString()} • {l.hours.toFixed(1)} hrs @ {currency} {l.effectiveHourlyRate.toFixed(2)}/hr
+                          </p>
+                        </div>
+                        <p className="font-bold text-cyan-400 font-mono">
+                          {currency} {l.cost.toFixed(2)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {(!projectDetails.income || projectDetails.income.length === 0) && 
+               (!projectDetails.expenses || projectDetails.expenses.length === 0) && 
+               (!projectDetails.laborEntries || projectDetails.laborEntries.length === 0) && (
+                <div className="py-8 text-center text-slate-400">
+                  No transactions or labor entries found for this project
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="py-8 text-center text-slate-400">
+              No data available
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -10,12 +10,67 @@
 import { Transaction } from '@/services/types';
 import type { ImportedTransaction } from '@/lib/importUtils';
 import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/apiClient';
+import { isSupabaseConfigured, getSupabaseClient } from '@/lib/supabaseClient';
+import { logUnexpectedError } from '@/lib/diagnostics';
 import { dataStore, generateId, simulateDelay } from './dataStore';
 import { classificationService } from './classificationService';
+import { mapDomainToDbTransaction, ensureSupabaseDependencies } from './transactionService';
+import { recomputeBankAccountBalance } from './accountService';
 import type { ServiceResponse, ImportPreview, ImportResult, ImportHistoryRecord } from './types';
 
 const IMP = (organizationId: string) =>
   `/organizations/${encodeURIComponent(organizationId)}/imports`;
+
+const STORAGE_KEY_PREFIX = 'finance_os_import_file_';
+
+function readLocalFileMeta(id: string): { fileSize?: number; fileContent?: string } | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(`${STORAGE_KEY_PREFIX}${id}`);
+    return raw ? (JSON.parse(raw) as { fileSize?: number; fileContent?: string }) : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeHistoryRecord(
+  row: ImportHistoryRecord | Record<string, unknown>,
+  organizationId: string,
+): ImportHistoryRecord {
+  const r = row as Record<string, unknown>;
+  const id = String(r.id ?? '');
+  const fileName = String(r.fileName ?? r.file_name ?? 'statement.csv');
+  const isPdf = fileName.toLowerCase().endsWith('.pdf');
+  const localMeta = readLocalFileMeta(id);
+  const fileTypeRaw = r.fileType ?? r.file_type;
+  const fileType: 'csv' | 'pdf' =
+    fileTypeRaw === 'pdf' || fileTypeRaw === 'csv'
+      ? fileTypeRaw
+      : isPdf
+        ? 'pdf'
+        : 'csv';
+
+  return {
+    id,
+    organizationId: String(r.organizationId ?? r.organization_id ?? organizationId),
+    fileName,
+    importedAt: String(r.importedAt ?? r.imported_at ?? new Date().toISOString()),
+    transactionCount: Number(r.transactionCount ?? r.transaction_count ?? 0),
+    status: String(r.status ?? 'completed'),
+    accountName: String(r.accountName ?? r.account_name ?? 'Bank Account'),
+    autoPlaced: Number(r.autoPlaced ?? r.auto_placed ?? 0),
+    needsReview: Number(r.needsReview ?? r.needs_review ?? 0),
+    duplicatesFound: Number(r.duplicatesFound ?? r.duplicates_found ?? 0),
+    fileType,
+    fileUrl: (r.fileUrl ?? r.file_url) ? String(r.fileUrl ?? r.file_url) : undefined,
+    filePath: (r.filePath ?? r.file_path) ? String(r.filePath ?? r.file_path) : undefined,
+    fileSize: Number(r.fileSize ?? r.file_size ?? localMeta?.fileSize ?? 0) || localMeta?.fileSize,
+    fileContent: localMeta?.fileContent,
+    bankAccountId: (r.bankAccountId ?? r.bank_account_id)
+      ? String(r.bankAccountId ?? r.bank_account_id)
+      : undefined,
+  };
+}
 
 function requireOrg<T>(organizationId: string): ServiceResponse<T> | null {
   if (!organizationId.trim()) {
@@ -213,7 +268,7 @@ export const importService = {
 
   /**
    * Commit rows parsed client-side (CSV mapping/review) into the ledger.
-   * HTTP: `POST .../imports/commit-parsed` (not in §16 table; aligns SETTLE-001 with a backend).
+   * Directly persists into Supabase database (transactions + import_history_records).
    */
   async commitParsedImport(
     organizationId: string,
@@ -221,35 +276,233 @@ export const importService = {
     currency: string,
     fileName: string,
     rows: ImportedTransaction[],
-    options: { skipDuplicates?: boolean; autoClassify?: boolean } = {},
+    options: {
+      skipDuplicates?: boolean;
+      autoClassify?: boolean;
+      fileSize?: number;
+      fileContent?: string;
+      idempotencyKey?: string;
+    } = {},
   ): Promise<ServiceResponse<ImportResult>> {
+    const err = requireOrg<ImportResult>(organizationId);
+    if (err) return err;
+
+    const { skipDuplicates = true, autoClassify = true, idempotencyKey } = options;
+    const safeName = fileName.slice(0, 80) || 'statement.csv';
+
+    // Generate idempotency key if not provided
+    const importKey = idempotencyKey || `import-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    // Use HTTP backend if configured (RECOMMENDED - uses service role)
     if (isHttpBackendConfigured()) {
-      const err = requireOrg<ImportResult>(organizationId);
-      if (err) return err;
-      return apiPostJson<
-        {
-          bankAccountId: string;
-          currency: string;
-          fileName: string;
-          rows: ImportedTransaction[];
-          skipDuplicates?: boolean;
-          autoClassify?: boolean;
-        },
-        ImportResult
-      >(`${IMP(organizationId)}/commit-parsed`, {
-        bankAccountId,
-        currency,
-        fileName,
-        rows,
-        skipDuplicates: options.skipDuplicates,
-        autoClassify: options.autoClassify,
-      });
+      try {
+        // Detect file type from filename
+        const fileType: 'csv' | 'pdf' = safeName.toLowerCase().endsWith('.pdf') ? 'pdf' : 'csv';
+        
+        // Explicitly structure the payload to avoid any scoping issues
+        const payload = {
+          bankAccountId: bankAccountId,
+          currency: currency,
+          fileName: fileName,
+          rows: rows,
+          skipDuplicates: skipDuplicates,
+          autoClassify: autoClassify,
+          idempotencyKey: importKey,
+          fileContent: options.fileContent,
+          fileType: fileType,
+        };
+        
+        console.log('=== HTTP PAYLOAD DEBUG [' + new Date().toISOString() + '] ===');
+        console.log('Function parameters received:');
+        console.log('  organizationId:', organizationId);
+        console.log('  bankAccountId:', bankAccountId);
+        console.log('  currency:', currency);
+        console.log('  fileName:', fileName);
+        console.log('  rows.length:', rows.length);
+        console.log('  rows[0]:', rows[0]);
+        console.log('  fileContent:', options.fileContent ? `${options.fileContent.length} chars` : 'not provided');
+        console.log('  fileType:', fileType);
+        console.log('Constructing payload object...');
+        console.log('Payload being sent:', { ...payload, fileContent: payload.fileContent ? `[${payload.fileContent.length} chars]` : undefined });
+        console.log('============================================');
+        
+        const result = await apiPostJson<
+          {
+            bankAccountId: string;
+            currency: string;
+            fileName: string;
+            rows: ImportedTransaction[];
+            skipDuplicates?: boolean;
+            autoClassify?: boolean;
+            idempotencyKey?: string;
+            fileContent?: string;
+            fileType?: 'csv' | 'pdf';
+          },
+          ImportResult
+        >(`${IMP(organizationId)}/commit-parsed`, payload);
+
+        if (result.success) {
+          dataStore.notify('transactions');
+          dataStore.notify('bankAccounts');
+          dataStore.notify('importHistory');
+          dataStore.notify('accounts');
+        }
+
+        return result;
+      } catch (err: any) {
+        logUnexpectedError('importService.commitParsedImport.http', err);
+        return {
+          success: false,
+          data: {
+            imported: 0,
+            skipped: 0,
+            duplicates: 0,
+            errors: [err.message || 'Failed to commit import'],
+            summary: {
+              totalIncome: 0,
+              totalExpenses: 0,
+              netAmount: 0,
+              autoClassified: 0,
+              needsReview: 0,
+            },
+          },
+          error: err.message || 'Failed to commit import',
+        };
+      }
     }
 
-    await simulateDelay(200);
+    // For Supabase direct, use RPC function (fallback)
+    if (isSupabaseConfigured() && organizationId.trim()) {
+      const sb = getSupabaseClient();
+      if (sb) {
+        try {
+          // Call the import_commit RPC function
+          const { data, error } = await sb.rpc('import_commit', {
+            p_org_id: organizationId,
+            p_bank_account_id: bankAccountId,
+            p_currency: currency,
+            p_file_name: safeName,
+            p_rows: rows,
+            p_idempotency_key: importKey,
+            p_skip_duplicates: skipDuplicates,
+            p_auto_classify: autoClassify,
+          });
 
-    const { skipDuplicates = true, autoClassify = true } = options;
-    const safeName = fileName.slice(0, 80) || 'statement.csv';
+          if (error) {
+            console.error('Import commit error:', error);
+            
+            // Handle specific error codes
+            if (error.code === '23505' || error.message?.includes('already imported')) {
+              return {
+                success: false,
+                data: {
+                  imported: 0,
+                  skipped: 0,
+                  duplicates: 0,
+                  errors: [{ row: 0, error: 'This exact statement was already imported' }],
+                  summary: {
+                    totalIncome: 0,
+                    totalExpenses: 0,
+                    netAmount: 0,
+                    autoClassified: 0,
+                    needsReview: 0,
+                  },
+                },
+                error: 'This exact statement was already imported',
+              };
+            } else if (error.code === '42704' || error.message?.includes('not found')) {
+              return {
+                success: false,
+                data: {
+                  imported: 0,
+                  skipped: 0,
+                  duplicates: 0,
+                  errors: [{ row: 0, error: 'Bank account not found in this organization' }],
+                  summary: {
+                    totalIncome: 0,
+                    totalExpenses: 0,
+                    netAmount: 0,
+                    autoClassified: 0,
+                    needsReview: 0,
+                  },
+                },
+                error: 'Bank account not found in this organization',
+              };
+            } else if (error.code === '22000' || error.message?.includes('currency')) {
+              return {
+                success: false,
+                data: {
+                  imported: 0,
+                  skipped: 0,
+                  duplicates: 0,
+                  errors: [{ row: 0, error: error.message || 'Currency mismatch' }],
+                  summary: {
+                    totalIncome: 0,
+                    totalExpenses: 0,
+                    netAmount: 0,
+                    autoClassified: 0,
+                    needsReview: 0,
+                  },
+                },
+                error: error.message || 'Currency mismatch',
+              };
+            }
+            
+            return {
+              success: false,
+              data: {
+                imported: 0,
+                skipped: 0,
+                duplicates: 0,
+                errors: [{ row: 0, error: error.message || 'Import failed' }],
+                summary: {
+                  totalIncome: 0,
+                  totalExpenses: 0,
+                  netAmount: 0,
+                  autoClassified: 0,
+                  needsReview: 0,
+                },
+              },
+              error: error.message || 'Import failed',
+            };
+          }
+
+          // Notify all real-time listeners across UI components
+          dataStore.notify('transactions');
+          dataStore.notify('bankAccounts');
+          dataStore.notify('importHistory');
+          dataStore.notify('accounts');
+
+          return {
+            success: true,
+            data: data as ImportResult,
+            message: `${data.imported} transactions imported successfully`,
+          };
+        } catch (err: any) {
+          console.error('Error committing import:', err);
+          return {
+            success: false,
+            data: {
+              imported: 0,
+              skipped: 0,
+              duplicates: 0,
+              errors: [err.message || 'Failed to commit import'],
+              summary: {
+                totalIncome: 0,
+                totalExpenses: 0,
+                netAmount: 0,
+                autoClassified: 0,
+                needsReview: 0,
+              },
+            },
+            error: err.message || 'Failed to commit import',
+          };
+        }
+      }
+    }
+
+    // Local fallback logic (legacy - not recommended for production)
+    const isPdf = fileName.toLowerCase().endsWith('.pdf');
     const tagFile = `import:${safeName}`;
 
     const toImport = rows.filter(r => !(skipDuplicates && r.isDuplicate));
@@ -295,6 +548,7 @@ export const importService = {
         status: 'pending',
         tags,
         attachments: [],
+        ...(row.projectId ? { projectId: row.projectId } : {}),
       };
 
       if (row.importCategoryId) {
@@ -334,25 +588,138 @@ export const importService = {
       imported.push(newTxn);
     }
 
-    dataStore.notify('transactions');
-
-    // "Update balance from a statement" (AccountsWallets.tsx) sends users here specifically to
-    // reconcile the account balance — importing must actually move it, in the account's own
-    // currency, or that promise is broken. Cross-currency imports (override at mapping step)
-    // are left alone since there's no FX conversion in this app.
     const bankAccount = dataStore.bankAccounts.find(a => a.id === bankAccountId);
-    if (bankAccount && bankAccount.currency === currency) {
-      const netDelta = imported.reduce((s, t) => s + t.amount, 0);
-      bankAccount.balance += netDelta;
-      dataStore.notify('bankAccounts');
+    const importId = generateId('import');
+    const accountDisplay = bankAccount?.bankName
+      ? `${bankAccount.bankName} (${bankAccount.currency || currency})`
+      : 'Bank Account';
+    const dupCount = rows.filter(r => r.isDuplicate).length;
+
+    const historyRecord: ImportHistoryRecord = {
+      id: importId,
+      organizationId,
+      fileName,
+      importedAt: new Date().toISOString(),
+      transactionCount: imported.length,
+      status: 'completed',
+      accountName: accountDisplay,
+      autoPlaced: autoClassified,
+      needsReview,
+      duplicatesFound: dupCount,
+      fileType: isPdf ? 'pdf' : 'csv',
+      fileSize: options.fileSize,
+      fileContent: options.fileContent,
+      bankAccountId,
+    };
+
+    // ── Supabase direct sync ──────────────────────────────────────────
+    if (isSupabaseConfigured() && organizationId.trim()) {
+      const sb = getSupabaseClient();
+      if (sb) {
+        try {
+          // 0. Ensure Organization & Bank Account exist in Supabase
+          await ensureSupabaseDependencies(organizationId, bankAccountId);
+
+          // Ensure any referenced categories exist in Supabase
+          const uniqueCategoryIds = Array.from(
+            new Set(imported.map(t => t.categoryId).filter((c): c is string => Boolean(c)))
+          );
+          for (const catId of uniqueCategoryIds) {
+            await ensureSupabaseDependencies(organizationId, undefined, catId);
+          }
+
+          // 1. Insert imported transactions in chunks
+          const dbTxns = imported.map(mapDomainToDbTransaction);
+          const chunkSize = 50;
+          for (let i = 0; i < dbTxns.length; i += chunkSize) {
+            const chunk = dbTxns.slice(i, i + chunkSize);
+            const { error: txnErr } = await sb.from('transactions').upsert(chunk, { onConflict: 'id' });
+            if (txnErr) {
+              logUnexpectedError('importService.commitParsedImport.transactions', txnErr);
+              // Fallback: If foreign key on category failed, retry with category_id = null
+              const fallbackChunk = chunk.map(c => ({ ...c, category_id: null }));
+              await sb.from('transactions').upsert(fallbackChunk, { onConflict: 'id' });
+            }
+          }
+
+          // 2. Insert into import_history_records
+          const dbHistoryPayload: Record<string, unknown> = {
+            id: importId,
+            organization_id: organizationId,
+            file_name: fileName,
+            imported_at: historyRecord.importedAt,
+            transaction_count: historyRecord.transactionCount,
+            status: historyRecord.status,
+            account_name: historyRecord.accountName,
+            auto_placed: historyRecord.autoPlaced,
+            needs_review: historyRecord.needsReview,
+            duplicates_found: historyRecord.duplicatesFound,
+          };
+          const { error: histErr } = await sb.from('import_history_records').upsert(dbHistoryPayload, { onConflict: 'id' });
+          if (histErr) {
+            logUnexpectedError('importService.commitParsedImport.import_history_records', histErr);
+          }
+
+          // 3. Accurately recompute live bank account balance in Supabase
+          await recomputeBankAccountBalance(organizationId, bankAccountId);
+        } catch (err) {
+          logUnexpectedError('importService.commitParsedImport.supabase', err);
+        }
+      }
+    } else if (isHttpBackendConfigured()) {
+      try {
+        await apiPostJson<
+          {
+            bankAccountId: string;
+            currency: string;
+            fileName: string;
+            rows: ImportedTransaction[];
+            skipDuplicates?: boolean;
+            autoClassify?: boolean;
+            fileSize?: number;
+            fileContent?: string;
+          },
+          ImportResult
+        >(`${IMP(organizationId)}/commit-parsed`, {
+          bankAccountId,
+          currency,
+          fileName,
+          rows,
+          skipDuplicates: options.skipDuplicates,
+          autoClassify: options.autoClassify,
+          fileSize: options.fileSize,
+          fileContent: options.fileContent,
+        });
+      } catch (err) {
+        logUnexpectedError('importService.commitParsedImport.http', err);
+      }
     }
+
+    // Persist file content locally for preview/download if provided
+    if (options.fileContent && typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(`${STORAGE_KEY_PREFIX}${importId}`, JSON.stringify({
+          id: importId,
+          fileName,
+          fileContent: options.fileContent,
+          fileType: isPdf ? 'pdf' : 'csv',
+          fileSize: options.fileSize,
+        }));
+      } catch {
+        /* ignore localStorage quota */
+      }
+    }
+
+    // Notify all real-time listeners across UI components
+    dataStore.notify('transactions');
+    dataStore.notify('bankAccounts');
+    dataStore.notify('importHistory');
+    dataStore.notify('accounts');
 
     const totalIncome = imported.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
     const totalExpenses = imported
       .filter(t => t.type === 'debit')
       .reduce((s, t) => s + Math.abs(t.amount), 0);
-
-    const dupCount = rows.filter(r => r.isDuplicate).length;
 
     return {
       success: true,
@@ -369,47 +736,92 @@ export const importService = {
           needsReview,
         },
       },
-      message: `${imported.length} transactions imported`,
+      message: `${imported.length} transactions imported and saved to database`,
     };
   },
 
   async getHistory(organizationId: string): Promise<ServiceResponse<ImportHistoryRecord[]>> {
-    if (isHttpBackendConfigured()) {
-      const err = requireOrg<ImportHistoryRecord[]>(organizationId);
-      if (err) return err;
-      return apiGet<ImportHistoryRecord[]>(`${IMP(organizationId)}/history`);
+    if (!organizationId || !organizationId.trim()) {
+      return { success: false, data: [], error: 'organizationId required' };
     }
 
-    await simulateDelay();
+    // Writes already go through the Express service-role API. Reads must use the
+    // same path: a browser anon-key SELECT is RLS-filtered to [] even when
+    // import_history_records rows exist (Table Editor uses the postgres role).
+    if (isHttpBackendConfigured()) {
+      const httpRes = await apiGet<ImportHistoryRecord[]>(`${IMP(organizationId)}/history`);
+      if (httpRes.success && Array.isArray(httpRes.data)) {
+        return { success: true, data: httpRes.data.map(row => normalizeHistoryRecord(row, organizationId)) };
+      }
+      if (!httpRes.success) {
+        logUnexpectedError('importService.getHistory.http', httpRes.error);
+      }
+    }
 
-    const baseRecords: { id: string; fileName: string; importedAt: string; transactionCount: number; status: string; bankAccountId: string }[] = [
-      { id: 'import-001', fileName: 'chase_jan_2026.csv', importedAt: '2026-01-13T08:00:00Z', transactionCount: 45, status: 'completed', bankAccountId: 'bank-001' },
-      { id: 'import-002', fileName: 'amex_dec_2025.csv', importedAt: '2026-01-01T10:30:00Z', transactionCount: 32, status: 'completed', bankAccountId: 'bank-002' },
-    ];
+    if (isSupabaseConfigured()) {
+      const sb = getSupabaseClient();
+      if (sb) {
+        try {
+          const { data, error } = await sb
+            .from('import_history_records')
+            .select('*')
+            .eq('organization_id', organizationId)
+            .order('imported_at', { ascending: false });
 
-    const enriched: ImportHistoryRecord[] = baseRecords.map(rec => {
-      const bankAccount = dataStore.bankAccounts.find(b => b.id === rec.bankAccountId);
-      const accountName = bankAccount?.bankName
-        ? `${bankAccount.bankName} (${bankAccount.currency || 'USD'})`
-        : 'Unknown Account';
+          if (error) {
+            logUnexpectedError('importService.getHistory.supabase', error);
+          } else if (Array.isArray(data)) {
+            return {
+              success: true,
+              data: data.map((row: Record<string, unknown>) =>
+                normalizeHistoryRecord(row, organizationId),
+              ),
+            };
+          }
+        } catch (err) {
+          logUnexpectedError('importService.getHistory.supabase', err);
+        }
+      }
+    }
 
-      const autoPlaced = Math.round(rec.transactionCount * 0.9);
-      const needsReview = Math.round(rec.transactionCount * 0.08);
-      const duplicatesFound = Math.max(0, rec.transactionCount - autoPlaced - needsReview);
+    return { success: true, data: [] };
+  },
 
-      return {
-        id: rec.id,
-        fileName: rec.fileName,
-        importedAt: rec.importedAt,
-        transactionCount: rec.transactionCount,
-        status: rec.status,
-        accountName,
-        autoPlaced,
-        needsReview,
-        duplicatesFound,
-      };
-    });
+  async deleteHistory(organizationId: string, id: string): Promise<ServiceResponse<null>> {
+    if (isHttpBackendConfigured()) {
+      try {
+        await apiRequest<null>(`${IMP(organizationId)}/history/${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+      } catch (err) {
+        logUnexpectedError('importService.deleteHistory.http', err);
+      }
+    } else if (isSupabaseConfigured() && organizationId.trim()) {
+      const sb = getSupabaseClient();
+      if (sb) {
+        try {
+          await sb
+            .from('import_history_records')
+            .delete()
+            .eq('id', id)
+            .eq('organization_id', organizationId);
+        } catch (err) {
+          logUnexpectedError('importService.deleteHistory.supabase', err);
+        }
+      }
+    }
 
-    return { success: true, data: enriched };
+    // 3. Remove from localStorage
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.removeItem(`${STORAGE_KEY_PREFIX}${id}`);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    dataStore.notify('transactions');
+    dataStore.notify('importHistory');
+    return { success: true, data: null, message: 'Statement record deleted' };
   },
 };

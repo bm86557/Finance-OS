@@ -11,6 +11,7 @@ import { employeeService } from '@/services/employeeService';
 import type { Expense } from '@/services/employeeService';
 import { useService, useMutation } from '@/hooks/useService';
 import { useAuth } from '@/contexts/AuthContext';
+import { usePlatformSettings } from '@/hooks/usePlatformSettings';
 import {
   suggestCategoryFromNarration,
   findLikelyDuplicates,
@@ -31,6 +32,7 @@ interface ExpenseClaim {
   receipt: boolean;
   project?: string;
   notes?: string;
+  rejectionReason?: string;
 }
 
 interface ExpenseFormData {
@@ -113,12 +115,14 @@ function formatExpenseCurrency(currency: string, amount: number): string {
 
 export function MyExpenses() {
   const { user, currentOrganization } = useAuth();
-  const orgId  = currentOrganization?.id ?? 'org-001';
+  const { getSelectableCurrencyCodes, featureFlags: globalFeatureFlags } = usePlatformSettings();
+  const selectableCurrencies = getSelectableCurrencyCodes(currentOrganization?.currency || 'USD');
+  const orgId = currentOrganization?.id || '';
   const userId = user?.id ?? '';
 
   // ── Data ──
   const { data: serviceExpenses, loading, error, refetch } = useService(
-    () => employeeService.getExpenses(orgId, userId),
+    () => (orgId && userId ? employeeService.getExpenses(orgId, userId) : Promise.resolve({ success: true, data: [] })),
     [orgId, userId],
     ['expenses'],
   );
@@ -165,6 +169,7 @@ export function MyExpenses() {
         receipt: !!e.receiptUrl,
         project: e.projectId,
         notes: e.notes,
+        rejectionReason: e.rejectionReason,
       })),
     [serviceExpenses],
   );
@@ -184,7 +189,7 @@ export function MyExpenses() {
   const expenseAi = useMemo(() => {
     const amt = parseFloat(formData.amount);
     const amount = !formData.amount || Number.isNaN(amt) ? 0 : amt;
-    const narrationSuggestion = suggestCategoryFromNarration(formData.description);
+    const narrationSuggestion = globalFeatureFlags.ai_category_suggestions ? suggestCategoryFromNarration(formData.description) : null;
     const duplicates =
       amount > 0 && formData.description.trim().length >= 3 && serviceExpenses
         ? findLikelyDuplicates(
@@ -535,7 +540,7 @@ export function MyExpenses() {
                     className="w-full px-4 py-3 rounded-lg text-sm font-mono"
                     style={inputStyle}
                   >
-                    {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
+                    {selectableCurrencies.map(c => <option key={c} value={c}>{c}</option>)}
                   </select>
                 </FormInput>
 
@@ -810,8 +815,10 @@ export function MyExpenses() {
                     {expense.project && (
                       <span className="text-xs text-purple-400/70 font-mono">{expense.project}</span>
                     )}
-                    {expense.notes && (
-                      <span className="text-xs text-red-400/70 font-mono italic truncate max-w-40">{expense.notes}</span>
+                    {(expense.rejectionReason || expense.notes) && (
+                      <span className="text-xs text-slate-400 font-mono italic truncate max-w-40">
+                        {expense.status === 'rejected' ? `Rejected: ${expense.rejectionReason || expense.notes?.replace(/^REJECTED:\s*/, '')}` : expense.notes}
+                      </span>
                     )}
                   </div>
                 </div>

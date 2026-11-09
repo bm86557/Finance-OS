@@ -23,7 +23,7 @@ function downloadPayslip(p: EmployeePayslip, employeeName: string): void {
     '',
     `Gross pay: ${p.currency} ${p.gross.toLocaleString()}`,
     'Deductions:',
-    ...p.deductions.map(d => `  - ${d.name}: ${p.currency} ${d.amount.toLocaleString()}`),
+    ...(p.deductions || []).map((d: any) => `  - ${d.name || d.label || 'Deduction'}: ${p.currency} ${Number(d.amount || 0).toLocaleString()}`),
     `Net pay: ${p.currency} ${p.net.toLocaleString()}`,
   ];
   const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
@@ -39,11 +39,11 @@ function downloadPayslip(p: EmployeePayslip, employeeName: string): void {
 
 export function MyPayslips() {
   const { user, currentOrganization } = useAuth();
-  const orgId = currentOrganization?.id ?? 'org-001';
+  const orgId = currentOrganization?.id || '';
   const userId = user?.id ?? '';
 
   const { data: rows, loading, error } = useService(
-    () => employeeService.getPayslips(orgId, userId),
+    () => (orgId && userId ? employeeService.getPayslips(orgId, userId) : Promise.resolve({ success: true, data: [] })),
     [orgId, userId],
   );
 
@@ -57,7 +57,7 @@ export function MyPayslips() {
       period: p.period,
       date: p.issueDate,
       gross: p.gross,
-      deductions: p.deductions.reduce((s, d) => s + d.amount, 0),
+      deductions: (p.deductions || []).reduce((s, d: any) => s + Number(d?.amount || 0), 0),
       net: p.net,
       status: p.status,
     }));
@@ -214,12 +214,19 @@ export function MyPayslips() {
                 <span>{viewingPayslip.currency} {viewingPayslip.gross.toLocaleString()}</span>
               </div>
               <div className="space-y-1 border-t border-white/10 pt-2">
-                {viewingPayslip.deductions.map((d) => (
-                  <div key={d.name} className="flex justify-between text-red-400">
-                    <span>{d.name}</span>
-                    <span>-{viewingPayslip.currency} {d.amount.toLocaleString()}</span>
+                {(viewingPayslip.deductions || []).length === 0 ? (
+                  <div className="flex justify-between text-slate-400">
+                    <span>No deductions</span>
+                    <span>{viewingPayslip.currency} 0</span>
                   </div>
-                ))}
+                ) : (
+                  (viewingPayslip.deductions || []).map((d: any, idx: number) => (
+                    <div key={d.name || d.label || idx} className="flex justify-between text-red-400">
+                      <span>{d.name || d.label || 'Deduction'}</span>
+                      <span>-{viewingPayslip.currency} {Number(d.amount || 0).toLocaleString()}</span>
+                    </div>
+                  ))
+                )}
               </div>
               <div className="flex justify-between border-t border-white/10 pt-2 font-bold text-green-400">
                 <span>Net pay</span>

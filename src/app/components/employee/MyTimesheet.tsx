@@ -3,22 +3,20 @@ import { motion, AnimatePresence } from 'motion/react';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { PageShell, PageHeader } from '../layout';
 import {
-  Clock, Plus, ChevronLeft, ChevronRight, Play, Pause,
+  Clock, Plus, ChevronLeft, ChevronRight, Play, Pause, RotateCcw,
   Check, Calendar, Send, X, CheckCircle, AlertCircle,
   Zap, DollarSign,
 } from 'lucide-react';
 import { employeeService } from '@/services/employeeService';
+import { projectService } from '@/services/projectService';
+import { organizationService } from '@/services/organizationService';
 import type { TimesheetEntry } from '@/services/employeeService';
 import { useService, useMutation } from '@/hooks/useService';
 import { useAuth } from '@/contexts/AuthContext';
 
-// ── Constants ──────────────────────────────────────────────────────────
+// ── Fallback Constants ──────────────────────────────────────────────────
 
-const TIMER_PROJECTS = [
-  { id: 'proj-001', name: 'Brand Refresh - TechCorp' },
-  { id: 'proj-002', name: 'Mobile App - StartupXYZ' },
-  { id: 'proj-003', name: 'Internal Tools' },
-];
+const TIMER_PROJECTS: { id: string; name: string; isAssigned: boolean }[] = [];
 
 const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri'];
 
@@ -66,16 +64,84 @@ function todayDate(): string {
 // ── Main Component ──────────────────────────────────────────────────────
 
 export function MyTimesheet() {
-  const { user, currentOrganization } = useAuth();
-  const orgId  = currentOrganization?.id ?? 'org-001';
+  const { user, currentOrganization, membership } = useAuth();
+  const orgId = currentOrganization?.id || '';
   const userId = user?.id ?? '';
+
+  // Fetch assigned tasks for datalist autocomplete (§13 Work Domain)
+  const { data: rawAssignedTasks, refetch: refetchTasks } = useService(
+    () => (orgId && userId ? employeeService.getMyTasks(orgId, userId) : Promise.resolve({ success: true, data: [] })),
+    [orgId, userId],
+    ['project_tasks'],
+  );
+  const myAssignedTasks = useMemo(
+    () => (Array.isArray(rawAssignedTasks) ? rawAssignedTasks : []),
+    [rawAssignedTasks],
+  );
 
   // ── Service data ──
   const { data: svcTimesheets, loading, error, refetch } = useService(
-    () => employeeService.getTimesheets(orgId, userId),
+    () => (orgId && userId ? employeeService.getTimesheets(orgId, userId) : Promise.resolve({ success: true, data: [] })),
     [orgId, userId],
     ['timesheets'],
   );
+
+  // ── Real Organization Projects ──
+  const { data: dbProjects = [] } = useService(
+    () => (orgId ? projectService.getAll(orgId) : Promise.resolve({ success: true, data: [] })),
+    [orgId],
+    ['projects'],
+  );
+
+  // ── Organization Members (authoritative source for assigned projects) ──
+  const { data: orgMembers = [] } = useService(
+    () => (orgId ? organizationService.getMembers(orgId) : Promise.resolve({ success: true, data: [] })),
+    [orgId],
+    ['organization_members'],
+  );
+
+  const currentMember = useMemo(() => {
+    const list = Array.isArray(orgMembers) ? (orgMembers as any[]) : [];
+    return list.find(m => 
+      m.userId === userId || 
+      m.userId === user?.id || 
+      (user?.email && m.user?.email?.toLowerCase() === user.email.toLowerCase())
+    ) || membership;
+  }, [orgMembers, userId, user, membership]);
+
+  const assignedProjectIds: string[] = useMemo(() => {
+    const fromMember = currentMember?.assignedProjects ?? (currentMember as any)?.assignedProjectIds;
+    if (Array.isArray(fromMember) && fromMember.length > 0) return fromMember;
+    if (typeof fromMember === 'string' && fromMember) {
+      try {
+        const parsed = JSON.parse(fromMember);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      } catch {}
+      return [fromMember];
+    }
+    const meta = (user as any)?.user_metadata || {};
+    const metaIds = meta.assignedProjectIds || meta.assigned_projects;
+    if (Array.isArray(metaIds) && metaIds.length > 0) return metaIds;
+    const fromMembership = (membership as any)?.assignedProjects || (membership as any)?.assigned_projects;
+    if (Array.isArray(fromMembership) && fromMembership.length > 0) return fromMembership;
+    return [];
+  }, [currentMember, user, membership]);
+
+  const availableProjects = useMemo(() => {
+    const list = Array.isArray(dbProjects) ? dbProjects : [];
+    if (list.length > 0) {
+      // Strictly filter to ONLY projects assigned to this employee
+      const assigned = list.filter(p => assignedProjectIds.includes(p.id));
+      return assigned.map(p => ({
+        id: p.id,
+        name: p.name + (p.clientName ? ` - ${p.clientName}` : ''),
+        isAssigned: true,
+        startDate: p.startDate,
+        endDate: p.endDate,
+      })).sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return [];
+  }, [dbProjects, assignedProjectIds]);
 
   // ── Mutations ──
   const createMutation = useMutation(
@@ -89,22 +155,75 @@ export function MyTimesheet() {
   // ── Timer state ──
   const [isTimerRunning, setIsTimerRunning]   = useState(false);
   const [elapsedSeconds, setElapsedSeconds]   = useState(0);
-  const [timerProjectId, setTimerProjectId]   = useState(TIMER_PROJECTS[0].id);
+  const [timerProjectId, setTimerProjectId]   = useState('');
   const [timerTask,      setTimerTask]         = useState('');
   const [timerBillable,  setTimerBillable]     = useState(true);
+  const [timerTaskId,    setTimerTaskId]       = useState('');
+  const [manualTaskId,   setManualTaskId]      = useState('');
+  const [isAutoFilling,  setIsAutoFilling]     = useState(false);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timesheetActionLockRef = useRef(false);
   const toastDismissRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timerStartTimeRef = useRef<Date | null>(null);
+
+  // ── Week navigation state ──
+  const [weekOffset, setWeekOffset] = useState(0);
 
   // ── Manual entry form ──
   const [showManualForm, setShowManualForm] = useState(false);
   const [manualForm, setManualForm] = useState({
     date: todayDate(),
-    projectId: TIMER_PROJECTS[0].id,
+    projectId: '',
     task: '',
     hours: '',
     billable: true,
   });
+
+  const selectedTimerProject = useMemo(
+    () => availableProjects.find(p => p.id === timerProjectId),
+    [availableProjects, timerProjectId]
+  );
+  const isTodayInTimerTimeline = useMemo(() => {
+    if (!selectedTimerProject) return true;
+    const today = todayDate();
+    if (selectedTimerProject.startDate && today < selectedTimerProject.startDate) return false;
+    if (selectedTimerProject.endDate && today > selectedTimerProject.endDate) return false;
+    return true;
+  }, [selectedTimerProject]);
+
+  const selectedManualProject = useMemo(
+    () => availableProjects.find(p => p.id === manualForm.projectId),
+    [availableProjects, manualForm.projectId]
+  );
+
+  const timerAssignedTasks = useMemo(() => {
+    if (!myAssignedTasks.length) return [];
+    return timerProjectId
+      ? myAssignedTasks.filter(t => t.projectId === timerProjectId)
+      : myAssignedTasks;
+  }, [myAssignedTasks, timerProjectId]);
+
+  const manualAssignedTasks = useMemo(() => {
+    if (!myAssignedTasks.length) return [];
+    return manualForm.projectId
+      ? myAssignedTasks.filter(t => t.projectId === manualForm.projectId)
+      : myAssignedTasks;
+  }, [myAssignedTasks, manualForm.projectId]);
+
+  // Keep timerProjectId and manualForm.projectId aligned with availableProjects
+  useEffect(() => {
+    if (availableProjects.length > 0) {
+      if (!timerProjectId || !availableProjects.some(p => p.id === timerProjectId)) {
+        setTimerProjectId(availableProjects[0].id);
+      }
+      if (!manualForm.projectId || !availableProjects.some(p => p.id === manualForm.projectId)) {
+        setManualForm(f => ({ ...f, projectId: availableProjects[0].id }));
+      }
+    } else {
+      setTimerProjectId('');
+      setManualForm(f => ({ ...f, projectId: '' }));
+    }
+  }, [availableProjects, timerProjectId, manualForm.projectId]);
 
   // ── Toast ──
   const [toast, setToast] = useState('');
@@ -128,6 +247,15 @@ export function MyTimesheet() {
 
   // ── Timer control ──
   const startTimer = () => {
+    if (selectedTimerProject?.startDate && todayDate() < selectedTimerProject.startDate) {
+      showToast(`Cannot log time: ${selectedTimerProject.name} starts on ${selectedTimerProject.startDate}`);
+      return;
+    }
+    if (selectedTimerProject?.endDate && todayDate() > selectedTimerProject.endDate) {
+      showToast(`Cannot log time: ${selectedTimerProject.name} ended on ${selectedTimerProject.endDate}`);
+      return;
+    }
+    timerStartTimeRef.current = new Date();
     setIsTimerRunning(true);
     intervalRef.current = setInterval(() => {
       setElapsedSeconds(prev => prev + 1);
@@ -148,26 +276,134 @@ export function MyTimesheet() {
     timesheetActionLockRef.current = true;
     try {
       const hours = Math.round((elapsedSeconds / 3600) * 100) / 100;
-      const project = TIMER_PROJECTS.find(p => p.id === timerProjectId)!;
+      const endDt = new Date();
+      const startDt = timerStartTimeRef.current || new Date(endDt.getTime() - elapsedSeconds * 1000);
+      const startTimeStr = startDt.toTimeString().slice(0, 5);
+      const endTimeStr = endDt.toTimeString().slice(0, 5);
+      const durationMins = Math.round(elapsedSeconds / 60);
+      const project = availableProjects.find(p => p.id === timerProjectId) || { id: timerProjectId, name: 'Project' };
+      const today = todayDate();
+      if ((project as any)?.startDate && today < (project as any).startDate) {
+        showToast(`Cannot log time: ${project.name} starts on ${(project as any).startDate}`);
+        return;
+      }
+      if ((project as any)?.endDate && today > (project as any).endDate) {
+        showToast(`Cannot log time: ${project.name} ended on ${(project as any).endDate}`);
+        return;
+      }
 
+      const matchedTask = myAssignedTasks.find(t => (t.title || '').toLowerCase() === timerTask.trim().toLowerCase());
       const result = await createMutation.execute({
         date: todayDate(),
         projectId: timerProjectId,
         projectName: project.name,
         hours,
         description: timerTask.trim() || 'Timer entry',
+        taskId: timerTaskId || matchedTask?.id || undefined,
         billable: timerBillable,
         status: 'draft',
+        startTime: startTimeStr,
+        endTime: endTimeStr,
+        durationMinutes: durationMins,
       });
 
       if (result.success) {
-        await refetch();
+        await Promise.all([refetch(), refetchTasks()]);
         setElapsedSeconds(0);
         setTimerTask('');
+        setTimerTaskId('');
         showToast(`Logged ${hours}h on ${project.name}`);
+      } else {
+        showToast(result.error || 'Failed to log hours');
       }
     } finally {
       timesheetActionLockRef.current = false;
+    }
+  };
+
+  // ── Auto-Fill Week Tasks (§13 Work Domain Batch Schedule) ──
+  const handleAutoFillWeek = async () => {
+    if (!orgId || !userId) {
+      showToast('Organization or user not loaded');
+      return;
+    }
+    if (availableProjects.length === 0) {
+      showToast('No assigned projects found to log time against');
+      return;
+    }
+    if (myAssignedTasks.length === 0) {
+      showToast('No assigned tasks found. Please assign tasks in Project details first.');
+      return;
+    }
+
+    setIsAutoFilling(true);
+    try {
+      // Prioritize active/in-progress tasks, fallback to all assigned tasks
+      const activeTasks = myAssignedTasks.filter((t: any) => t.status !== 'completed');
+      const candidateTasks = activeTasks.length > 0 ? activeTasks : myAssignedTasks;
+
+      const entriesToCreate: Array<Omit<TimesheetEntry, 'id' | 'organizationId' | 'userId'>> = [];
+      let totalAssignedHours = 0;
+
+      for (const day of weekData) {
+        const dayDate = day.date;
+        const alreadyLogged = timesheetData
+          .filter(e => e.date === dayDate)
+          .reduce((sum, e) => sum + e.hours, 0);
+
+        let dailyCapacity = Math.max(0, 8 - alreadyLogged);
+        if (dailyCapacity <= 0) continue;
+
+        // Specific tasks with matching due dates for this day, or rotate candidate tasks
+        const dueToday = candidateTasks.filter((t: any) => t.dueDate === dayDate);
+        const tasksForDay = dueToday.length > 0 ? dueToday : candidateTasks;
+
+        for (const task of tasksForDay) {
+          if (dailyCapacity <= 0) break;
+
+          const proj = availableProjects.find(p => p.id === (task as any).projectId) || availableProjects[0];
+          if (proj.startDate && dayDate < proj.startDate) continue;
+          if (proj.endDate && dayDate > proj.endDate) continue;
+
+          const estHours = Number((task as any).estimatedHours || 8);
+          const logHours = Number((task as any).loggedHours || 0);
+          const remainingEffort = Math.max(1, estHours - logHours);
+          const hoursToLog = Math.min(dailyCapacity, Math.min(4, remainingEffort));
+
+          if (hoursToLog <= 0) continue;
+
+          entriesToCreate.push({
+            date: dayDate,
+            projectId: proj.id,
+            projectName: proj.name,
+            hours: hoursToLog,
+            description: (task as any).title,
+            taskId: (task as any).id,
+            billable: true,
+            status: 'draft',
+          });
+
+          dailyCapacity -= hoursToLog;
+          totalAssignedHours += hoursToLog;
+        }
+      }
+
+      if (entriesToCreate.length === 0) {
+        showToast('No unallocated weekday hours available (week is already at target).');
+        return;
+      }
+
+      const res = await employeeService.batchCreateTimesheetEntries(orgId, userId, entriesToCreate);
+      if (res.success) {
+        await Promise.all([refetch(), refetchTasks()]);
+        showToast(`Auto-assigned ${entriesToCreate.length} tasks (${totalAssignedHours}h) for the week!`);
+      } else {
+        showToast(res.error || 'Failed to auto-fill timesheet');
+      }
+    } catch (err: any) {
+      showToast(err.message || 'Auto-fill error');
+    } finally {
+      setIsAutoFilling(false);
     }
   };
 
@@ -181,25 +417,46 @@ export function MyTimesheet() {
     const hrs = parseFloat(manualForm.hours);
     if (!manualForm.task.trim() || isNaN(hrs) || hrs <= 0) return;
     if (timesheetActionLockRef.current) return;
+
+    const project = availableProjects.find(p => p.id === manualForm.projectId) || { id: manualForm.projectId, name: 'Project' };
+    if ((project as any)?.startDate && manualForm.date < (project as any).startDate) {
+      showToast(`Cannot log time: ${project.name} starts on ${(project as any).startDate}`);
+      return;
+    }
+    if ((project as any)?.endDate && manualForm.date > (project as any).endDate) {
+      showToast(`Cannot log time: ${project.name} ended on ${(project as any).endDate}`);
+      return;
+    }
+
     timesheetActionLockRef.current = true;
     try {
-      const project = TIMER_PROJECTS.find(p => p.id === manualForm.projectId)!;
+      const durationMins = Math.round(hrs * 60);
+      const startTimeStr = undefined;
+      const endTimeStr = undefined;
 
+      const matchedTask = myAssignedTasks.find(t => (t.title || '').toLowerCase() === manualForm.task.trim().toLowerCase());
       const result = await createMutation.execute({
         date: manualForm.date,
         projectId: manualForm.projectId,
         projectName: project.name,
         hours: hrs,
         description: manualForm.task.trim(),
+        taskId: manualTaskId || matchedTask?.id || undefined,
         billable: manualForm.billable,
         status: 'draft',
+        startTime: startTimeStr,
+        endTime: endTimeStr,
+        durationMinutes: durationMins,
       });
 
       if (result.success) {
-        await refetch();
+        await Promise.all([refetch(), refetchTasks()]);
         setShowManualForm(false);
-        setManualForm({ date: todayDate(), projectId: TIMER_PROJECTS[0].id, task: '', hours: '', billable: true });
+        setManualForm(f => ({ ...f, date: todayDate(), task: '', hours: '', billable: true }));
+        setManualTaskId('');
         showToast(`Logged ${hrs}h on ${project.name}`);
+      } else {
+        showToast(result.error || 'Failed to log hours');
       }
     } finally {
       timesheetActionLockRef.current = false;
@@ -208,9 +465,25 @@ export function MyTimesheet() {
 
   // ── Submit week ──
   const handleSubmitWeek = async () => {
-    const draftIds = (svcTimesheets ?? []).filter(t => t.status === 'draft').map(t => t.id);
+    const draftEntries = (svcTimesheets ?? []).filter(t => t.status === 'draft');
+    if (draftEntries.length === 0) { showToast('No draft entries to submit'); return; }
 
-    if (draftIds.length === 0) { showToast('No draft entries to submit'); return; }
+    // Validate that all draft entries are within their project timelines
+    const invalidEntry = draftEntries.find(t => {
+      const proj = availableProjects.find(p => p.id === t.projectId) || (Array.isArray(dbProjects) ? dbProjects.find(p => p.id === t.projectId) : undefined);
+      if (!proj) return false;
+      if (proj.startDate && t.date < proj.startDate) return true;
+      if (proj.endDate && t.date > proj.endDate) return true;
+      return false;
+    });
+
+    if (invalidEntry) {
+      const proj = availableProjects.find(p => p.id === invalidEntry.projectId) || (Array.isArray(dbProjects) ? dbProjects.find(p => p.id === invalidEntry.projectId) : undefined);
+      showToast(`Cannot submit: Date ${invalidEntry.date} is outside ${proj?.name || 'project'} timeline (${proj?.startDate || ''} to ${proj?.endDate || 'end'}).`);
+      return;
+    }
+
+    const draftIds = draftEntries.map(t => t.id);
     if (timesheetActionLockRef.current) return;
 
     timesheetActionLockRef.current = true;
@@ -242,21 +515,49 @@ export function MyTimesheet() {
     [svcTimesheets],
   );
 
-  const todayEntries = timesheetData.filter(e => e.date === todayDate());
-  const todayTotal   = todayEntries.reduce((s, e) => s + e.hours, 0);
-  const weekTotal    = timesheetData.reduce((s, e) => s + e.hours, 0);
-  const draftCount   = timesheetData.filter(e => e.status === 'logged').length;
+  const activeMonday = useMemo(() => {
+    const d = mondayOfWeek(new Date());
+    d.setDate(d.getDate() + weekOffset * 7);
+    return d;
+  }, [weekOffset]);
 
   const weekData = useMemo(() => {
-    const mon = mondayOfWeek(new Date());
     return weekDays.map((day, i) => {
-      const d = new Date(mon);
-      d.setDate(mon.getDate() + i);
+      const d = new Date(activeMonday);
+      d.setDate(activeMonday.getDate() + i);
       const date = toYMD(d);
       const entries = timesheetData.filter(e => e.date === date);
       return { day, date, hours: entries.reduce((s, e) => s + e.hours, 0), entries };
     });
+  }, [activeMonday, timesheetData]);
+
+  const weekStartDate = weekData.length > 0 ? weekData[0].date : '';
+  const weekEndDate   = weekData.length > 0 ? weekData[weekData.length - 1].date : '';
+
+  const activeWeekEntries = useMemo(() => {
+    return timesheetData.filter(e => e.date >= weekStartDate && e.date <= weekEndDate);
+  }, [timesheetData, weekStartDate, weekEndDate]);
+
+  const todayEntries = timesheetData.filter(e => e.date === todayDate());
+  const todayTotal   = todayEntries.reduce((s, e) => s + e.hours, 0);
+  const weekTotal    = activeWeekEntries.reduce((s, e) => s + e.hours, 0);
+  const draftCount   = timesheetData.filter(e => e.status === 'logged').length;
+
+  const groupedEntries = useMemo(() => {
+    const map = new Map<string, TimesheetVM[]>();
+    for (const entry of timesheetData) {
+      const list = map.get(entry.date) || [];
+      list.push(entry);
+      map.set(entry.date, list);
+    }
+    return Array.from(map.entries()).sort((a, b) => b[0].localeCompare(a[0]));
   }, [timesheetData]);
+
+  const manualFormDayLogged = useMemo(() => {
+    return timesheetData
+      .filter(e => e.date === manualForm.date)
+      .reduce((sum, e) => sum + e.hours, 0);
+  }, [timesheetData, manualForm.date]);
 
   const weekLabel = useMemo(() => {
     if (!weekData.length) return 'This week';
@@ -300,17 +601,39 @@ export function MyTimesheet() {
           description="Track your working hours and project time"
           actions={
             <div className="flex items-center gap-2 sm:gap-3 flex-wrap w-full sm:w-auto justify-start sm:justify-end">
-          <button type="button" className="flex items-center gap-2 min-h-10 px-4 py-2 rounded-lg text-sm touch-manipulation" style={AXIOM.buttons.outline}>
+          <button
+            type="button"
+            onClick={() => setWeekOffset(w => w - 1)}
+            className="flex items-center gap-2 min-h-10 px-4 py-2 rounded-lg text-sm touch-manipulation hover:bg-white/10 transition-colors"
+            style={AXIOM.buttons.outline}
+            title="Previous week"
+          >
             <ChevronLeft className="size-4" /> Prev Week
           </button>
           <span className="text-white font-mono text-sm px-3 sm:px-4 py-2 rounded-lg min-h-10 inline-flex items-center" style={{
             background: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.3)',
           }}>
-            <Calendar className="size-4 inline mr-2 shrink-0" />{weekLabel}
+            <Calendar className="size-4 inline mr-2 shrink-0 text-blue-400" />{weekLabel}
           </span>
-          <button type="button" className="flex items-center gap-2 min-h-10 px-4 py-2 rounded-lg text-sm touch-manipulation" style={AXIOM.buttons.outline}>
+          <button
+            type="button"
+            onClick={() => setWeekOffset(w => w + 1)}
+            className="flex items-center gap-2 min-h-10 px-4 py-2 rounded-lg text-sm touch-manipulation hover:bg-white/10 transition-colors"
+            style={AXIOM.buttons.outline}
+            title="Next week"
+          >
             Next Week <ChevronRight className="size-4" />
           </button>
+          {weekOffset !== 0 && (
+            <button
+              type="button"
+              onClick={() => setWeekOffset(0)}
+              className="flex items-center gap-1.5 min-h-10 px-3 py-2 rounded-lg text-xs font-mono text-blue-400 hover:text-blue-300 border border-blue-500/30 bg-blue-500/10 transition-colors"
+              title="Return to current week"
+            >
+              <RotateCcw className="size-3.5" /> Today's Week
+            </button>
+          )}
           {draftCount > 0 && (
             <motion.button
               initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }}
@@ -363,12 +686,28 @@ export function MyTimesheet() {
             <select
               value={timerProjectId}
               onChange={e => setTimerProjectId(e.target.value)}
-              disabled={isTimerRunning}
+              disabled={isTimerRunning || availableProjects.length === 0}
               className="w-full px-3 py-2 rounded-lg text-xs font-mono disabled:opacity-50"
               style={inputStyle}
             >
-              {TIMER_PROJECTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+              {availableProjects.length === 0 ? (
+                <option value="" disabled className="bg-slate-900 text-slate-400">
+                  No projects assigned to you
+                </option>
+              ) : (
+                availableProjects.map(p => (
+                  <option key={p.id} value={p.id} className="bg-slate-900 text-white">
+                    {p.name}
+                  </option>
+                ))
+              )}
             </select>
+            {selectedTimerProject?.startDate && (
+              <p className={`text-[10px] font-mono mt-1.5 ${isTodayInTimerTimeline ? 'text-slate-400' : 'text-amber-400'}`}>
+                Timeline: {selectedTimerProject.startDate} {selectedTimerProject.endDate ? `– ${selectedTimerProject.endDate}` : '(ongoing)'}
+                {!isTodayInTimerTimeline && ' • Cannot log time before kickoff'}
+              </p>
+            )}
           </div>
 
           {/* Task input */}
@@ -377,12 +716,51 @@ export function MyTimesheet() {
             <input
               type="text"
               placeholder="What are you working on?"
+              list="project-tasks-list"
               value={timerTask}
-              onChange={e => setTimerTask(e.target.value)}
+              onChange={e => {
+                setTimerTask(e.target.value);
+                const matched = myAssignedTasks.find(t => t.title.toLowerCase() === e.target.value.trim().toLowerCase());
+                setTimerTaskId(matched ? matched.id : '');
+              }}
               disabled={isTimerRunning}
               className="w-full px-3 py-2 rounded-lg text-xs font-mono disabled:opacity-50"
               style={inputStyle}
             />
+            {timerAssignedTasks.length > 0 && (
+              <div className="mt-2.5">
+                <p className="text-[9px] text-blue-400 font-mono tracking-wider mb-1.5">ASSIGNED PROJECT TASKS (§13)</p>
+                <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                  {timerAssignedTasks.map((t: any) => {
+                    const isSelected = timerTaskId === t.id || timerTask === t.title;
+                    return (
+                      <button
+                        key={t.id}
+                        type="button"
+                        onClick={() => {
+                          setTimerTask(t.title);
+                          setTimerTaskId(t.id);
+                          if (t.projectId && t.projectId !== timerProjectId) {
+                            setTimerProjectId(t.projectId);
+                          }
+                        }}
+                        disabled={isTimerRunning}
+                        className={`text-[10px] font-mono px-2 py-1 rounded-md transition-all text-left flex items-center gap-1 ${
+                          isSelected
+                            ? 'bg-blue-500/30 text-blue-200 border border-blue-400/50 shadow-sm'
+                            : 'bg-white/5 text-slate-300 border border-white/10 hover:bg-white/10'
+                        }`}
+                      >
+                        <span className="truncate max-w-[120px]">{t.title}</span>
+                        <span className="text-[9px] text-slate-400 shrink-0">
+                          {t.loggedHours || 0}/{t.estimatedHours || 8}h
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Billable toggle */}
@@ -415,21 +793,22 @@ export function MyTimesheet() {
           <div className="flex gap-3">
             <button
               onClick={handleToggleTimer}
-              disabled={isTimesheetMutating}
+              disabled={isTimesheetMutating || (availableProjects.length === 0 && !isTimerRunning) || (!isTimerRunning && !isTodayInTimerTimeline)}
               className="flex-1 flex items-center justify-center gap-2 py-3 rounded-xl text-white font-medium disabled:opacity-50 transition-all"
               style={isTimerRunning ? AXIOM.buttons.danger : AXIOM.buttons.success}
             >
               {isTimesheetMutating
                 ? <div className="size-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 : isTimerRunning ? <Pause className="size-5" /> : <Play className="size-5" />}
-              {isTimesheetMutating ? 'Saving…' : isTimerRunning ? 'Stop & Save' : 'Start Timer'}
+              {isTimesheetMutating ? 'Saving…' : isTimerRunning ? 'Stop & Save' : availableProjects.length === 0 ? 'No Assigned Projects' : !isTodayInTimerTimeline ? 'Outside Timeline' : 'Start Timer'}
             </button>
 
             {/* Manual entry toggle */}
             <button
               onClick={() => setShowManualForm(v => !v)}
-              title="Log time manually"
-              className="px-4 py-3 rounded-xl transition-all"
+              disabled={availableProjects.length === 0}
+              title={availableProjects.length === 0 ? 'No projects assigned' : 'Log time manually'}
+              className="px-4 py-3 rounded-xl transition-all disabled:opacity-40"
               style={showManualForm ? AXIOM.buttons.primary : AXIOM.buttons.outline}
             >
               <Plus className="size-5 text-slate-400" />
@@ -483,7 +862,7 @@ export function MyTimesheet() {
         >
           <p className="text-xs text-slate-400 font-mono mb-2">THIS WEEK</p>
           <p className="text-4xl font-bold text-white mb-1">{weekTotal}h</p>
-          <p className="text-sm text-purple-400 font-mono mb-4">{timesheetData.length} total entries</p>
+          <p className="text-sm text-purple-400 font-mono mb-4">{activeWeekEntries.length} entries this week</p>
           <div className="h-3 rounded-full overflow-hidden" style={{ background: 'rgba(0,0,0,0.3)' }}>
             <motion.div
               initial={{ width: 0 }}
@@ -533,17 +912,35 @@ export function MyTimesheet() {
                 <div className="space-y-1.5">
                   <label className="text-[10px] text-slate-400 font-mono tracking-widest">DATE</label>
                   <input type="date" value={manualForm.date}
+                    min={selectedManualProject?.startDate || undefined}
+                    max={selectedManualProject?.endDate || undefined}
                     onChange={e => setManualForm(f => ({ ...f, date: e.target.value }))}
                     className="w-full px-3 py-2.5 rounded-lg text-sm font-mono"
                     style={{ ...inputStyle, colorScheme: 'dark' }} />
+                  {selectedManualProject?.startDate && (
+                    <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                      Timeline: {selectedManualProject.startDate} {selectedManualProject.endDate ? `– ${selectedManualProject.endDate}` : ''}
+                    </p>
+                  )}
                 </div>
 
                 <div className="space-y-1.5">
                   <label className="text-[10px] text-slate-400 font-mono tracking-widest">PROJECT</label>
                   <select value={manualForm.projectId}
                     onChange={e => setManualForm(f => ({ ...f, projectId: e.target.value }))}
-                    className="w-full px-3 py-2.5 rounded-lg text-sm font-mono" style={inputStyle}>
-                    {TIMER_PROJECTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                    disabled={availableProjects.length === 0}
+                    className="w-full px-3 py-2.5 rounded-lg text-sm font-mono disabled:opacity-50" style={inputStyle}>
+                    {availableProjects.length === 0 ? (
+                      <option value="" disabled className="bg-slate-900 text-slate-400">
+                        No projects assigned to you
+                      </option>
+                    ) : (
+                      availableProjects.map(p => (
+                        <option key={p.id} value={p.id} className="bg-slate-900 text-white">
+                          {p.name}
+                        </option>
+                      ))
+                    )}
                   </select>
                 </div>
 
@@ -567,11 +964,52 @@ export function MyTimesheet() {
                   </button>
                 </div>
 
+                {manualAssignedTasks.length > 0 && (
+                  <div className="md:col-span-2 lg:col-span-4 space-y-1.5">
+                    <label className="text-[10px] text-purple-400 font-mono tracking-widest block">QUICK SELECT ASSIGNED TASK (§13)</label>
+                    <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
+                      {manualAssignedTasks.map((t: any) => {
+                        const isSelected = manualTaskId === t.id || manualForm.task === t.title;
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            onClick={() => {
+                              setManualForm(f => ({
+                                ...f,
+                                task: t.title,
+                                projectId: t.projectId || f.projectId,
+                                hours: f.hours || (t.estimatedHours ? String(Math.min(4, Math.max(1, (t.estimatedHours || 0) - (t.loggedHours || 0)))) : '4'),
+                              }));
+                              setManualTaskId(t.id);
+                            }}
+                            className={`text-[11px] font-mono px-2.5 py-1.5 rounded-md transition-all text-left flex items-center gap-1.5 ${
+                              isSelected
+                                ? 'bg-purple-500/30 text-purple-200 border border-purple-400/50'
+                                : 'bg-white/5 text-slate-300 border border-white/10 hover:bg-white/10'
+                            }`}
+                          >
+                            <span className="truncate max-w-[140px]">{t.title}</span>
+                            <span className="text-[9px] text-slate-400 shrink-0">
+                              {t.loggedHours || 0}/{t.estimatedHours || 8}h
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 <div className="md:col-span-2 lg:col-span-4 space-y-1.5">
                   <label className="text-[10px] text-slate-400 font-mono tracking-widest">TASK DESCRIPTION *</label>
                   <input type="text" placeholder="What did you work on?"
+                    list="project-tasks-list"
                     value={manualForm.task}
-                    onChange={e => setManualForm(f => ({ ...f, task: e.target.value }))}
+                    onChange={e => {
+                      setManualForm(f => ({ ...f, task: e.target.value }));
+                      const matched = myAssignedTasks.find(t => t.title.toLowerCase() === e.target.value.trim().toLowerCase());
+                      setManualTaskId(matched ? matched.id : '');
+                    }}
                     className="w-full px-3 py-2.5 rounded-lg text-sm font-mono" style={inputStyle} />
                 </div>
               </div>
@@ -641,6 +1079,53 @@ export function MyTimesheet() {
                   </div>
                 ))}
               </div>
+
+              {/* Tasks due or scheduled for this date */}
+              {(() => {
+                const dayTasks = myAssignedTasks.filter((t: any) => t.dueDate === day.date);
+                if (dayTasks.length === 0) return null;
+                return (
+                  <div className="mt-2 pt-2 border-t border-white/10 space-y-1">
+                    <p className="text-[9px] text-purple-400 font-mono tracking-wider">DUE TODAY</p>
+                    {dayTasks.map((t: any) => (
+                      <div key={t.id} className="flex items-center justify-between text-[10px] text-slate-300 font-mono bg-white/5 px-2 py-1 rounded">
+                        <span className="truncate max-w-[80px]" title={t.title}>{t.title}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setManualForm({
+                              date: day.date,
+                              projectId: t.projectId || (availableProjects[0]?.id || ''),
+                              task: t.title,
+                              hours: '4',
+                              billable: true,
+                            });
+                            setManualTaskId(t.id);
+                            setShowManualForm(true);
+                          }}
+                          className="text-[9px] text-blue-400 hover:text-blue-300 ml-1 px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/30"
+                          title="Log time for this task"
+                        >
+                          + Log
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
+
+              {day.hours < 8 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setManualForm(f => ({ ...f, date: day.date }));
+                    setShowManualForm(true);
+                  }}
+                  className="mt-2 w-full text-center py-1 rounded text-[9px] font-mono text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 transition-colors"
+                >
+                  + Add Entry
+                </button>
+              )}
             </motion.div>
           ))}
         </div>
@@ -739,6 +1224,16 @@ export function MyTimesheet() {
           )}
         </div>
       </motion.div>
+    
+      {/* Autocomplete Datalist for Project Deliverables (§13 Work Domain) */}
+      <datalist id="project-tasks-list">
+        {(myAssignedTasks ?? []).map((t: any) => (
+          <option key={t.id} value={t.title}>
+            {t.projectName ? `${t.projectName} • ` : ''}{t.status} (${t.loggedHours || 0}h / ${t.estimatedHours || 0}h)
+          </option>
+        ))}
+      </datalist>
+
     </PageShell>
   );
 }

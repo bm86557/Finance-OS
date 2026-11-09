@@ -1,4 +1,7 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { useLocation } from 'react-router';
+import { useAuth } from '@/contexts/AuthContext';
+import { notificationService } from '@/services/notificationService';
 
 export interface Notification {
   id: string;
@@ -10,12 +13,29 @@ export interface Notification {
   read: boolean;
   actionLabel?: string;
   actionUrl?: string;
-  category: 'cashflow' | 'categorization' | 'insight' | 'reminder' | 'system';
+  category:
+    | 'cashflow'
+    | 'categorization'
+    | 'insight'
+    | 'reminder'
+    | 'system'
+    | 'budget'
+    | 'approvals'
+    | 'expenses'
+    | 'timesheets'
+    | 'projects'
+    | 'announcements'
+    | 'payslips'
+    | 'general';
+  organizationId?: string;
+  portal?: 'organization' | 'employee' | 'platform';
 }
 
 interface NotificationContextType {
   notifications: Notification[];
   unreadCount: number;
+  loading: boolean;
+  refresh: () => Promise<void>;
   addNotification: (notification: Omit<Notification, 'id' | 'timestamp' | 'read'>) => void;
   markAsRead: (id: string) => void;
   markAllAsRead: () => void;
@@ -23,119 +43,162 @@ interface NotificationContextType {
   clearAll: () => void;
 }
 
-const NotificationContext = createContext<NotificationContextType | undefined>(undefined);
+const NOTIFICATION_CONTEXT_KEY = Symbol.for('finance_os.notification_context');
+export const NotificationContext = ((globalThis as any)[NOTIFICATION_CONTEXT_KEY] ||
+  ((globalThis as any)[NOTIFICATION_CONTEXT_KEY] = createContext<NotificationContextType | undefined>(undefined))) as React.Context<NotificationContextType | undefined>;
 
 export function NotificationProvider({ children }: { children: ReactNode }) {
+  const { currentOrganization, user } = useAuth();
+  const location = useLocation();
   const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [loading, setLoading] = useState(false);
 
-  // Load notifications from localStorage
+  // Clean up legacy mock notifications key from previous iterations
   useEffect(() => {
-    const saved = localStorage.getItem('financeOS_notifications');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // Convert timestamp strings back to Date objects
-        const withDates = parsed.map((n: any) => ({
-          ...n,
-          timestamp: new Date(n.timestamp)
+    try {
+      localStorage.removeItem('financeOS_notifications');
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
+  // Determine current portal based on pathname
+  const portal: 'organization' | 'employee' = location.pathname.startsWith('/employee')
+    ? 'employee'
+    : 'organization';
+
+  const orgId = currentOrganization?.id || '';
+
+  // Fetch live notifications from backend & Supabase
+  const fetchLiveNotifications = useCallback(async () => {
+    if (!orgId) {
+      setNotifications([]);
+      return;
+    }
+
+    try {
+      setLoading(true);
+      const res = await notificationService.getByOrganization(orgId, portal);
+      if (res.success && Array.isArray(res.data)) {
+        const safeItems = res.data.filter((n: any) => {
+          if (portal === 'employee') {
+            const p = String(n.portal || '').toLowerCase();
+            if (p === 'organization' || p === 'platform') return false;
+            const cat = String(n.category || '').toLowerCase();
+            const ORG_CATS = [
+              'budget',
+              'categorization',
+              'cashflow',
+              'insight',
+              'profit',
+              'recurrence',
+              'recurring',
+              'audit',
+              'costing',
+              'tax',
+              'billing',
+            ];
+            if (ORG_CATS.includes(cat)) return false;
+            const actionUrl = String(n.actionUrl || n.action_url || '').toLowerCase();
+            if (actionUrl.startsWith('/dashboard') || actionUrl.includes('view=costing')) {
+              return false;
+            }
+          }
+          return true;
+        });
+
+        const formatted: Notification[] = safeItems.map((n: any) => ({
+          id: n.id,
+          title: n.title || 'Notification',
+          message: n.message || '',
+          type: n.type || 'info',
+          category: n.category || 'system',
+          actionLabel: n.actionLabel || n.action_label,
+          actionUrl: n.actionUrl || n.action_url,
+          read: !!n.read || !!n.isRead || !!n.is_read,
+          timestamp: n.timestamp ? new Date(n.timestamp) : (n.createdAt ? new Date(n.createdAt) : new Date()),
+          organizationId: n.organizationId || n.organization_id || orgId,
+          portal: n.portal || portal,
         }));
-        setNotifications(withDates);
-      } catch (e) {
-        console.error('Failed to load notifications:', e);
+        setNotifications(formatted);
+      } else {
+        setNotifications([]);
       }
+    } catch (err) {
+      console.warn('[NotificationContext] Failed to load live notifications:', err);
+      setNotifications([]);
+    } finally {
+      setLoading(false);
     }
-  }, []);
+  }, [orgId, portal]);
 
-  // Save notifications to localStorage
+  // Initial load and refetch whenever active organization or portal changes.
+  // Immediately reset local notifications array to prevent stale ghost alerts from lingering across portals.
   useEffect(() => {
-    localStorage.setItem('financeOS_notifications', JSON.stringify(notifications));
-  }, [notifications]);
-
-  // Generate sample notifications on mount (for demo)
-  useEffect(() => {
-    if (notifications.length === 0) {
-      const sampleNotifications: Omit<Notification, 'id' | 'timestamp' | 'read'>[] = [
-        {
-          title: 'Cash Flow Alert',
-          message: 'Your balance may drop below PKR 500K in 15 days',
-          type: 'warning',
-          category: 'cashflow',
-          actionLabel: 'View Forecast',
-          actionUrl: '/dashboard?view=forecast'
-        },
-        {
-          title: '12 Transactions Need Review',
-          message: 'Help AI improve categorization accuracy',
-          type: 'info',
-          category: 'categorization',
-          actionLabel: 'Review Now',
-          actionUrl: '/dashboard?view=transactions'
-        },
-        {
-          title: 'Profit Margin Increased',
-          message: 'Your profit margin improved by 3.2% this month',
-          type: 'success',
-          category: 'insight',
-          actionLabel: 'See Details',
-          actionUrl: '/dashboard?view=profit-intelligence'
-        },
-        {
-          title: 'Invoice Payment Overdue',
-          message: 'Client ABC Corp payment is 15 days overdue',
-          type: 'error',
-          category: 'reminder',
-          actionLabel: 'Send Reminder',
-          actionUrl: '/dashboard?view=reports'
-        }
-      ];
-
-      sampleNotifications.forEach(n => addNotification(n));
-    }
-  }, []);
+    setNotifications([]);
+    fetchLiveNotifications();
+  }, [portal, orgId, fetchLiveNotifications]);
 
   const unreadCount = notifications.filter(n => !n.read).length;
 
-  const addNotification = (notification: Omit<Notification, 'id' | 'timestamp' | 'read'>) => {
+  const markAsRead = useCallback(async (id: string) => {
+    // Optimistic local update
+    setNotifications(prev =>
+      prev.map(n => (n.id === id ? { ...n, read: true } : n))
+    );
+    if (orgId) {
+      await notificationService.markOrgNotificationRead(orgId, id).catch(() => null);
+    }
+  }, [orgId]);
+
+  const markAllAsRead = useCallback(async () => {
+    // Optimistic local update
+    setNotifications(prev =>
+      prev.map(n => ({ ...n, read: true }))
+    );
+    if (orgId) {
+      await notificationService.markOrgAllAsRead(orgId, portal).catch(() => null);
+    }
+  }, [orgId, portal]);
+
+  const removeNotification = useCallback(async (id: string) => {
+    setNotifications(prev => prev.filter(n => n.id !== id));
+    if (orgId) {
+      await notificationService.deleteOrgNotification(orgId, id).catch(() => null);
+    }
+  }, [orgId]);
+
+  const clearAll = useCallback(async () => {
+    setNotifications([]);
+    if (orgId) {
+      await notificationService.clearOrgNotifications(orgId, portal).catch(() => null);
+    }
+  }, [orgId, portal]);
+
+  const addNotification = useCallback((notification: Omit<Notification, 'id' | 'timestamp' | 'read'>) => {
     const newNotification: Notification = {
       ...notification,
       id: `notif_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       timestamp: new Date(),
-      read: false
+      read: false,
+      organizationId: orgId,
+      portal,
     };
-
     setNotifications(prev => [newNotification, ...prev]);
-  };
-
-  const markAsRead = (id: string) => {
-    setNotifications(prev =>
-      prev.map(n => n.id === id ? { ...n, read: true } : n)
-    );
-  };
-
-  const markAllAsRead = () => {
-    setNotifications(prev =>
-      prev.map(n => ({ ...n, read: true }))
-    );
-  };
-
-  const removeNotification = (id: string) => {
-    setNotifications(prev => prev.filter(n => n.id !== id));
-  };
-
-  const clearAll = () => {
-    setNotifications([]);
-  };
+  }, [orgId, portal]);
 
   return (
     <NotificationContext.Provider
       value={{
         notifications,
         unreadCount,
+        loading,
+        refresh: fetchLiveNotifications,
         addNotification,
         markAsRead,
         markAllAsRead,
         removeNotification,
-        clearAll
+        clearAll,
       }}
     >
       {children}
@@ -145,7 +208,7 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
 
 export function useNotifications() {
   const context = useContext(NotificationContext);
-  if (context === undefined) {
+  if (!context) {
     throw new Error('useNotifications must be used within NotificationProvider');
   }
   return context;

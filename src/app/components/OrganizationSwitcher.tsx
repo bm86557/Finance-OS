@@ -19,7 +19,14 @@ export const OrganizationSwitcher: React.FC = () => {
         </div>
         <div className="flex-1 text-left">
           <div className="text-sm font-medium text-white">{currentOrganization.name}</div>
-          <div className="text-xs text-gray-400">{currentOrganization.currency}</div>
+          <div className="text-xs text-gray-400 flex items-center gap-1.5">
+            <span>{currentOrganization.currency}</span>
+            {currentOrganization?.settings?.features?.multi_currency && Array.isArray(currentOrganization?.settings?.enabledCurrencies) && currentOrganization.settings.enabledCurrencies.length > 1 && (
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-mono">
+                +{currentOrganization.settings.enabledCurrencies.length - 1} FX
+              </span>
+            )}
+          </div>
         </div>
         <ChevronDown className={`w-4 h-4 text-gray-400 transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} />
       </button>

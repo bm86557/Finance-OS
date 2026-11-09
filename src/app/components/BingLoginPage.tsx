@@ -8,9 +8,10 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/
 import { Sparkles, Lock, Mail, ArrowLeft, Zap, Brain } from 'lucide-react';
 import { mockUsers } from '@/data/mockDatabase';
 import { useTheme } from '@/contexts/ThemeContext';
+import type { PortalType } from '@/services/authSessionTypes';
 
 interface BingLoginPageProps {
-  onLogin: (email: string, password: string) => Promise<void>;
+  onLogin: (email: string, password: string, orgSlug?: string, portalType?: PortalType) => Promise<void>;
 }
 
 export function BingLoginPage({ onLogin }: BingLoginPageProps) {
@@ -45,10 +46,10 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
     setAiStatus('Initializing AI...');
 
     try {
-      await onLogin(email, password);
+      await onLogin(email, password, undefined, 'ai_assistant');
       navigate('/');
-    } catch (err) {
-      setError('AI authentication failed. Please try again.');
+    } catch (err: any) {
+      setError(err?.message || 'Access denied or authentication failed.');
     } finally {
       setIsLoading(false);
       setScanProgress(0);
@@ -65,19 +66,16 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
     setAiStatus('Initializing AI...');
 
     try {
-      await onLogin(demoEmail, 'demo');
+      await onLogin(demoEmail, 'demo', undefined, 'ai_assistant');
       navigate('/');
-    } catch (err) {
-      setError('Login failed.');
+    } catch (err: any) {
+      setError(err?.message || 'Login failed.');
     } finally {
       setIsLoading(false);
       setScanProgress(0);
       setAiStatus('Initializing AI...');
     }
   };
-
-  // Filter Bing AI users
-  const bingUsers = mockUsers.filter(u => u.role === 'bing_ai');
 
   return (
     <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 to-slate-100'} flex items-center justify-center p-4 relative overflow-hidden`}>
@@ -179,7 +177,7 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
                 AI Authentication
               </CardTitle>
               <CardDescription className={`${theme === 'dark' ? 'text-purple-400/70' : 'text-purple-600/80'} font-mono`}>
-                Enter Bing AI credentials to access
+                Enter Platform Admin credentials to access
               </CardDescription>
             </CardHeader>
 
@@ -192,7 +190,7 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
                     <Mail className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-purple-400" />
                     <Input
                       type="email"
-                      placeholder="bing@financeos.com"
+                      placeholder="admin@financeos.com"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       className={`${theme === 'dark' ? 'bg-slate-950/50 border-purple-500/30 text-white' : 'bg-slate-50 border-purple-400/40 text-slate-900'} pl-10 h-12 focus:border-purple-500/50 font-mono`}
@@ -279,55 +277,6 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
                   </span>
                 </Button>
               </form>
-
-              {/* Divider */}
-              {bingUsers.length > 0 && (
-                <>
-                  <div className="relative">
-                    <div className="absolute inset-0 flex items-center">
-                      <div className="w-full border-t border-purple-500/20"></div>
-                    </div>
-                    <div className="relative flex justify-center text-xs">
-                      <span className={`${theme === 'dark' ? 'bg-slate-900/50' : 'bg-white/80'} px-2 text-purple-400/70 font-mono`}>QUICK ACCESS</span>
-                    </div>
-                  </div>
-
-                  {/* Demo Bing AI Accounts */}
-                  <div className="space-y-2">
-                    {bingUsers.map((user, index) => (
-                      <motion.button
-                        key={user.email}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.2 + index * 0.1 }}
-                        onClick={() => handleDemoLogin(user.email)}
-                        disabled={isLoading}
-                        className={`w-full p-3 ${theme === 'dark' ? 'bg-slate-950/50 hover:bg-slate-950/80' : 'bg-slate-50 hover:bg-slate-100'} border border-purple-500/20 hover:border-purple-500/40 rounded-lg transition-all group text-left relative overflow-hidden`}
-                      >
-                        <div className="absolute inset-0 bg-gradient-to-r from-purple-500/0 to-purple-500/0 group-hover:from-purple-500/5 group-hover:to-pink-500/5 transition-all"></div>
-                        <div className="flex items-center gap-3 relative z-10">
-                          <div className="size-8 rounded-lg bg-gradient-to-br from-purple-500/20 via-pink-500/20 to-rose-500/20 flex items-center justify-center">
-                            <Brain className="size-4 text-purple-400" />
-                          </div>
-                          <div className="flex-1">
-                            <p className={`text-sm font-medium font-mono ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{user.name}</p>
-                            <p className="text-purple-400/70 text-xs font-mono">{user.email}</p>
-                          </div>
-                          <span className="text-xs text-purple-400 font-mono flex items-center gap-1">
-                            <Sparkles className="size-3" />
-                            AI
-                          </span>
-                        </div>
-                      </motion.button>
-                    ))}
-                  </div>
-
-                  {/* Footer Note */}
-                  <p className={`text-xs text-center ${theme === 'dark' ? 'text-slate-500' : 'text-slate-600'} font-mono`}>
-                    Demo account — click a name above to sign in instantly
-                  </p>
-                </>
-              )}
             </CardContent>
           </Card>
         </motion.div>

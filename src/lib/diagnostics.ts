@@ -18,7 +18,7 @@ export function isDiagnosticsVerbose(): boolean {
   } catch {
     /* ignore */
   }
-  return import.meta.env.DEV;
+  return Boolean((typeof import.meta !== 'undefined' && (import.meta as any)?.env?.DEV) || (typeof process !== 'undefined' && process?.env?.NODE_ENV !== 'production'));
 }
 
 /** Non-OK HTTP or transport failures when calling the API (dev or verbose only — avoids noisy consoles). */

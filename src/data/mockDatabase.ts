@@ -169,21 +169,20 @@ export const mockUsers: User[] = [
 ];
 
 export const mockOrganizationMembers: OrganizationMember[] = [
-  { userId: 'user-001', organizationId: 'org-001', role: 'owner', joinedAt: '2024-01-15T10:00:00Z' },
-  { userId: 'user-002', organizationId: 'org-001', role: 'admin', joinedAt: '2024-01-20T10:00:00Z' },
-  { userId: 'user-003', organizationId: 'org-001', role: 'viewer', joinedAt: '2024-02-01T10:00:00Z' },
-  { userId: 'user-004', organizationId: 'org-001', role: 'admin', joinedAt: '2024-02-15T10:00:00Z' },
-  { userId: 'user-emp-001', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-01T10:00:00Z' },
-  { userId: 'user-emp-002', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-10T10:00:00Z' },
-  { userId: 'user-emp-003', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-15T10:00:00Z' },
-  { userId: 'user-emp-004', organizationId: 'org-001', role: 'employee', joinedAt: '2024-04-01T10:00:00Z' },
+  { userId: 'user-001', organizationId: 'org-001', role: 'owner', joinedAt: '2024-01-15T10:00:00Z', status: 'active', portalType: 'organization_admin' },
+  { userId: 'user-002', organizationId: 'org-001', role: 'admin', joinedAt: '2024-01-20T10:00:00Z', status: 'active', portalType: 'organization_admin' },
+  { userId: 'user-003', organizationId: 'org-001', role: 'admin', joinedAt: '2024-02-01T10:00:00Z', status: 'active', portalType: 'organization_admin' },
+  { userId: 'user-004', organizationId: 'org-001', role: 'admin', joinedAt: '2024-02-15T10:00:00Z', status: 'active', portalType: 'organization_admin' },
+  { userId: 'user-emp-001', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-01T10:00:00Z', status: 'active', portalType: 'employee' },
+  { userId: 'user-emp-002', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-10T10:00:00Z', status: 'active', portalType: 'employee' },
+  { userId: 'user-emp-003', organizationId: 'org-001', role: 'employee', joinedAt: '2024-03-15T10:00:00Z', status: 'active', portalType: 'employee' },
+  { userId: 'user-emp-004', organizationId: 'org-001', role: 'employee', joinedAt: '2024-04-01T10:00:00Z', status: 'active', portalType: 'employee' },
 ];
 
 function memberRoleLabel(role: UserRole): string {
   switch (role) {
     case 'owner': return 'Owner';
     case 'admin': return 'Admin';
-    case 'viewer': return 'Viewer';
     case 'employee': return 'Team member';
     default: return 'Member';
   }
@@ -191,12 +190,11 @@ function memberRoleLabel(role: UserRole): string {
 
 /** Team directory rows mirror org membership + user profile (no separate fictional roster). */
 function buildTeamForOrg(orgId: string): EmployeeTeamMember[] {
-  return mockOrganizationMembers
-    .filter(m => m.organizationId === orgId)
-    .map(m => {
-      const u = mockUsers.find(x => x.id === m.userId);
-      if (!u) return null;
-      return {
+  const result: EmployeeTeamMember[] = [];
+  for (const m of mockOrganizationMembers.filter(x => x.organizationId === orgId)) {
+    const u = mockUsers.find(x => x.id === m.userId);
+    if (u) {
+      result.push({
         id: u.id,
         organizationId: orgId,
         name: u.name,
@@ -205,10 +203,11 @@ function buildTeamForOrg(orgId: string): EmployeeTeamMember[] {
         department: m.role === 'employee' ? 'Team' : 'Operations',
         avatar: u.avatar,
         joinedAt: m.joinedAt,
-        status: 'active' as const,
-      };
-    })
-    .filter((x): x is EmployeeTeamMember => x !== null);
+        status: 'active',
+      });
+    }
+  }
+  return result;
 }
 
 /** Minimal chart + bank wallet so Quick Add and ledger flows work on a clean seed. */
@@ -567,5 +566,6 @@ export const mockEmployeePayslips: EmployeePayslip[] = [
   },
 ];
 export const mockEmployeeTimesheets: TimesheetEntry[] = [];
-export const mockEmployeeTeamMembers: EmployeeTeamMember[] = buildTeamForOrg('org-001');
+// Team members now come from Supabase only - no mock data
+export const mockEmployeeTeamMembers: EmployeeTeamMember[] = [];
 export const mockCompanyAnnouncements: CompanyAnnouncement[] = [];

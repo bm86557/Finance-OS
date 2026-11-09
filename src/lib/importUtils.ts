@@ -16,6 +16,10 @@ export interface ImportedTransaction {
   usage?: 'business' | 'personal';
   /** Review step: chart category to apply on import */
   importCategoryId?: string;
+  /** Review step: project assigned to transaction */
+  projectId?: string;
+  /** Classification source: 'ai' (AI model) or 'rules' (rule engine) */
+  classificationSource?: 'ai' | 'rules';
 }
 
 export interface ColumnMapping {
@@ -508,19 +512,25 @@ export function parseStatementDate(dateStr: string): string | null {
 export const parseAmount = (amountStr: string): number | null => {
   if (!amountStr) return null;
   
-  // Remove currency symbols and extra spaces
+  // Remove currency symbols, common ISO codes (PKR, USD, EUR, etc.), prefixes (Rs, Rs.), and formatting
   let cleanStr = amountStr
+    .replace(/^(?:PKR|USD|EUR|GBP|AED|SAR|CAD|AUD|INR|JPY|CNY|Rs\.?)\s*/i, '')
+    .replace(/\s*(?:PKR|USD|EUR|GBP|AED|SAR|CAD|AUD|INR|JPY|CNY|Rs\.?)$/i, '')
     .replace(/[$€£¥₹]/g, '')
     .replace(/,/g, '')
     .replace(/\s/g, '')
     .trim();
   
-  // Handle parentheses for negative numbers
+  // Handle parentheses for negative numbers: (500) -> -500
   if (cleanStr.startsWith('(') && cleanStr.endsWith(')')) {
     cleanStr = '-' + cleanStr.slice(1, -1);
   }
   
-  const amount = parseFloat(cleanStr);
+  // Extract signed numeric part if trailing characters remain
+  const match = cleanStr.match(/^-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  
+  const amount = parseFloat(match[0]);
   return isNaN(amount) ? null : amount;
 };
 
@@ -528,36 +538,57 @@ export const parseAmount = (amountStr: string): number | null => {
 export const detectTransactionType = (
   amount: number,
   typeColumn?: string,
-  amountColumn?: string
+  amountColumn?: string,
+  narration?: string
 ): 'debit' | 'credit' => {
   // If type column exists, use it
   if (typeColumn) {
-    const lower = typeColumn.toLowerCase();
-    if (lower.includes('credit') || lower.includes('cr') || lower.includes('deposit')) {
+    const lower = typeColumn.toLowerCase().trim();
+    if (lower === 'credit' || lower === 'cr' || lower.includes('credit') || lower.includes('deposit') || lower.includes('incoming')) {
       return 'credit';
     }
-    if (lower.includes('debit') || lower.includes('dr') || lower.includes('withdrawal')) {
+    if (lower === 'debit' || lower === 'dr' || lower.includes('debit') || lower.includes('withdrawal') || lower.includes('outgoing') || lower.includes('expense')) {
       return 'debit';
     }
   }
-  
-  // If amount is negative, it's typically a debit
+
+  // If amount is negative, it's definitively a debit (expense)
   if (amount < 0) {
     return 'debit';
   }
-  
+
+  // Check narration/description for explicit debit/credit keywords
+  if (narration) {
+    const lower = narration.toLowerCase();
+    const hasDebit = /\b(debit|dr|withdrawal|expense|payroll|fee|fees|charges?|bill|vendor payment|purchase|rent)\b/i.test(lower);
+    const hasCredit = /\b(credit|cr|deposit|refund|interest earned|client payment|sales? receipt|incoming)\b/i.test(lower);
+
+    if (hasDebit && !hasCredit) {
+      return 'debit';
+    }
+    if (hasCredit && !hasDebit) {
+      return 'credit';
+    }
+    if (/\bdebit\b/i.test(lower)) {
+      return 'debit';
+    }
+    if (/\bcredit\b/i.test(lower)) {
+      return 'credit';
+    }
+  }
+
   // Check if column name indicates type
   if (amountColumn) {
     const lower = amountColumn.toLowerCase();
-    if (lower.includes('credit') || lower.includes('deposit')) {
+    if (lower.includes('credit') || lower.includes('deposit') || lower.includes('incoming')) {
       return 'credit';
     }
-    if (lower.includes('debit') || lower.includes('withdrawal')) {
+    if (lower.includes('debit') || lower.includes('withdrawal') || lower.includes('outgoing') || lower.includes('expense')) {
       return 'debit';
     }
   }
-  
-  // Default to debit for positive amounts (conservative approach)
+
+  // Default to debit for positive amounts if conservative or check magnitude
   return amount > 0 ? 'credit' : 'debit';
 };
 
@@ -683,7 +714,7 @@ export const processCSVData = (
       const parsed = parseAmount(amountStr);
       if (parsed === null) continue;
       amount = Math.abs(parsed);
-      txnType = detectTransactionType(parsed, typeStr, mapping.amount);
+      txnType = detectTransactionType(parsed, typeStr, mapping.amount, narration);
     }
 
     if (!date || amount === null) {
@@ -712,14 +743,25 @@ export const calculateImportStats = (transactions: ImportedTransaction[]) => {
   const classified = nonDup.filter(
     t => (t.confidence ?? 0) >= 60
   ).length;
+  
+  // Track classification sources
+  const classifiedByAI = nonDup.filter(
+    t => (t.confidence ?? 0) >= 60 && t.classificationSource === 'ai'
+  ).length;
+  const classifiedByRules = nonDup.filter(
+    t => (t.confidence ?? 0) >= 60 && t.classificationSource === 'rules'
+  ).length;
+  
   return {
     total: transactions.length,
     duplicates: transactions.filter(t => t.isDuplicate).length,
     valid: nonDup.length,
     /** Rows with confident suggested classification (same as "auto-classified" in UI) */
     classified,
+    classifiedByAI,
+    classifiedByRules,
     totalAmount: nonDup.reduce(
-      (sum, t) => sum + (t.type === 'credit' ? t.amount : -t.amount),
+      (sum, t) => sum + (t.type === 'credit' ? Math.abs(t.amount) : -Math.abs(t.amount)),
       0
     ),
     credits: transactions.filter(t => t.type === 'credit' && !t.isDuplicate).length,

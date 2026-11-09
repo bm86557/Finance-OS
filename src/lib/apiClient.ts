@@ -8,22 +8,19 @@ import type { ServiceResponse } from '@/services/types';
 import { logApiFailure } from '@/lib/diagnostics';
 import { isSupabaseDataConfigured } from '@/lib/supabaseClient';
 
-/** Primary env: set in `.env.local`. Falls back to `VITE_LOCAL_API_BASE` for existing setups. */
+/** Primary env: set in `.env.local`. Returns empty string when no backend is configured. */
 export function getApiBaseUrl(): string {
-  const primary = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
-  const legacy = import.meta.env.VITE_LOCAL_API_BASE?.trim() ?? '';
-  return primary || legacy || '';
+  const metaEnv = typeof import.meta !== 'undefined' && (import.meta as any)?.env ? (import.meta as any).env : {};
+  const procEnv = typeof process !== 'undefined' && process?.env ? process.env : {};
+  const primary = (metaEnv.VITE_API_BASE_URL || procEnv.VITE_API_BASE_URL || '')?.trim?.() ?? '';
+  const legacy = (metaEnv.VITE_LOCAL_API_BASE || procEnv.VITE_LOCAL_API_BASE || '')?.trim?.() ?? '';
+  return primary || legacy;
 }
 
 /**
- * True when a non-empty API base is configured — safe to route service calls through HTTP.
- * Returns false whenever Supabase is the active data backend (`isSupabaseDataConfigured()`):
- * the local API and Supabase keep independent sessions, so a service can't call one while the
- * user is authenticated against the other — every service falls back to the (Supabase-synced)
- * `dataStore` branch instead in that case.
+ * True when an API base is available to route administrative or sync requests through HTTP.
  */
 export function isHttpBackendConfigured(): boolean {
-  if (isSupabaseDataConfigured()) return false;
   return getApiBaseUrl().length > 0;
 }
 
@@ -59,6 +56,7 @@ function withTimeoutSignal(
 /**
  * JSON-oriented `fetch` that returns `ServiceResponse<T>`.
  * - Sends cookies (`credentials: 'include'`) for session-style auth.
+ * - Auto-attaches Supabase Bearer token if available and token option is omitted.
  * - 2xx: prefers body shaped like `{ success, data, ... }`; otherwise wraps raw JSON as `{ success: true, data }`.
  * - Non-OK HTTP: maps body `error` / `message` or status to `success: false`.
  */
@@ -77,8 +75,21 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
   const url = joinBaseAndPath(base, path);
   const headers = new Headers(requestInit.headers);
 
-  if (token) {
-    headers.set('Authorization', `Bearer ${token}`);
+  let activeToken = token;
+  if (!activeToken) {
+    try {
+      const sb = (await import('@/lib/supabaseClient')).getSupabaseClient();
+      if (sb) {
+        const sess = await sb.auth.getSession();
+        activeToken = sess.data.session?.access_token;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (activeToken) {
+    headers.set('Authorization', `Bearer ${activeToken}`);
   }
 
   const body = requestInit.body;
@@ -96,6 +107,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
       ...requestInit,
       headers,
       credentials: 'include',
+      cache: 'no-store',
       signal: timeoutSignal,
     });
 
@@ -165,4 +177,42 @@ export async function apiPostJson<TBody extends object, T>(
 /** Convenience for GET without cache surprises during dev. */
 export async function apiGet<T>(path: string, options: Omit<ApiRequestOptions, 'method' | 'body'> = {}): Promise<ServiceResponse<T>> {
   return apiRequest<T>(path, { ...options, method: 'GET' });
+}
+
+
+/** Convenience for PUT with JSON bodies. */
+export async function apiPutJson<TBody extends object, T>(
+  path: string,
+  body: TBody,
+  options: Omit<ApiRequestOptions, 'body' | 'method'> = {},
+): Promise<ServiceResponse<T>> {
+  return apiRequest<T>(path, {
+    ...options,
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+/** Convenience for PATCH with JSON bodies. */
+export async function apiPatchJson<TBody extends object, T>(
+  path: string,
+  body: TBody,
+  options: Omit<ApiRequestOptions, 'body' | 'method'> = {},
+): Promise<ServiceResponse<T>> {
+  return apiRequest<T>(path, {
+    ...options,
+    method: 'PATCH',
+    body: JSON.stringify(body),
+  });
+}
+
+/** Convenience for DELETE requests. */
+export async function apiDelete<T>(
+  path: string,
+  options: Omit<ApiRequestOptions, 'method' | 'body'> = {},
+): Promise<ServiceResponse<T>> {
+  return apiRequest<T>(path, {
+    ...options,
+    method: 'DELETE',
+  });
 }

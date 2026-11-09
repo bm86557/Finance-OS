@@ -29,6 +29,9 @@ create table if not exists public.organizations (
   settings jsonb not null default '{"theme":"dark","notifications":true}'::jsonb
 );
 
+create unique index if not exists idx_organizations_name_unique on public.organizations (lower(trim(name)));
+create unique index if not exists idx_organizations_slug_unique on public.organizations (lower(trim(slug)));
+
 comment on table public.organizations is 'Organization / tenant — maps to Organization in types.ts';
 
 -- Profile row per auth user (app User + metadata)
@@ -45,15 +48,29 @@ create table if not exists public.profiles (
 comment on table public.profiles is 'Extends auth.users — maps to User in types.ts';
 
 create table if not exists public.organization_members (
+  id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users (id) on delete cascade,
   organization_id text not null references public.organizations (id) on delete cascade,
   role text not null check (role in ('owner', 'admin', 'viewer', 'employee')),
+  status text not null default 'active' check (status in ('active', 'pending', 'inactive')),
+  portal_type text not null default 'employee',
+  department text,
+  email text,
+  invited_by uuid references auth.users (id) on delete set null,
+  invited_at timestamptz,
   joined_at timestamptz not null default now(),
-  primary key (user_id, organization_id)
+  constraint organization_members_user_org_unique unique (user_id, organization_id)
 );
+
+comment on table public.organization_members is 'Organization membership with invitation support';
+comment on column public.organization_members.email is 'Email for pending invitations (before user account exists)';
+comment on column public.organization_members.status is 'active = member, pending = invited but not accepted, inactive = removed';
 
 create index if not exists idx_organization_members_user on public.organization_members (user_id);
 create index if not exists idx_organization_members_org on public.organization_members (organization_id);
+create index if not exists idx_org_members_email on public.organization_members (email);
+create index if not exists idx_org_members_status on public.organization_members (status);
+create index if not exists idx_org_members_invited_by on public.organization_members (invited_by);
 
 -- Auto-create profile on signup (optional; safe to run twice if function replaced)
 create or replace function public.handle_new_user()
@@ -63,11 +80,12 @@ security definer
 set search_path = public
 as $$
 begin
-  insert into public.profiles (id, email, full_name)
+  insert into public.profiles (id, email, full_name, platform_role)
   values (
     new.id,
     new.email,
-    coalesce(new.raw_user_meta_data->>'full_name', new.raw_user_meta_data->>'name', split_part(new.email, '@', 1))
+    coalesce(new.raw_user_meta_data->>'full_name', new.raw_user_meta_data->>'name', split_part(new.email, '@', 1)),
+    coalesce(new.raw_user_meta_data->>'platform_role', 'organization_user')
   )
   on conflict (id) do update set
     email = excluded.email,
@@ -80,6 +98,21 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
+
+-- Helper to check if any platform admin exists (RLS-safe for anonymous login check)
+create or replace function public.has_platform_admin()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists(
+    select 1 from public.profiles where platform_role = 'platform_admin'
+  );
+$$;
+
+grant execute on function public.has_platform_admin() to anon, authenticated;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Accounting & banking
@@ -152,8 +185,14 @@ create table if not exists public.transactions (
   project_id text,
   status text not null check (status in ('pending', 'classified', 'reviewed', 'reconciled')),
   confidence numeric,
-  tags jsonb not null default '[]'::jsonb,
+  tags jsonb not null default '["business"]'::jsonb,  -- Default to business tag
   attachments jsonb not null default '[]'::jsonb,
+  idempotency_key text,
+  original_amount numeric,
+  original_currency text,
+  fx_rate_to_base numeric,
+  base_currency text,
+  source_import_id text references public.import_history_records (id) on delete set null,
   created_at timestamptz not null default now(),
   classified_at timestamptz,
   classified_by text
@@ -162,6 +201,9 @@ create table if not exists public.transactions (
 create index if not exists idx_transactions_org on public.transactions (organization_id);
 create index if not exists idx_transactions_bank on public.transactions (bank_account_id);
 create index if not exists idx_transactions_date on public.transactions (date);
+create index if not exists idx_transactions_idempotency on public.transactions (organization_id, idempotency_key);
+create index if not exists idx_transactions_source_import on public.transactions (source_import_id) where source_import_id is not null;
+create index if not exists idx_transactions_org_source on public.transactions (organization_id, source_import_id) where source_import_id is not null;
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- Departments, projects, assets, inventory
@@ -311,7 +353,7 @@ create table if not exists public.recurring_transactions (
   amount numeric not null,
   currency text not null default 'USD',
   type text not null check (type in ('debit', 'credit')),
-  category_id text not null references public.categories (id) on delete cascade,
+  category_id text references public.categories (id) on delete cascade,
   bank_account_id text not null references public.bank_accounts (id) on delete cascade,
   frequency text not null check (
     frequency in ('daily', 'weekly', 'monthly', 'quarterly', 'yearly')
@@ -339,8 +381,19 @@ create table if not exists public.budgets (
   budgeted_amount numeric not null default 0,
   spent_amount numeric not null default 0,
   currency text not null default 'USD',
-  status text not null check (status in ('active', 'exceeded', 'completed'))
+  status text not null check (status in ('active', 'exceeded', 'completed')),
+  alert_threshold integer not null default 80 check (alert_threshold between 1 and 100),
+  scope text not null default 'business' check (scope in ('business', 'personal')),
+  rolled_from_id text references public.budgets (id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
+
+create index if not exists idx_budgets_org on public.budgets (organization_id);
+create index if not exists idx_budgets_period on public.budgets (organization_id, start_date, end_date);
+create index if not exists idx_budgets_category on public.budgets (organization_id, category_id);
+create index if not exists idx_budgets_dept on public.budgets (organization_id, department_id);
+
 
 create table if not exists public.loans (
   id text primary key,
@@ -538,6 +591,11 @@ as $$
     from public.organization_members m
     where m.organization_id = p_org_id
       and m.user_id = auth.uid()
+  ) or exists (
+    select 1
+    from public.profiles p
+    where p.id = auth.uid()
+      and p.platform_role in ('platform_admin', 'platform_manager')
   );
 $$;
 
@@ -576,10 +634,77 @@ create policy "profiles_select_own" on public.profiles for select using (id = au
 drop policy if exists "profiles_update_own" on public.profiles;
 create policy "profiles_update_own" on public.profiles for update using (id = auth.uid());
 
--- Organization members: see own rows
+-- Organization members: proper policies for invitation flow
 drop policy if exists "organization_members_select_own" on public.organization_members;
-create policy "organization_members_select_own" on public.organization_members
-  for select using (user_id = auth.uid());
+drop policy if exists "org_members_select" on public.organization_members;
+drop policy if exists "org_members_insert" on public.organization_members;
+drop policy if exists "org_members_update" on public.organization_members;
+drop policy if exists "org_members_delete" on public.organization_members;
+
+-- Helper function to get user's organizations (avoids circular RLS dependency)
+create or replace function public.user_organizations(check_user_id uuid)
+returns table(organization_id text, role text, status text)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select 
+    organization_id,
+    role,
+    status
+  from organization_members
+  where user_id = check_user_id;
+$$;
+
+grant execute on function public.user_organizations(uuid) to authenticated;
+
+-- SELECT: Users can see their own memberships and other members in their orgs
+create policy "org_members_select" on public.organization_members
+for select
+using (
+  user_id = auth.uid()
+  or
+  organization_id in (
+    select organization_id 
+    from user_organizations(auth.uid())
+  )
+);
+
+-- INSERT: Only admins/owners can invite new members
+create policy "org_members_insert" on public.organization_members
+for insert
+with check (
+  organization_id in (
+    select organization_id 
+    from user_organizations(auth.uid())
+    where role in ('admin', 'owner')
+  )
+);
+
+-- UPDATE: Admins can update member details, users can update their own profile
+create policy "org_members_update" on public.organization_members
+for update
+using (
+  user_id = auth.uid()
+  or
+  organization_id in (
+    select organization_id 
+    from user_organizations(auth.uid())
+    where role in ('admin', 'owner')
+  )
+);
+
+-- DELETE: Only admins/owners can remove members
+create policy "org_members_delete" on public.organization_members
+for delete
+using (
+  organization_id in (
+    select organization_id 
+    from user_organizations(auth.uid())
+    where role in ('admin', 'owner')
+  )
+);
 
 -- Organizations: readable if member
 drop policy if exists "organizations_select_member" on public.organizations;
@@ -636,8 +761,40 @@ create policy "recurring_transactions_org_access" on public.recurring_transactio
   for all using (public.is_org_member(organization_id)) with check (public.is_org_member(organization_id));
 
 drop policy if exists "budgets_org_access" on public.budgets;
-create policy "budgets_org_access" on public.budgets
-  for all using (public.is_org_member(organization_id)) with check (public.is_org_member(organization_id));
+drop policy if exists "service_role_budgets_all" on public.budgets;
+create policy "service_role_budgets_all" on public.budgets
+  for all to service_role using (true) with check (true);
+
+drop policy if exists "auth_budgets_select" on public.budgets;
+create policy "auth_budgets_select" on public.budgets
+  for select to authenticated using (public.is_org_member(organization_id));
+
+drop policy if exists "auth_budgets_insert" on public.budgets;
+create policy "auth_budgets_insert" on public.budgets
+  for insert to authenticated with check (
+    organization_id in (
+      select organization_id from public.organization_members
+      where user_id::text = auth.uid()::text and role in ('owner', 'admin')
+    )
+  );
+
+drop policy if exists "auth_budgets_update" on public.budgets;
+create policy "auth_budgets_update" on public.budgets
+  for update to authenticated using (
+    organization_id in (
+      select organization_id from public.organization_members
+      where user_id::text = auth.uid()::text and role in ('owner', 'admin')
+    )
+  );
+
+drop policy if exists "auth_budgets_delete" on public.budgets;
+create policy "auth_budgets_delete" on public.budgets
+  for delete to authenticated using (
+    organization_id in (
+      select organization_id from public.organization_members
+      where user_id::text = auth.uid()::text and role in ('owner', 'admin')
+    )
+  );
 
 drop policy if exists "loans_org_access" on public.loans;
 create policy "loans_org_access" on public.loans
@@ -711,3 +868,111 @@ create policy "finance_os_bundle_authenticated_all"
   to authenticated
   using (true)
   with check (true);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Budget Planning Triggers & Auto-Compute Functions
+-- ═══════════════════════════════════════════════════════════════════════════
+
+create or replace function public.budgets_set_updated_at()
+returns trigger language plpgsql as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_budgets_updated_at on public.budgets;
+create trigger trg_budgets_updated_at
+  before update on public.budgets
+  for each row
+  execute function public.budgets_set_updated_at();
+
+-- Recomputes spent_amount from transactions upon insert, update, or delete
+create or replace function public.budget_recompute_spent()
+returns trigger language plpgsql security definer as $$
+declare
+  v_org_id text;
+  v_date   date;
+  v_cat_id text;
+  v_dept_id text;
+  v_proj_id text;
+begin
+  if tg_op = 'DELETE' then
+    v_org_id  := old.organization_id;
+    v_date    := old.date::date;
+    v_cat_id  := old.category_id;
+    v_dept_id := old.department_id;
+    v_proj_id := old.project_id;
+  else
+    v_org_id  := new.organization_id;
+    v_date    := new.date::date;
+    v_cat_id  := new.category_id;
+    v_dept_id := new.department_id;
+    v_proj_id := new.project_id;
+  end if;
+
+  update public.budgets b
+  set spent_amount = coalesce((
+    select sum(abs(t.amount))
+    from public.transactions t
+    where t.organization_id = b.organization_id
+      and t.type = 'debit'
+      and t.date::date >= b.start_date
+      and t.date::date <= b.end_date
+      and (b.category_id is null or t.category_id = b.category_id)
+      and (b.department_id is null or t.department_id = b.department_id or t.project_id in (select p.id from public.projects p where p.department_id = b.department_id))
+      and (b.project_id is null or t.project_id = b.project_id)
+  ), 0)
+  where b.organization_id = v_org_id
+    and b.start_date <= v_date
+    and b.end_date   >= v_date
+    and b.status != 'completed';
+
+  update public.budgets
+  set status = case
+    when spent_amount >= budgeted_amount then 'exceeded'
+    else 'active'
+  end
+  where organization_id = v_org_id
+    and start_date <= v_date
+    and end_date   >= v_date
+    and status != 'completed';
+
+  return coalesce(new, old);
+end;
+$$;
+
+drop trigger if exists trg_budget_recompute_on_txn on public.transactions;
+create trigger trg_budget_recompute_on_txn
+  after insert or update or delete on public.transactions
+  for each row
+  execute function public.budget_recompute_spent();
+
+-- Helper: On-demand recomputation of all budgets for an organization
+create or replace function public.budget_recompute_all_for_org(p_org_id text)
+returns void language plpgsql security definer as $$
+begin
+  update public.budgets b
+  set spent_amount = coalesce((
+    select sum(abs(t.amount))
+    from public.transactions t
+    where t.organization_id = b.organization_id
+      and t.type = 'debit'
+      and t.date::date >= b.start_date
+      and t.date::date <= b.end_date
+      and (b.category_id is null or t.category_id = b.category_id)
+      and (b.department_id is null or t.department_id = b.department_id or t.project_id in (select p.id from public.projects p where p.department_id = b.department_id))
+      and (b.project_id is null or t.project_id = b.project_id)
+  ), 0)
+  where b.organization_id = p_org_id
+    and b.status != 'completed';
+
+  update public.budgets
+  set status = case
+    when spent_amount >= budgeted_amount then 'exceeded'
+    else 'active'
+  end
+  where organization_id = p_org_id
+    and status != 'completed';
+end;
+$$;

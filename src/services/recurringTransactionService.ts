@@ -2,6 +2,17 @@
  * Recurring Transaction Service
  * ==============================
  * CRUD for recurring/scheduled transactions.
+ * 
+ * IMPORTANT: Recurring schedules are TEMPLATES, not active transactions.
+ * They do NOT affect bank balances until transactions are generated.
+ * 
+ * Workflow:
+ * 1. User creates recurring schedule via UI → POST /recurring-transactions
+ * 2. Schedule saved to `recurring_transactions` table in Supabase
+ * 3. User clicks "Generate Due" or cron job runs daily → POST /recurring-transactions/generate
+ * 4. `recurring_generate_due()` SQL function creates rows in `transactions` table
+ * 5. Trigger `trg_update_bank_balance` fires on INSERT → updates `bank_accounts.balance`
+ * 6. Bank balance reflects the generated transaction
  *
  * When `VITE_API_BASE_URL` is set, uses org-scoped REST routes; otherwise `dataStore`.
  */
@@ -60,10 +71,14 @@ export const recurringTransactionService = {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<RecurringTransaction>(organizationId);
       if (err) return err;
-      return apiPostJson<Omit<RecurringTransaction, 'id' | 'organizationId'>, RecurringTransaction>(
+      const result = await apiPostJson<Omit<RecurringTransaction, 'id' | 'organizationId'>, RecurringTransaction>(
         REC(organizationId),
         data,
       );
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+      }
+      return result;
     }
 
     await simulateDelay(200);
@@ -82,7 +97,11 @@ export const recurringTransactionService = {
       const path = organizationId
         ? `${REC(organizationId)}/${encodeURIComponent(id)}`
         : `/recurring-transactions/${encodeURIComponent(id)}`;
-      return apiRequest<RecurringTransaction>(path, { method: 'PATCH', body: JSON.stringify(updates) });
+      const result = await apiRequest<RecurringTransaction>(path, { method: 'PATCH', body: JSON.stringify(updates) });
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+      }
+      return result;
     }
 
     await simulateDelay(150);
@@ -103,7 +122,11 @@ export const recurringTransactionService = {
       const path = organizationId
         ? `${REC(organizationId)}/${encodeURIComponent(id)}`
         : `/recurring-transactions/${encodeURIComponent(id)}`;
-      return apiRequest<null>(path, { method: 'DELETE' });
+      const result = await apiRequest<null>(path, { method: 'DELETE' });
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+      }
+      return result;
     }
 
     await simulateDelay(150);
@@ -119,7 +142,11 @@ export const recurringTransactionService = {
       const path = organizationId
         ? `${REC(organizationId)}/${encodeURIComponent(id)}/toggle`
         : `/recurring-transactions/${encodeURIComponent(id)}/toggle`;
-      return apiRequest<RecurringTransaction>(path, { method: 'POST', body: '{}' });
+      const result = await apiRequest<RecurringTransaction>(path, { method: 'POST', body: '{}' });
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+      }
+      return result;
     }
 
     await simulateDelay(100);
@@ -128,5 +155,67 @@ export const recurringTransactionService = {
     dataStore.recurringTransactions[idx].isActive = !dataStore.recurringTransactions[idx].isActive;
     dataStore.notify('recurringTransactions');
     return { success: true, data: dataStore.recurringTransactions[idx] };
+  },
+
+  async generate(organizationId: string, asOfDate?: string): Promise<ServiceResponse<any>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any>(organizationId);
+      if (err) return err;
+      return apiPostJson<{ asOfDate?: string }, any>(
+        `${REC(organizationId)}/generate`,
+        { asOfDate: asOfDate || new Date().toISOString().split('T')[0] },
+      );
+    }
+    
+    // Local dataStore mode: not implemented (requires SQL logic)
+    return { success: false, data: null as any, error: 'Generation only works with Supabase backend' };
+  },
+
+  async generateSingle(recurringId: string, organizationId?: string): Promise<ServiceResponse<any>> {
+    if (isHttpBackendConfigured()) {
+      const path = organizationId
+        ? `${REC(organizationId)}/${encodeURIComponent(recurringId)}/generate`
+        : `/recurring-transactions/${encodeURIComponent(recurringId)}/generate`;
+      const result = await apiRequest<any>(path, { method: 'POST', body: '{}' });
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+        dataStore.notify('transactions');
+      }
+      return result;
+    }
+    
+    // Local dataStore mode: not implemented (requires SQL logic)
+    return { success: false, data: null as any, error: 'Generation only works with Supabase backend' };
+  },
+
+  async getTotals(organizationId: string): Promise<ServiceResponse<{
+    active: number;
+    monthlyIncome: number;
+    monthlyExpense: number;
+    dueSoon: number;
+    overdue: number;
+    byCurrency: Record<string, number>;
+  }>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any>(organizationId);
+      if (err) return err;
+      return apiGet<any>(`${REC(organizationId)}/totals`);
+    }
+    
+    // Local dataStore mode: calculate manually (simplified, no normalization)
+    await simulateDelay();
+    const all = dataStore.recurringTransactions.filter(r => r.organizationId === organizationId);
+    const active = all.filter(r => r.isActive).length;
+    return { 
+      success: true, 
+      data: { 
+        active, 
+        monthlyIncome: 0, 
+        monthlyExpense: 0, 
+        dueSoon: 0, 
+        overdue: 0, 
+        byCurrency: {} 
+      } 
+    };
   },
 };

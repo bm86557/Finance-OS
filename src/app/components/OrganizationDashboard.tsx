@@ -1,5 +1,6 @@
 import { formatCurrency } from '@/lib/formatters';
 import { TrendingUp, Wallet, DollarSign, Plus, Upload, Settings, Users, BarChart3, LayoutDashboard, Activity, Target, Zap, TrendingDown, Calendar, ArrowRight } from 'lucide-react';
+import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 
 // ── Local inline mock data ─────────────────────────────────────────────────
 // NOTE: OrganizationDashboard.tsx is the LEGACY dashboard (not routed in App.tsx).

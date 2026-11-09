@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../ui/card';
 import { Button } from '../ui/button';
 import { Badge } from '../ui/badge';
@@ -7,21 +7,23 @@ import {
   Brain, 
   CheckCircle2, 
   XCircle, 
-  HelpCircle,
-  Sparkles,
-  TrendingUp,
-  Calendar,
-  DollarSign,
-  AlertCircle,
-  ArrowRight,
-  ThumbsUp,
-  ThumbsDown,
-  Zap
+  HelpCircle, 
+  Sparkles, 
+  TrendingUp, 
+  Calendar, 
+  DollarSign, 
+  AlertCircle, 
+  ArrowRight, 
+  ThumbsUp, 
+  ThumbsDown, 
+  Zap 
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { formatCurrency, formatDate } from '@/lib/formatters';
 import { useTheme } from '../../../contexts/ThemeContext';
 import { motion } from 'motion/react';
+import { useOrgServices } from '@/hooks/useOrgServices';
+import { useService, useServiceArray } from '@/hooks/useService';
 
 interface LowConfidenceTransaction {
   id: string;
@@ -46,180 +48,165 @@ interface LowConfidenceTransaction {
   accountName: string;
 }
 
-const mockLowConfidenceTransactions: LowConfidenceTransaction[] = [
-  {
-    id: '1',
-    date: '2025-01-15',
-    narration: 'GRAB FOOD DELIVERY',
-    amount: 850,
-    currency: 'PKR',
-    type: 'expense',
-    currentCategory: 'Uncategorized',
-    confidence: 45,
-    suggestions: [
-      {
-        category: 'Meals & Entertainment',
-        scope: 'business',
-        confidence: 55,
-        reasoning: 'Could be a business lunch or personal meal'
-      },
-      {
-        category: 'Food & Dining',
-        scope: 'personal',
-        confidence: 45,
-        reasoning: 'Common food delivery service'
-      }
-    ],
-    questions: [
-      {
-        id: 'q1',
-        question: 'Was this a business meal with a client/team?',
-        options: ['Yes, business meeting', 'No, personal meal', 'Team lunch/dinner']
-      }
-    ],
-    accountName: 'HBL Business Account'
-  },
-  {
-    id: '2',
-    date: '2025-01-14',
-    narration: 'AMAZON WEB SERVICES',
-    amount: 12500,
-    currency: 'PKR',
-    type: 'expense',
-    currentCategory: 'Software & Tools',
-    confidence: 65,
-    suggestions: [
-      {
-        category: 'Software & Tools',
-        scope: 'business',
-        confidence: 85,
-        reasoning: 'AWS is typically a business expense'
-      },
-      {
-        category: 'Hosting & Infrastructure',
-        scope: 'business',
-        confidence: 80,
-        reasoning: 'Cloud hosting service'
-      }
-    ],
-    questions: [
-      {
-        id: 'q1',
-        question: 'Which project is this AWS cost for?',
-        options: ['Client Project A', 'Client Project B', 'Internal Infrastructure', 'Multiple Projects']
-      }
-    ],
-    accountName: 'HBL Business Account'
-  },
-  {
-    id: '3',
-    date: '2025-01-13',
-    narration: 'UBER TRIP',
-    amount: 450,
-    currency: 'PKR',
-    type: 'expense',
-    currentCategory: 'Uncategorized',
-    confidence: 40,
-    suggestions: [
-      {
-        category: 'Transportation',
-        scope: 'business',
-        confidence: 50,
-        reasoning: 'Could be client visit or personal commute'
-      },
-      {
-        category: 'Travel',
-        scope: 'personal',
-        confidence: 50,
-        reasoning: 'Common ride-sharing service'
-      }
-    ],
-    questions: [
-      {
-        id: 'q1',
-        question: 'What was the purpose of this ride?',
-        options: ['Client meeting', 'Office commute', 'Personal errand', 'Airport/Travel']
-      }
-    ],
-    accountName: 'HBL Business Account'
-  },
-  {
-    id: '4',
-    date: '2025-01-12',
-    narration: 'STARBUCKS COFFEE',
-    amount: 650,
-    currency: 'PKR',
-    type: 'expense',
-    currentCategory: 'Uncategorized',
-    confidence: 38,
-    suggestions: [
-      {
-        category: 'Meals & Entertainment',
-        scope: 'business',
-        confidence: 48,
-        reasoning: 'Could be client meeting at cafe'
-      },
-      {
-        category: 'Food & Dining',
-        scope: 'personal',
-        confidence: 52,
-        reasoning: 'Personal coffee purchase'
-      }
-    ],
-    questions: [
-      {
-        id: 'q1',
-        question: 'Was this coffee with a client or team member?',
-        options: ['Yes, business meeting', 'No, personal coffee', 'Working session with team']
-      }
-    ],
-    accountName: 'HBL Business Account'
-  }
-];
-
 export function SmartCategorizationPrompts() {
-  const [transactions, setTransactions] = useState<LowConfidenceTransaction[]>(mockLowConfidenceTransactions);
+  const svc = useOrgServices();
+  const { data: txnResult, refetch: refetchTxns } = useService(
+    () => svc.transactions.getAll({ pageSize: 100 }),
+    [svc.orgId]
+  );
+  const { data: categories = [] } = useServiceArray(
+    () => svc.categories.getAll(),
+    [svc.orgId]
+  );
+
+  const [classificationMap, setClassificationMap] = useState<Map<string, any>>(new Map());
+
+  useEffect(() => {
+    const raw = txnResult?.items || [];
+    const uncategorized = raw.filter(t => !t.categoryId || t.categoryId === 'uncategorized' || t.status === 'pending');
+    if (uncategorized.length === 0 || !svc.classification?.batchClassify) return;
+
+    let isMounted = true;
+    const toClassify = uncategorized.slice(0, 20).map(t => ({
+      narration: t.narration || t.description || 'Transaction',
+      amount: Math.abs(t.amount),
+      type: t.type === 'credit' ? ('credit' as const) : ('debit' as const),
+    }));
+
+    svc.classification.batchClassify(toClassify).then(res => {
+      if (!isMounted || !res?.success || !res.data) return;
+      const map = new Map<string, any>();
+      uncategorized.slice(0, 20).forEach((t, idx) => {
+        const item = res.data.get(idx);
+        if (item) map.set(t.id, item);
+      });
+      setClassificationMap(map);
+    }).catch(err => {
+      console.warn('[SmartCategorization] Batch classify notice:', err);
+    });
+
+    return () => { isMounted = false; };
+  }, [txnResult?.items, svc.classification]);
+
+  const realTransactions: LowConfidenceTransaction[] = useMemo(() => {
+    const raw = txnResult?.items || [];
+    const uncategorized = raw.filter(t => !t.categoryId || t.categoryId === 'uncategorized' || t.status === 'pending');
+    return uncategorized.map(t => {
+      const text = `${t.narration || ''} ${t.description || ''}`.toLowerCase();
+      let suggestedName = categories[0]?.name || 'General Operations';
+      let reasoning = 'Matched from ledger transaction description';
+      if (text.includes('laptop') || text.includes('inventory') || text.includes('hardware')) {
+        suggestedName = categories.find(c => c.name.toLowerCase().includes('inventory') || c.name.toLowerCase().includes('cost of goods') || c.name.toLowerCase().includes('equipment'))?.name || 'Equipment & Hardware';
+        reasoning = 'Detected inventory or hardware procurement';
+      } else if (text.includes('subscription') || text.includes('claude') || text.includes('software')) {
+        suggestedName = categories.find(c => c.name.toLowerCase().includes('software') || c.name.toLowerCase().includes('subscription'))?.name || 'Software & Tools';
+        reasoning = 'Detected software/cloud service subscription';
+      } else if (text.includes('rent')) {
+        suggestedName = categories.find(c => c.name.toLowerCase().includes('rent'))?.name || 'Rent & Facilities';
+        reasoning = 'Detected lease or rent outflow';
+      }
+
+      const aiResult = classificationMap.get(t.id);
+      if (aiResult) {
+        if (aiResult.categoryName || aiResult.category) suggestedName = aiResult.categoryName || aiResult.category;
+        if (aiResult.reasoning || aiResult.explanation) reasoning = aiResult.reasoning || aiResult.explanation;
+      }
+      const aiConf = aiResult?.confidence ? Math.round(Number(aiResult.confidence) * (Number(aiResult.confidence) <= 1 ? 100 : 1)) : 85;
+      if (false) {
+      }
+
+      return {
+        id: t.id,
+        date: t.date,
+        narration: (t.narration || t.description || 'Transaction').toUpperCase(),
+        amount: Math.abs(t.amount),
+        currency: t.currency || 'USD',
+        type: t.type === 'credit' ? ('income' as const) : ('expense' as const),
+        currentCategory: 'Uncategorized',
+        confidence: 45,
+        suggestions: [
+          {
+            category: suggestedName,
+            scope: 'business' as const,
+            confidence: aiConf,
+            reasoning,
+          },
+          {
+            category: 'General Operations',
+            scope: 'business' as const,
+            confidence: 50,
+            reasoning: 'Standard operational categorization',
+          }
+        ],
+        questions: [
+          {
+            id: 'q1',
+            question: 'Is this an operational business transaction for this organization?',
+            options: ['Yes, business operational cost', 'No, personal expense', 'Client project reimbursable']
+          }
+        ],
+        accountName: 'Organization Bank Account',
+      };
+    });
+  }, [txnResult?.items, categories, classificationMap]);
+
   const [currentIndex, setCurrentIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [learnedCount, setLearnedCount] = useState(0);
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
 
-  const currentTransaction = transactions[currentIndex];
-  const progress = ((currentIndex / transactions.length) * 100);
-  const remaining = transactions.length - currentIndex;
+  const activeTransactions = realTransactions.filter(t => !dismissedIds.has(t.id));
+  const currentTransaction = activeTransactions[currentIndex];
+  const progress = activeTransactions.length > 0 ? (currentIndex / activeTransactions.length) * 100 : 100;
+  const remaining = Math.max(0, activeTransactions.length - currentIndex);
 
   const handleAnswer = (questionId: string, answer: string) => {
+    if (!currentTransaction) return;
     setAnswers({ ...answers, [`${currentTransaction.id}_${questionId}`]: answer });
   };
 
-  const handleConfirm = (suggestion: any) => {
-    // Apply the suggestion and create a learning rule
-    toast.success(`✓ Learned: "${currentTransaction.narration}" → ${suggestion.category} (${suggestion.scope})`);
-    
-    setLearnedCount(learnedCount + 1);
-    moveToNext();
-  };
-
-  const handleSkip = () => {
-    toast.info('Transaction skipped');
-    moveToNext();
-  };
-
-  const handleReject = () => {
-    toast.info('Suggestion rejected - will stay uncategorized');
-    moveToNext();
-  };
-
-  const moveToNext = () => {
-    if (currentIndex < transactions.length - 1) {
-      setCurrentIndex(currentIndex + 1);
-      setAnswers({});
-    } else {
-      toast.success(`🎉 All done! Learned ${learnedCount + 1} new patterns`);
-      setTransactions([]);
+  const handleConfirm = async (suggestion: any) => {
+    if (!currentTransaction) return;
+    try {
+      const targetCat = categories.find(c => c.name.toLowerCase() === suggestion.category.toLowerCase()) || categories[0];
+      if (targetCat) {
+        await svc.transactions.update(currentTransaction.id, {
+          categoryId: targetCat.id,
+          status: 'classified',
+          ...(suggestion.scope ? { worldScope: suggestion.scope } : {}),
+        });
+        if ((svc as any).classification?.learnFromCorrection) {
+          try {
+            await (svc as any).classification.learnFromCorrection(currentTransaction.id, targetCat.id);
+          } catch (e) {
+            console.warn('[SmartCategorization] learn error:', e);
+          }
+        }
+        await Promise.resolve({
+        });
+      }
+      toast.success(`✓ Learned: "${currentTransaction.narration}" → ${suggestion.category} (${suggestion.scope})`);
+      setLearnedCount(prev => prev + 1);
+      setDismissedIds(prev => new Set(prev).add(currentTransaction.id));
+      void refetchTxns();
+    } catch {
+      toast.error('Failed to update category');
     }
   };
 
-  if (transactions.length === 0) {
+  const handleSkip = () => {
+    if (!currentTransaction) return;
+    toast.info('Transaction skipped');
+    setDismissedIds(prev => new Set(prev).add(currentTransaction.id));
+  };
+
+  const handleReject = () => {
+    if (!currentTransaction) return;
+    toast.info('Suggestion rejected - will stay uncategorized');
+    setDismissedIds(prev => new Set(prev).add(currentTransaction.id));
+  };
+
+  if (!currentTransaction || activeTransactions.length === 0) {
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-4">
@@ -291,7 +278,7 @@ export function SmartCategorizationPrompts() {
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm text-slate-400">Overall Progress</span>
             <span className="text-sm text-white font-medium">
-              {currentIndex + 1} of {transactions.length}
+              {currentIndex + 1} of {activeTransactions.length}
             </span>
           </div>
           <Progress value={progress} className="h-2" />

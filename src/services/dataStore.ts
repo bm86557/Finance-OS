@@ -25,6 +25,7 @@ import {
   buildPayloadFromMocks,
 } from '@/services/initialBundle';
 import { isSupabaseConfigured, getSupabaseClient } from '@/lib/supabaseClient';
+import { isHttpBackendConfigured } from '@/lib/apiClient';
 import {
   fetchBundleFromSupabase,
   upsertBundleToSupabase,
@@ -88,32 +89,32 @@ function localDbApiBase(): string {
 }
 
 class DataStore {
-  organizations: Organization[];
-  users: User[];
-  organizationMembers: OrganizationMember[];
-  accounts: Account[];
-  bankAccounts: BankAccount[];
-  transactions: Transaction[];
-  categories: Category[];
-  departments: Department[];
-  projects: Project[];
-  assets: Asset[];
-  depreciationSchedules: DepreciationSchedule[];
-  inventoryItems: InventoryItem[];
-  inventoryTransactions: InventoryTransaction[];
-  overheadAllocations: OverheadAllocation[];
-  recurringTransactions: RecurringTransaction[];
-  budgets: Budget[];
-  loans: Loan[];
-  cashFlowForecasts: CashFlowForecast[];
-  activeSessions: ActiveSession[];
-  notifications: Notification[];
+  organizations!: Organization[];
+  users!: User[];
+  organizationMembers!: OrganizationMember[];
+  accounts!: Account[];
+  bankAccounts!: BankAccount[];
+  transactions!: Transaction[];
+  categories!: Category[];
+  departments!: Department[];
+  projects!: Project[];
+  assets!: Asset[];
+  depreciationSchedules!: DepreciationSchedule[];
+  inventoryItems!: InventoryItem[];
+  inventoryTransactions!: InventoryTransaction[];
+  overheadAllocations!: OverheadAllocation[];
+  recurringTransactions!: RecurringTransaction[];
+  budgets!: Budget[];
+  loans!: Loan[];
+  cashFlowForecasts!: CashFlowForecast[];
+  activeSessions!: ActiveSession[];
+  notifications!: Notification[];
 
-  expenses: EmployeeExpense[];
-  payslips: EmployeePayslip[];
-  timesheets: TimesheetEntry[];
-  teamMembers: EmployeeTeamMember[];
-  announcements: CompanyAnnouncement[];
+  expenses!: EmployeeExpense[];
+  payslips!: EmployeePayslip[];
+  timesheets!: TimesheetEntry[];
+  teamMembers!: EmployeeTeamMember[];
+  announcements!: CompanyAnnouncement[];
 
   private listeners: Map<string, Set<() => void>> = new Map();
   private persistTimer: ReturnType<typeof setTimeout> | null = null;

@@ -1,5 +1,5 @@
 import { ReactNode } from 'react';
-import { useAuth } from '../../../contexts/AuthContext';
+import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '../ui/button';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { 

@@ -7,6 +7,8 @@
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { env } from '../config/env.js';
+// @ts-ignore
+import ws from 'ws';
 
 let client: SupabaseClient | null = null;
 
@@ -19,6 +21,10 @@ export function getSupabaseAdminClient(): SupabaseClient | null {
   if (!client) {
     client = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
       auth: { autoRefreshToken: false, persistSession: false },
+      realtime: {
+        // @ts-ignore - ws has different types but works at runtime
+        transport: ws,
+      },
     });
   }
   return client;
@@ -38,3 +44,23 @@ export async function findAuthUserIdByLegacyId(legacyId: string): Promise<string
   }
   return null;
 }
+
+/**
+ * Verifies email/password against Supabase Auth using a dedicated isolated client instance.
+ * Never mutates the singleton admin client's service-role authentication headers.
+ */
+export async function verifyUserCredentials(email: string, password: string) {
+  if (!isSupabaseAdminConfigured()) {
+    return { user: null, session: null, error: new Error('Supabase admin not configured') };
+  }
+  const verifier = createClient(env.supabaseUrl, env.supabaseAnonKey || env.supabaseServiceRoleKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+    realtime: {
+      // @ts-ignore
+      transport: ws,
+    },
+  });
+  const { data, error } = await verifier.auth.signInWithPassword({ email, password });
+  return { user: data?.user ?? null, session: data?.session ?? null, error };
+}
+

@@ -7,11 +7,13 @@
     "build": "vite build",
     "dev": "vite",
     "dev:server": "tsx watch server/index.ts",
-    "dev:full": "cross-env VITE_USE_LOCAL_DB=true concurrently -n web,api -c blue,green \"vite\" \"cross-env PORT=3001 tsx watch server/index.ts\"",
+    "dev:full": "concurrently -n web,api -c blue,green \"vite\" \"cross-env PORT=3001 tsx watch server/index.ts\"",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "db:seed": "tsx server/seed.ts",
-    "check:api-001": "node scripts/check-api-001.mjs"
+    "check:api-001": "node scripts/check-api-001.mjs",
+    "verify:ai-setup": "node scripts/verify-ai-setup.mjs",
+    "verify:ai-assistant": "node scripts/verify-ai-assistant.mjs"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -47,7 +49,7 @@
     "@radix-ui/react-tooltip": "1.1.8",
     "@react-three/drei": "^9.122.0",
     "@react-three/fiber": "^8.18.0",
-    "@supabase/supabase-js": "^2.101.1",
+    "@supabase/supabase-js": "^2.109.0",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.8.0",
     "class-variance-authority": "0.7.1",
@@ -68,6 +70,7 @@
     "motion": "12.23.24",
     "multer": "^2.2.0",
     "next-themes": "0.4.6",
+    "nodemailer": "^10.0.11",
     "pdfjs-dist": "^4.10.38",
     "react": "18.3.1",
     "react-day-picker": "8.10.1",
@@ -87,6 +90,7 @@
     "three": "^0.182.0",
     "tw-animate-css": "1.3.8",
     "vaul": "1.1.2",
+    "ws": "^8.22.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
@@ -98,12 +102,16 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.2.0",
+    "@types/nodemailer": "^8.0.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "4.7.0",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
     "drizzle-kit": "^0.31.10",
     "tailwindcss": "4.1.12",
     "tsx": "^4.21.0",
+    "typescript": "^5.8.2",
     "vite": "6.3.5"
   },
   "overrides": {

@@ -1,6 +1,8 @@
 import { formatCurrency } from '@/lib/formatters';
+import { convertCurrency } from '@/lib/currencyUtils';
 import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router';
+import { useAuth } from '@/contexts/AuthContext';
 import { useOrgWorkspaceNav } from './organization/OrgWorkspaceNavContext';
 import type { OrgView } from './organization/OrganizationWorkspace';
 import { useOrgServices } from '@/hooks/useOrgServices';
@@ -95,6 +97,9 @@ export function OrganizationDashboard() {
   };
 
   // ── Service wiring (ORG-P02: loading / error / empty-safe) ─────────────
+  const { currentOrganization, userRole, accessRole } = useAuth();
+  const canViewPayroll = userRole === 'owner' || userRole === 'admin' || accessRole === 'org_admin';
+  const orgCurrency = currentOrganization?.currency || 'USD';
   const svc = useOrgServices();
   const {
     data: bankAccounts,
@@ -121,70 +126,182 @@ export function OrganizationDashboard() {
     void refetchTxns();
   };
 
-  const sumAccountsPkr = bankAccounts.reduce((sum, acc) => {
-    const b = safeFinite(acc.balance, 0);
-    if (acc.currency === 'PKR') return sum + b;
-    if (acc.currency === 'USD') return sum + b * 280;
-    return sum + b;
-  }, 0);
-
+  // Calculate total balance in the organization's base currency (real data from bank accounts converted via FX)
   const totalBalance =
-    bankAccounts.length > 0
-      ? safeFinite(sumAccountsPkr, dashboardFallbackAnalytics.netWorth)
-      : dashboardFallbackAnalytics.netWorth;
+    kpis?.totalBankBalanceBase != null
+      ? safeFinite(kpis.totalBankBalanceBase, 0)
+      : bankAccounts
+    .filter(acc => acc.accountType !== 'credit_card' && acc.accountType !== 'line_of_credit')
+    .reduce((sum, acc) => {
+      const balance = safeFinite(acc.balance, 0);
+      return sum + convertCurrency(balance, acc.currency || orgCurrency, orgCurrency);
+    }, 0);
 
-  const cashInHand = safeFinite(kpis?.cashOnHand, dashboardFallbackAnalytics.cashInHand);
-  const monthlyProfit = safeFinite(kpis?.netProfit, dashboardFallbackAnalytics.monthlyProfit);
+  const cashInHand = safeFinite(kpis?.cashOnHand, 0);
+  const monthlyProfit = safeFinite(kpis?.monthlyProfit != null ? kpis.monthlyProfit : kpis?.netProfit, 0);
+  const netProfitAllTime = safeFinite(kpis?.netProfit, 0);
 
-  const netWorthFromSummary =
-    kpis != null
-      ? safeFinite(
-          safeFinite(kpis.cashOnHand, 0) +
-            safeFinite(kpis.accountsReceivable, 0) -
-            Math.abs(safeFinite(kpis.accountsPayable, 0)),
-          dashboardFallbackAnalytics.netWorth,
-        )
-      : safeFinite(dashboardFallbackAnalytics.netWorth, 0);
+  // Debug logging
+  console.log('[Dashboard] KPIs data:', kpis);
 
-  // Net worth is assets minus liabilities (cash + receivables − payables), never just the sum of
-  // bank balances — that's `totalBalance` above. Always use the full calc; `netWorthFromSummary`
-  // already falls back to dashboardFallbackAnalytics.netWorth when kpis isn't loaded yet.
-  const netWorth = netWorthFromSummary;
+  // ════════════════════════════════════════════════════════════════════════════
+  // PROPER NET WORTH CALCULATION
+  // Use backend's netWorth (Total Assets - Total Liabilities)
+  // Fallback to calculation only if backend doesn't provide it
+  // ════════════════════════════════════════════════════════════════════════════
+  const netWorth = kpis?.netWorth != null 
+    ? safeFinite(kpis.netWorth, 0)
+    : kpis?.totalAssets != null && kpis?.totalLiabilities != null
+      ? safeFinite(safeFinite(kpis.totalAssets, 0) - safeFinite(kpis.totalLiabilities, 0), 0)
+      : totalBalance;
 
   const dataError = accountsError || kpisError || txnError;
   const dataLoading = accountsLoading || kpisLoading || txnLoading;
 
   // ── Transaction adapter: NEW (debit/credit) → UI shape (income/expense) ─
   const rawTxns = txnResult?.items ?? [];
-  const recentTransactions = rawTxns.slice(0, 10).map(t => ({
-    id: t.id,
-    date: t.date,
-    title: (t as any).narration ?? (t as any).description ?? '',
-    amount: t.amount,
-    type: t.type === 'credit' ? 'income' as const : 'expense' as const,
-  }));
-  const upcomingPayments = rawTxns
-    .filter(t => t.type === 'debit')
-    .slice(0, 5)
-    .map(t => ({
+  const recentTransactions = rawTxns.slice(0, 10).map(t => {
+    const rawAmt = Number(t.amount || 0);
+    const converted = convertCurrency(rawAmt, t.currency || orgCurrency, orgCurrency);
+    const rawTitle = (t as any).narration ?? (t as any).description ?? '';
+    const isPayroll =
+      /payroll|salary|wage/i.test(rawTitle) ||
+      /payroll|salary|wage/i.test((t as any).category || '') ||
+      /payroll|salary|wage/i.test((t as any).tags?.join(' ') || '');
+    const isMasked = isPayroll && !canViewPayroll;
+    return {
       id: t.id,
       date: t.date,
-      title: (t as any).narration ?? (t as any).description ?? '',
-      amount: t.amount,
-      type: 'expense' as const,
-    }));
+      title: isMasked ? 'Payroll Expense (Confidential)' : rawTitle,
+      amount: isMasked ? 0 : converted,
+      type: t.type === 'credit' ? 'income' as const : 'expense' as const,
+    };
+  });
+
+  const upcomingPayments = useMemo(() => {
+    const rawUpcoming = [
+      ...(kpis?.upcomingPayments || []),
+      ...(kpis?.upcomingExpenses || []),
+    ];
+
+    if (rawUpcoming.length > 0) {
+      return rawUpcoming.map((p, idx) => {
+        const isPayroll =
+          /payroll|salary|wage/i.test(p.title || '') ||
+          /payroll|salary|wage/i.test((p as any).category || '');
+        const isMasked = isPayroll && !canViewPayroll;
+        return {
+          id: `upcoming-${idx}`,
+          date: p.date,
+          title: isMasked ? 'Team Payroll (Confidential)' : p.title,
+          amount: isMasked ? 0 : convertCurrency(Number(p.amount || 0), (p as any).currency || orgCurrency, orgCurrency),
+          type: ((p as any).type === 'credit' ? 'income' : 'expense') as 'income' | 'expense',
+        };
+      });
+    }
+    // Return empty list if no upcoming scheduled payments - do not display historical past txns as upcoming
+    return [];
+  }, [kpis?.upcomingPayments, kpis?.upcomingExpenses, orgCurrency, canViewPayroll]);
+
+  // Live 7-point trailing balance sparkline from balanceHistory or calculated transaction points
+  const get7PointSparkline = (account: any): { points: number[]; trend: 'up' | 'down' } => {
+    if (Array.isArray(account.balanceHistory) && account.balanceHistory.length >= 7) {
+      const points = account.balanceHistory.slice(-7).map(Number);
+      return {
+        points,
+        trend: points[points.length - 1] >= points[0] ? 'up' : 'down',
+      };
+    }
+
+    const currentBal = safeFinite(account.balance, 0);
+    const acctTxns = rawTxns
+      .filter((t: any) =>
+        (t.bankAccountId === account.id || t.accountId === account.id) &&
+        !['draft', 'pending', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
+      )
+      .sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+    if (acctTxns.length > 0) {
+      const points: number[] = [currentBal];
+      let running = currentBal;
+      for (let i = acctTxns.length - 1; i >= 0 && points.length < 7; i--) {
+        const t = acctTxns[i];
+        const delta = (t.type === 'credit' ? 1 : -1) * Number(t.amount || 0);
+        running = running - delta;
+        points.unshift(Math.round(running * 100) / 100);
+      }
+      while (points.length < 7) {
+        points.unshift(points[0]);
+      }
+      return {
+        points,
+        trend: points[points.length - 1] >= points[0] ? 'up' : 'down',
+      };
+    }
+
+    if (Array.isArray(account.balanceHistory) && account.balanceHistory.length >= 2) {
+      const hist = account.balanceHistory.map(Number);
+      const points: number[] = [];
+      for (let i = 0; i < 7; i++) {
+        const idx = (i / 6) * (hist.length - 1);
+        const low = Math.floor(idx);
+        const high = Math.ceil(idx);
+        const weight = idx - low;
+        points.push(Math.round((hist[low] * (1 - weight) + hist[high] * weight) * 100) / 100);
+      }
+      return {
+        points,
+        trend: points[points.length - 1] >= points[0] ? 'up' : 'down',
+      };
+    }
+
+    // Trailing points when no transactions linked yet
+    if (currentBal !== 0) {
+      const base = currentBal * 0.95;
+      const step = (currentBal - base) / 6;
+      const points = [0, 1, 2, 3, 4, 5, 6].map(i => Math.round((base + step * i) * 100) / 100);
+      return { points, trend: 'up' };
+    }
+
+    return { points: [0, 0, 0, 0, 0, 0, 0], trend: 'up' };
+  };
+
+  // Dynamically derive Monthly Goals without static constants
+  const monthlyGoals = useMemo(() => {
+    if (kpis?.monthlyGoals?.revenuePct != null || kpis?.monthlyGoals?.savingsPct != null) {
+      return {
+        revenuePct: Math.min(100, Math.max(0, Math.round(kpis.monthlyGoals.revenuePct ?? 100))),
+        savingsPct: Math.min(100, Math.max(0, Math.round(kpis.monthlyGoals.savingsPct ?? 0))),
+      };
+    }
+    const rev = safeFinite(kpis?.monthlyRevenue, 0);
+    const exp = safeFinite(kpis?.monthlyExpenses, 0);
+    const targetRev = safeFinite((kpis?.monthlyGoals as any)?.revenueTarget ?? (kpis as any)?.revenueTarget, 0);
+    const revPct = targetRev > 0
+      ? Math.min(100, Math.max(0, Math.round((rev / targetRev) * 100)))
+      : (exp > 0 ? Math.min(100, Math.round((rev / exp) * 100)) : (rev > 0 ? 100 : 0));
+    const savingsRate = rev > 0 ? Math.min(100, Math.max(0, Math.round(((rev - exp) / rev) * 100))) : 0;
+    return {
+      revenuePct: revPct,
+      savingsPct: savingsRate,
+    };
+  }, [kpis?.monthlyGoals, kpis?.monthlyRevenue, kpis?.monthlyExpenses]);
   // ─────────────────────────────────────────────────────────────────────────
 
-  const profitDataFull = useMemo(
-    () =>
-      Array.from({ length: 12 }, (_, i) => ({
-        name: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][i],
-        Revenue: 2000000 + Math.sin(i * 0.5) * 500000 + i * 150000,
-        Expenses: 1200000 + Math.cos(i * 0.7) * 300000 + i * 80000,
-        Profit: 800000 + Math.sin(i * 0.3) * 400000 + i * 100000,
-      })),
-    [],
-  );
+  const defaultMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+  // Real 12-Month Profit & Revenue Data from Server/Database
+  const profitDataFull = useMemo(() => {
+    if (kpis?.chartData?.profitData && kpis.chartData.profitData.length > 0) {
+      return kpis.chartData.profitData;
+    }
+    return defaultMonths.map(name => ({
+      name,
+      Revenue: 0,
+      Expenses: 0,
+      Profit: 0,
+    }));
+  }, [kpis?.chartData?.profitData]);
 
   const profitData = useMemo(() => {
     const full = profitDataFull;
@@ -204,33 +321,56 @@ export function OrganizationDashboard() {
     }
   }, [profitDataFull, selectedPeriod]);
 
-  const departmentData = Array.from({ length: 12 }, (_, i) => ({
-    name: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][i],
-    Development: 1500000 + Math.sin(i * 0.5) * 400000 + i * 120000,
-    Design: 800000 + Math.cos(i * 0.7) * 250000 + i * 80000,
-    Marketing: 600000 + Math.sin(i * 0.3) * 200000 + i * 60000,
-    Sales: 1000000 + Math.cos(i * 0.6) * 300000 + i * 90000,
-  }));
+  // Real Department Performance Data from Server/Database
+  const departmentData = useMemo(() => {
+    if (kpis?.chartData?.departmentData && kpis.chartData.departmentData.length > 0) {
+      return kpis.chartData.departmentData;
+    }
+    return defaultMonths.map(name => ({
+      name,
+      Development: 0,
+      Design: 0,
+      Marketing: 0,
+      Sales: 0,
+    }));
+  }, [kpis?.chartData?.departmentData]);
 
-  // Expense category data for donut chart
-  const expenseCategoryData = [
-    { name: 'Salaries', value: 1500000, color: MODERN_COLORS.primary },
-    { name: 'Operations', value: 800000, color: MODERN_COLORS.secondary },
-    { name: 'Marketing', value: 500000, color: MODERN_COLORS.info },
-    { name: 'Technology', value: 400000, color: MODERN_COLORS.success },
-    { name: 'Other', value: 300000, color: MODERN_COLORS.warning },
-  ];
+  const departmentKeys = useMemo(() => {
+    if (!departmentData || departmentData.length === 0) {
+      return [
+        { key: 'Development', color: MODERN_COLORS.primary, name: 'Development' },
+        { key: 'Design', color: MODERN_COLORS.secondary, name: 'Design' },
+        { key: 'Marketing', color: MODERN_COLORS.warning, name: 'Marketing' },
+        { key: 'Sales', color: MODERN_COLORS.success, name: 'Sales' },
+      ];
+    }
+    const sample = departmentData[0] || {};
+    const keys = Object.keys(sample).filter(k => k !== 'name');
+    const colors = [MODERN_COLORS.primary, MODERN_COLORS.secondary, MODERN_COLORS.warning, MODERN_COLORS.success, MODERN_COLORS.info];
+    return keys.map((key, i) => ({
+      key,
+      name: key,
+      color: colors[i % colors.length],
+    }));
+  }, [departmentData]);
 
-  const monthlyComparisonData = useMemo(
-    () =>
-      ['Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'].map((name, i) => ({
-        name,
-        Revenue: 2000000 + ((i * 137167) % 500000),
-        Expenses: 1200000 + ((i * 211093) % 300000),
-        Profit: 800000 + ((i * 97049) % 200000),
-      })),
-    [],
-  );
+  // Real Expense Categories Donut Data from Server/Database
+  const expenseCategoryData = useMemo(() => {
+    if (kpis?.chartData?.expenseCategoryData && kpis.chartData.expenseCategoryData.length > 0) {
+      return kpis.chartData.expenseCategoryData;
+    }
+    return [
+      { name: 'General Operations', value: 0, color: MODERN_COLORS.primary },
+    ];
+  }, [kpis?.chartData?.expenseCategoryData]);
+
+  // Real Monthly Comparison Combo Data from Server/Database
+  const monthlyComparisonData = useMemo(() => {
+    if (kpis?.chartData?.monthlyComparisonData && kpis.chartData.monthlyComparisonData.length > 0) {
+      return kpis.chartData.monthlyComparisonData;
+    }
+    return profitDataFull.slice(-6);
+  }, [kpis?.chartData?.monthlyComparisonData, profitDataFull]);
 
   return (
     <div 
@@ -350,8 +490,8 @@ export function OrganizationDashboard() {
                 icon={TrendingUp}
                 label="Total Balance"
                 value={totalBalance}
-                currency="PKR"
-                percentage="12.5%"
+                currency={orgCurrency}
+                percentage={kpis?.totalBalanceChange != null ? `${kpis.totalBalanceChange >= 0 ? '+' : ''}${kpis.totalBalanceChange.toFixed(1)}%` : '0%'}
                 trend="up"
                 delay={0}
               />
@@ -360,8 +500,8 @@ export function OrganizationDashboard() {
                 icon={Wallet}
                 label="Cash in Hand"
                 value={cashInHand}
-                currency="PKR"
-                percentage="8.2%"
+                currency={orgCurrency}
+                percentage={kpis?.cashOnHandChange != null ? `${kpis.cashOnHandChange >= 0 ? '+' : ''}${kpis.cashOnHandChange.toFixed(1)}%` : '0%'}
                 trend="up"
                 delay={0.1}
               />
@@ -370,20 +510,22 @@ export function OrganizationDashboard() {
                 icon={DollarSign}
                 label="Monthly Profit"
                 value={monthlyProfit}
-                currency="PKR"
-                percentage="15.7%"
-                trend="up"
+                currency={orgCurrency}
+                percentage={kpis?.monthlyProfitChange != null ? `${kpis.monthlyProfitChange >= 0 ? '+' : ''}${kpis.monthlyProfitChange.toFixed(1)}%` : (kpis?.profitChange != null ? `${kpis.profitChange >= 0 ? '+' : ''}${kpis.profitChange.toFixed(1)}%` : '0%')}
+                trend={(kpis?.monthlyProfitChange ?? 0) >= 0 ? 'up' : 'down'}
                 delay={0.2}
+                subtitle={`All-time: ${formatCurrency(netProfitAllTime, orgCurrency, { compact: true })}`}
               />
 
               <ModernKPICard
                 icon={BarChart3}
                 label="Net Worth"
                 value={netWorth}
-                currency="PKR"
-                percentage="9.3%"
+                currency={orgCurrency}
+                percentage={kpis?.netWorthChange != null ? `${kpis.netWorthChange >= 0 ? '+' : ''}${kpis.netWorthChange.toFixed(1)}%` : 'Assets − Liab'}
                 trend="up"
                 delay={0.3}
+                subtitle={kpis?.totalAssets != null && kpis?.totalLiabilities != null ? `Assets ${formatCurrency(kpis.totalAssets, orgCurrency, { compact: true })} − Liab ${formatCurrency(kpis.totalLiabilities, orgCurrency, { compact: true })}` : undefined}
               />
             </div>
 
@@ -519,7 +661,7 @@ export function OrganizationDashboard() {
                       style={{ fontSize: '12px', fontWeight: 600 }}
                       tickLine={false}
                       axisLine={{ stroke: theme === 'dark' ? 'rgba(148, 163, 184, 0.2)' : 'rgba(148, 163, 184, 0.3)' }}
-                      tickFormatter={(value) => `₨${(value / 1000).toFixed(0)}K`}
+                      tickFormatter={(value) => formatCurrency(Number(value), orgCurrency, { compact: true })}
                     />
                     <Tooltip 
                       contentStyle={{ 
@@ -541,7 +683,7 @@ export function OrganizationDashboard() {
                         fontSize: '12px',
                         fontWeight: 600
                       }}
-                      formatter={(value: any) => [`₨${(value / 1000).toFixed(1)}K`, '']}
+                      formatter={(value: any) => [formatCurrency(Number(value), orgCurrency), '']}
                     />
                     
                     <Area
@@ -621,13 +763,8 @@ export function OrganizationDashboard() {
                 delay={0.5}
               >
                 <ModernBarChart
-                  data={departmentData.slice(6)} // Last 6 months
-                  dataKeys={[
-                    { key: 'Development', color: MODERN_COLORS.primary, name: 'Development' },
-                    { key: 'Design', color: MODERN_COLORS.secondary, name: 'Design' },
-                    { key: 'Marketing', color: MODERN_COLORS.warning, name: 'Marketing' },
-                    { key: 'Sales', color: MODERN_COLORS.success, name: 'Sales' },
-                  ]}
+                  data={departmentData.slice(-6)} // Last 6 months
+                  dataKeys={departmentKeys}
                   height={280}
                   stacked={true}
                 />
@@ -754,13 +891,16 @@ export function OrganizationDashboard() {
                     </p>
                   </div>
                 )}
-                {bankAccounts.slice(0, 4).map((account, index) => (
+                {bankAccounts.slice(0, 4).map((account, index) => {
+                  const spark = get7PointSparkline(account);
+                  return (
                   <motion.div
                     key={account.id}
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.8 + index * 0.05 }}
                     whileHover={{ scale: 1.02, y: -4 }}
+                    onClick={() => openOrgView('accounts')}
                     className="group p-4 rounded-xl border transition-all cursor-pointer"
                     style={{
                       background: theme === 'dark' 
@@ -781,13 +921,13 @@ export function OrganizationDashboard() {
                       <div 
                         className="px-2 py-1 rounded-md text-xs font-bold border"
                         style={{
-                          background: account.accountType !== 'credit'
+                          background: account.accountType !== 'credit_card'
                             ? 'rgba(59, 130, 246, 0.15)'
                             : 'rgba(16, 185, 129, 0.15)',
-                          color: account.accountType !== 'credit'
+                          color: account.accountType !== 'credit_card'
                             ? '#60a5fa'
                             : '#34d399',
-                          borderColor: account.accountType !== 'credit'
+                          borderColor: account.accountType !== 'credit_card'
                             ? 'rgba(59, 130, 246, 0.3)'
                             : 'rgba(16, 185, 129, 0.3)',
                         }}
@@ -804,15 +944,21 @@ export function OrganizationDashboard() {
                         >
                           {formatCurrency(account.balance, account.currency, { compact: true })}
                         </p>
+                        {account.currency !== orgCurrency && (
+                          <p className="text-xs font-medium text-slate-400 mt-0.5">
+                            ≈ {formatCurrency(convertCurrency(account.balance, account.currency, orgCurrency), orgCurrency, { compact: true })}
+                          </p>
+                        )}
                       </div>
                       <Sparkline 
-                        data={[45, 52, 38, 45, 55, 60, 58]} 
-                        color={MODERN_COLORS.success}
-                        trend="up"
+                        data={spark.points} 
+                        color={spark.trend === 'up' ? MODERN_COLORS.success : MODERN_COLORS.danger}
+                        trend={spark.trend}
                       />
                     </div>
                   </motion.div>
-                ))}
+                );
+                })}
               </div>
             </motion.div>
           </div>
@@ -944,14 +1090,14 @@ export function OrganizationDashboard() {
               
               <div className="grid grid-cols-2 gap-4">
                 <ProgressRing 
-                  value={75} 
+                  value={monthlyGoals.revenuePct} 
                   max={100} 
                   label="Revenue"
                   color={MODERN_COLORS.success}
                   size={100}
                 />
                 <ProgressRing 
-                  value={60} 
+                  value={monthlyGoals.savingsPct} 
                   max={100} 
                   label="Savings"
                   color={MODERN_COLORS.primary}
@@ -965,6 +1111,7 @@ export function OrganizationDashboard() {
               title="Recent Activity"
               icon={Activity}
               items={recentTransactions}
+              currency={orgCurrency}
               delay={0.6}
               emptyLabel="No recent transactions yet."
             />
@@ -974,6 +1121,7 @@ export function OrganizationDashboard() {
               title="Upcoming Payments"
               icon={Calendar}
               items={upcomingPayments}
+              currency={orgCurrency}
               delay={0.7}
               emptyLabel="No upcoming debits in this list yet."
             />

@@ -18,6 +18,9 @@ import {
   HardDrive
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { useOrgServices } from '@/hooks/useOrgServices';
+import { usePlatformSettings } from '@/hooks/usePlatformSettings';
+import { exportToQuickBooks } from '@/lib/exportUtils';
 
 interface ExportOption {
   id: string;
@@ -30,6 +33,8 @@ interface ExportOption {
 }
 
 export function DataExportCenter() {
+  const svc = useOrgServices();
+  const { featureFlags } = usePlatformSettings();
   const [exportOptions, setExportOptions] = useState<ExportOption[]>([
     {
       id: 'transactions',
@@ -115,19 +120,71 @@ export function DataExportCenter() {
     return `${totalKB.toFixed(0)} KB`;
   };
 
-  const handleExport = () => {
+  const handleExport = async () => {
     const enabledOptions = exportOptions.filter(opt => opt.enabled);
     if (enabledOptions.length === 0) {
       toast.error('Please select at least one data type to export');
       return;
     }
 
-    toast.success('Generating export package...');
-    
-    // Simulate export generation
-    setTimeout(() => {
-      toast.success(`Export complete! Downloaded: finance-os-export-${Date.now()}.zip`);
-    }, 2000);
+    toast.info('Generating export package from live backend...');
+    try {
+      const exportData: Record<string, any> = {
+        exportedAt: new Date().toISOString(),
+        format: exportFormat,
+        includedModules: enabledOptions.map(o => o.id),
+      };
+
+      let txList: any[] = [];
+      if (enabledOptions.some(o => o.id === 'transactions')) {
+        const txRes = await svc.transactions.getAll({ pageSize: 1000 });
+        txList = txRes.success && txRes.data?.items ? txRes.data.items : [];
+        exportData.transactions = txList;
+      }
+      if (enabledOptions.some(o => o.id === 'accounts')) {
+        const accRes = await svc.accounts.getBankAccounts();
+        exportData.accounts = accRes.success && accRes.data ? accRes.data : [];
+      }
+      if (enabledOptions.some(o => o.id === 'settings')) {
+        const catRes = await svc.categories.getAll();
+        exportData.categories = catRes.success && catRes.data ? catRes.data : [];
+      }
+
+      let blob: Blob;
+      let filename = `finance-os-export-${Date.now()}`;
+      if (exportFormat === 'json') {
+        blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+        filename += '.json';
+      } else {
+        const lines = [
+          'Module,RecordId,Title,Amount,Date,Status',
+          ...txList.map(t => `Transaction,${t.id},"${(t.description || t.narration || '').replace(/"/g, '""')}",${t.amount},${t.date},${t.status}`),
+        ];
+        blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+        filename += '.csv';
+      }
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success(`Export downloaded: ${filename}`);
+    } catch (e: any) {
+      toast.error('Export failed: ' + (e?.message || 'Unknown error'));
+    }
+  };
+
+  const handleQuickBooksExport = async () => {
+    try {
+      const txRes = await svc.transactions.getAll({ pageSize: 1000 });
+      const txList = txRes.success && txRes.data?.items ? txRes.data.items : [];
+      exportToQuickBooks(txList, `quickbooks-org-export-${Date.now()}`, 'iif');
+      toast.success('Exported ledger to QuickBooks (.IIF)');
+    } catch (err: any) {
+      toast.error('QuickBooks export failed: ' + (err?.message || 'Unknown error'));
+    }
   };
 
   const handleExitPlatform = () => {
@@ -139,8 +196,21 @@ export function DataExportCenter() {
     <div className="space-y-6">
       {/* Header */}
       <div>
-        <h2 className="text-2xl font-bold text-white mb-2">Data Export Center</h2>
-        <p className="text-slate-400">Export all your data or leave the platform</p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-2xl font-bold text-white mb-2">Data Export Center</h2>
+            <p className="text-slate-400">Export all your data or leave the platform</p>
+          </div>
+          {featureFlags.export_to_quickbooks && (
+            <Button
+              onClick={() => void handleQuickBooksExport()}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white"
+            >
+              <Download className="size-4 mr-2" />
+              Export to QuickBooks (.IIF)
+            </Button>
+          )}
+        </div>
       </div>
 
       {/* Export Package Builder */}

@@ -248,6 +248,11 @@ export const AXIOM = {
       border: '1px solid rgba(6, 182, 212, 0.3)',
       color: 'rgb(34, 211, 238)',
     },
+    neutral: {
+      background: 'rgba(148, 163, 184, 0.1)',
+      border: '1px solid rgba(148, 163, 184, 0.2)',
+      color: 'rgb(148, 163, 184)',
+    },
   },
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -311,6 +316,11 @@ export const AXIOM = {
     item: {
       background: 'rgba(0, 0, 0, 0.3)',
       border: '1px solid rgba(148, 163, 184, 0.1)',
+    },
+    modal: {
+      background: 'linear-gradient(135deg, rgba(20, 24, 39, 0.98) 0%, rgba(10, 12, 22, 0.99) 100%)',
+      border: '1px solid rgba(148, 163, 184, 0.2)',
+      boxShadow: '0 25px 70px -15px rgba(0, 0, 0, 0.9)',
     },
   },
 

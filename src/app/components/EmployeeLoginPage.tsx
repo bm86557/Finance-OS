@@ -1,31 +1,44 @@
 import { useState, useEffect, useMemo } from 'react';
-import { useNavigate, useParams } from 'react-router';
+import { useNavigate, useParams, useSearchParams } from 'react-router';
 import { motion } from 'motion/react';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
-import { Users, Lock, Mail, ArrowLeft, Briefcase, Clock, DollarSign } from 'lucide-react';
+import { Users, Lock, Mail, ArrowLeft, Briefcase, Clock, DollarSign, Eye, EyeOff, CheckCircle2, AlertCircle } from 'lucide-react';
 import { mockUsers, mockOrganizationMembers, mockOrganizations } from '@/data/mockDatabase';
 import { useTheme } from '@/contexts/ThemeContext';
+import { authService } from '@/services/authService';
 import { SupabaseConnectionPanel } from './SupabaseConnectionPanel';
+import type { PortalType } from '@/services/authSessionTypes';
 
 interface EmployeeLoginPageProps {
-  onLogin: (email: string, password: string, orgSlug?: string) => Promise<void>;
+  onLogin: (email: string, password: string, orgSlug?: string, portalType?: PortalType) => Promise<void>;
 }
 
 export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
   const { orgSlug } = useParams<{ orgSlug?: string }>();
+  const [searchParams] = useSearchParams();
   const workspaceLabel = useMemo(() => {
     if (!orgSlug?.trim()) return null;
     const s = orgSlug.trim().toLowerCase();
     const o = mockOrganizations.find(x => (x.slug || '').toLowerCase() === s);
     return o?.name ?? orgSlug;
   }, [orgSlug]);
-  const [email, setEmail] = useState('');
+
+  const urlEmail = searchParams.get('email') || '';
+
+  const [email, setEmail] = useState(urlEmail);
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
   const [error, setError] = useState('');
+  const [infoMessage, setInfoMessage] = useState(
+    searchParams.get('notice') === 'invite_only'
+      ? 'Employee accounts are invite-only. Set your password using the activation link in your invitation email, then sign in below.'
+      : ''
+  );
   const [scanProgress, setScanProgress] = useState(0);
   const navigate = useNavigate();
   const { theme } = useTheme();
@@ -39,22 +52,75 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
     }
   }, [isLoading, scanProgress]);
 
+  const handleForgotPassword = async () => {
+    if (!email.trim()) {
+      setError('Please enter your employee email address first, then click "Forgot password?".');
+      return;
+    }
+    setIsResetting(true);
+    setError('');
+    setInfoMessage('');
+    try {
+      const res = await authService.resetPassword(email.trim());
+      if (res.success) {
+        setInfoMessage('Password reset link sent! Please check your email inbox.');
+      } else {
+        setError(res.error || 'Failed to send password reset email.');
+      }
+    } catch {
+      setError('Failed to send password reset request.');
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setScanProgress(0);
     setError('');
+    setInfoMessage('');
+
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) {
+      setError('Please enter your employee email address.');
+      setIsLoading(false);
+      return;
+    }
 
     try {
-      await onLogin(email, password, orgSlug);
+      // Check if email has received an organization invitation
+      const inviteCheck = await authService.checkInviteStatus(trimmedEmail);
+      if (!inviteCheck.isInvited) {
+        setError('You are not invited by any organization, so you are not allowed to log in. Please contact your organization administrator to receive an invitation.');
+        setIsLoading(false);
+        return;
+      }
+
+      await onLogin(trimmedEmail, password, orgSlug, 'employee');
       navigate('/employee');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Invalid employee credentials.');
+      const rawMsg = err instanceof Error ? err.message : String(err || '');
+      if (rawMsg.toLowerCase().includes('not invited') || rawMsg.toLowerCase().includes('no employee account')) {
+        setError('You are not invited by any organization, so you are not allowed to log in. Please contact your organization administrator to receive an invitation.');
+      } else if (rawMsg.toLowerCase().includes('invalid login credentials') || rawMsg.toLowerCase().includes('invalid email or password')) {
+        const inviteCheck = await authService.checkInviteStatus(trimmedEmail);
+        if (!inviteCheck.isInvited) {
+          setError('You are not invited by any organization, so you are not allowed to log in. Please contact your organization administrator to receive an invitation.');
+        } else {
+          setError('Incorrect password. If you haven\'t set your password yet, please use the activation link in your invitation email.');
+        }
+      } else if (rawMsg) {
+        setError(rawMsg);
+      } else {
+        setError('You are not invited by any organization, so you are not allowed to log in.');
+      }
     } finally {
       setIsLoading(false);
       setScanProgress(0);
     }
   };
+
 
   const handleDemoLogin = async (demoEmail: string) => {
     setEmail(demoEmail);
@@ -62,12 +128,13 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
     setIsLoading(true);
     setScanProgress(0);
     setError('');
+    setInfoMessage('');
 
     try {
-      await onLogin(demoEmail, 'demo', orgSlug);
+      await onLogin(demoEmail, 'demo', orgSlug, 'employee');
       navigate('/employee');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed.');
+      setError(err instanceof Error ? err.message : 'Login failed or no employee account found.');
     } finally {
       setIsLoading(false);
       setScanProgress(0);
@@ -157,14 +224,16 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
           {/* Login Card */}
           <Card className={`${theme === 'dark' ? 'bg-slate-900/50 border-green-500/30' : 'bg-white/80 border-green-400/40'} backdrop-blur-xl relative overflow-hidden shadow-2xl`}>
             <div className={`absolute inset-0 ${theme === 'dark' ? 'bg-gradient-to-r from-green-500/20 via-teal-500/20 to-cyan-500/20' : 'bg-gradient-to-r from-green-400/10 to-teal-400/10'} opacity-50`}></div>
+            <CardHeader className="relative pb-3">
+              <div className="flex items-center justify-between mb-2">
+                <CardTitle className={`text-2xl ${theme === 'dark' ? 'text-white' : 'text-slate-900'} flex items-center gap-2`}>
+                  <Lock className="size-6 text-green-400" />
+                  Employee Sign In
+                </CardTitle>
+              </div>
 
-            <CardHeader className="relative">
-              <CardTitle className={`text-2xl ${theme === 'dark' ? 'text-white' : 'text-slate-900'} flex items-center gap-2`}>
-                <Lock className="size-6 text-green-400" />
-                Employee Authentication
-              </CardTitle>
-              <CardDescription className={`${theme === 'dark' ? 'text-green-400/70' : 'text-green-600/80'} font-mono`}>
-                Enter your credentials to access portal
+              <CardDescription className={`${theme === 'dark' ? 'text-green-400/70' : 'text-green-600/80'} font-mono text-xs`}>
+                Enter your credentials to access your employee workspace
               </CardDescription>
             </CardHeader>
 
@@ -186,23 +255,57 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
                 </div>
 
                 <div className="space-y-2">
-                  <Label className={`${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'} font-mono`}>Password</Label>
+                  <div className="flex items-center justify-between">
+                    <Label className={`${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'} font-mono`}>Password</Label>
+                    <button
+                      type="button"
+                      onClick={handleForgotPassword}
+                      disabled={isResetting || isLoading}
+                      className={`text-xs ${theme === 'dark' ? 'text-green-400 hover:text-green-300' : 'text-green-600 hover:text-green-700'} font-mono transition-colors underline`}
+                    >
+                      {isResetting ? 'Sending link...' : 'Forgot password?'}
+                    </button>
+                  </div>
                   <div className="relative">
                     <Lock className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-green-400" />
                     <Input
-                      type="password"
-                      placeholder="********"
+                      type={showPassword ? 'text' : 'password'}
+                      placeholder="••••••••"
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
-                      className={`${theme === 'dark' ? 'bg-slate-950/50 border-green-500/30 text-white' : 'bg-slate-50 border-green-400/40 text-slate-900'} pl-10 h-12 focus:border-green-500/50 font-mono`}
+                      className={`${theme === 'dark' ? 'bg-slate-950/50 border-green-500/30 text-white' : 'bg-slate-50 border-green-400/40 text-slate-900'} pl-10 pr-10 h-12 focus:border-green-500/50 font-mono`}
                       required
                     />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-green-400/70 hover:text-green-400 transition-colors p-1"
+                      title={showPassword ? 'Hide password' : 'Show password'}
+                    >
+                      {showPassword ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                    </button>
                   </div>
                 </div>
 
+                {/* Info Message */}
+                {infoMessage && (
+                  <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-lg flex items-center gap-2"
+                  >
+                    <CheckCircle2 className="size-4 text-emerald-400 shrink-0" />
+                    <p className="text-emerald-300 text-xs font-mono">{infoMessage}</p>
+                  </motion.div>
+                )}
+
+                {/* Error Message */}
                 {error && (
-                  <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
-                    <p className="text-red-400 text-sm font-mono">{error}</p>
+                  <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg space-y-2">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="size-4 text-red-400 shrink-0" />
+                      <p className="text-red-400 text-sm font-mono">{error}</p>
+                    </div>
                   </motion.div>
                 )}
 
@@ -270,6 +373,13 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
                   <p className={`text-xs text-center ${theme === 'dark' ? 'text-slate-500' : 'text-slate-600'} font-mono`}>
                     Demo account — click a name above to sign in instantly
                   </p>
+                  
+                  {/* Invite Only Notice */}
+                  <div className="text-center pt-2">
+                    <p className={`text-xs ${theme === 'dark' ? 'text-slate-400' : 'text-slate-600'} font-mono`}>
+                      Employee accounts are invite-only. Contact your organization administrator for an invitation.
+                    </p>
+                  </div>
                 </>
               )}
             </CardContent>

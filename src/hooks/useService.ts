@@ -55,13 +55,29 @@ export function useService<T>(
         if (response.success) {
           setState({ data: response.data, loading: false, error: null });
         } else {
-          setState({ data: null, loading: false, error: response.error || 'Unknown error' });
+          // Enhanced error messaging with HTTP status hints
+          const errorMsg = response.error || 'Request failed without error message';
+          const fullError = response.error?.includes('403') || response.error?.includes('Forbidden')
+            ? `${errorMsg} - Check that you have access to this organization`
+            : response.error?.includes('401') || response.error?.includes('Unauthorized')
+            ? `${errorMsg} - Please sign in again`
+            : errorMsg;
+          setState({ data: null, loading: false, error: fullError });
         }
       }
     } catch (err: unknown) {
       logUnexpectedError('useService.fetch', err);
       if (mountedRef.current) {
-        setState({ data: null, loading: false, error: err instanceof Error ? err.message : 'Service error' });
+        const errorMsg = err instanceof Error ? err.message : 'Service error';
+        // Better error messages for common HTTP errors
+        const fullError = errorMsg.includes('403') || errorMsg.includes('Forbidden')
+          ? `Access denied (403) - Verify organization membership`
+          : errorMsg.includes('401') || errorMsg.includes('Unauthorized')
+          ? `Not authenticated (401) - Please sign in again`
+          : errorMsg.includes('Failed to fetch')
+          ? `Network error - Check your connection or server status`
+          : errorMsg || 'An unexpected error occurred';
+        setState({ data: null, loading: false, error: fullError });
       }
     }
   }, deps);

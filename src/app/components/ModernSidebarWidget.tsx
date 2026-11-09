@@ -27,7 +27,7 @@ export function ModernSidebarWidget({
   title,
   icon: Icon,
   items,
-  currency = 'PKR',
+  currency = 'USD',
   delay = 0,
   emptyLabel = 'No entries yet.',
 }: ModernSidebarWidgetProps) {

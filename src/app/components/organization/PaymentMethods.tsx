@@ -9,6 +9,7 @@ import {
   Info,
 } from 'lucide-react';
 import { useTheme } from '../../../contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { toast } from 'sonner';
 import { useOrgServices } from '@/hooks/useOrgServices';
@@ -18,7 +19,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { useOrgWorkspaceNav } from './OrgWorkspaceNavContext';
 
 function isCardAccountType(t: BankAccount['accountType']): boolean {
-  return t === 'credit_card' || t === 'line_of_credit';
+  return t === 'credit_card' || t === 'line_of_credit' || t === 'debit_card' || t === 'prepaid_card';
 }
 
 function maskAccountRef(num: string): string {
@@ -30,23 +31,25 @@ function maskAccountRef(num: string): string {
 
 export function PaymentMethods() {
   const { theme } = useTheme();
+  const { currentOrganization } = useAuth();
+  const baseCurrency = currentOrganization?.currency || 'USD';
   const svc = useOrgServices();
   const goToOrgView = useOrgWorkspaceNav();
 
-  const { data: allAccounts, loading, error } = useServiceArray(
-    () => svc.accounts.getBankAccounts(),
-    [svc.orgId],
-    ['bankAccounts'],
+  const { data: allAccounts, loading, error, refetch } = useServiceArray(
+    () => (svc.isReady ? svc.accounts.getBankAccounts() : Promise.resolve({ success: true as const, data: [] })),
+    [svc.orgId, svc.isReady],
+    ['bankAccounts', 'transactions'],
   );
 
   const { data: chartAccounts } = useServiceArray(
-    () => svc.accounts.getAll(),
-    [svc.orgId],
+    () => (svc.isReady ? svc.accounts.getAll() : Promise.resolve({ success: true as const, data: [] })),
+    [svc.orgId, svc.isReady],
     ['accounts'],
   );
 
   const assetChartOptions = useMemo(
-    () => chartAccounts.filter((a) => a.type === 'asset' && a.isActive),
+    () => chartAccounts.filter((a) => (a.type === 'asset' || a.type === 'liability') && a.isActive),
     [chartAccounts],
   );
 
@@ -67,15 +70,17 @@ export function PaymentMethods() {
 
   const [cardName, setCardName] = useState('');
   const [cardLastFour, setCardLastFour] = useState('');
-  const [cardSubtype, setCardSubtype] = useState<'credit_card' | 'line_of_credit'>('credit_card');
-  const [cardCurrency, setCardCurrency] = useState('PKR');
+  const [cardSubtype, setCardSubtype] = useState<
+    'credit_card' | 'line_of_credit' | 'debit_card' | 'prepaid_card'
+  >('credit_card');
+  const [cardCurrency, setCardCurrency] = useState(baseCurrency);
   const [cardUsage, setCardUsage] = useState<'personal' | 'business'>('business');
   const [cardChartId, setCardChartId] = useState('');
 
   const [bankLabel, setBankLabel] = useState('');
   const [bankNumber, setBankNumber] = useState('');
   const [bankSubtype, setBankSubtype] = useState<'checking' | 'savings'>('checking');
-  const [bankCurrency, setBankCurrency] = useState('PKR');
+  const [bankCurrency, setBankCurrency] = useState(baseCurrency);
   const [bankUsage, setBankUsage] = useState<'personal' | 'business'>('business');
   const [bankChartId, setBankChartId] = useState('');
 
@@ -83,7 +88,7 @@ export function PaymentMethods() {
     setCardName('');
     setCardLastFour('');
     setCardSubtype('credit_card');
-    setCardCurrency('PKR');
+    setCardCurrency(baseCurrency);
     setCardUsage('business');
     setCardChartId(assetChartOptions[0]?.id ?? '');
   };
@@ -92,7 +97,7 @@ export function PaymentMethods() {
     setBankLabel('');
     setBankNumber('');
     setBankSubtype('checking');
-    setBankCurrency('PKR');
+    setBankCurrency(baseCurrency);
     setBankUsage('business');
     setBankChartId(assetChartOptions[0]?.id ?? '');
   };
@@ -120,11 +125,10 @@ export function PaymentMethods() {
       toast.error('Enter at least the last four digits.');
       return;
     }
-    const chartId = cardChartId || assetChartOptions[0]?.id;
-    if (!chartId) {
-      toast.error('Link a chart account first.');
-      return;
-    }
+    const chartId = cardChartId || assetChartOptions[0]?.id || '';
+    
+    console.log('[PaymentMethods] Creating card:', { name, four, cardSubtype, cardCurrency, chartId });
+    
     setSavingCard(true);
     try {
       const res = await svc.accounts.createBankAccount({
@@ -137,13 +141,24 @@ export function PaymentMethods() {
         isActive: true,
         usage: cardUsage,
       });
+      
+      console.log('[PaymentMethods] Create card result:', res);
+      
       if (res.success) {
         toast.success(res.message ?? 'Card added');
         setAddCardOpen(false);
         resetCardForm();
+        // Explicitly refetch to ensure we have latest data
+        console.log('[PaymentMethods] Refetching accounts...');
+        await refetch();
+        console.log('[PaymentMethods] Refetch complete');
       } else {
+        console.error('[PaymentMethods] Failed to create card:', res.error);
         toast.error(res.error ?? 'Could not add card.');
       }
+    } catch (error) {
+      console.error('[PaymentMethods] Exception creating card:', error);
+      toast.error('An error occurred while adding the card');
     } finally {
       setSavingCard(false);
     }
@@ -160,11 +175,7 @@ export function PaymentMethods() {
       toast.error('Enter an account number.');
       return;
     }
-    const chartId = bankChartId || assetChartOptions[0]?.id;
-    if (!chartId) {
-      toast.error('Link a chart account first.');
-      return;
-    }
+    const chartId = bankChartId || assetChartOptions[0]?.id || '';
     setSavingBank(true);
     try {
       const res = await svc.accounts.createBankAccount({
@@ -181,8 +192,10 @@ export function PaymentMethods() {
         toast.success(res.message ?? 'Bank method added');
         setAddBankOpen(false);
         resetBankForm();
+        // Explicitly refetch to ensure we have latest data
+        await refetch();
       } else {
-        toast.error(res.error ?? 'Could not add account.');
+        toast.error(res.error ?? 'Could not add bank method.');
       }
     } finally {
       setSavingBank(false);
@@ -344,7 +357,7 @@ export function PaymentMethods() {
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
-              disabled={!assetChartOptions.length || savingBank}
+              disabled={savingCard}
               className="flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50"
               style={{
                 background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.4), rgba(59, 130, 246, 0.4))',
@@ -357,22 +370,6 @@ export function PaymentMethods() {
               Add card
             </motion.button>
           </div>
-          {!assetChartOptions.length && (
-            <p
-              className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-100/95"
-              role="status"
-            >
-              <span className="font-medium text-amber-50">Create an asset account first.</span>{' '}
-              Payment methods need a chart account to link to.{' '}
-              <button
-                type="button"
-                className="text-cyan-400 underline decoration-cyan-400/50 underline-offset-2 hover:text-cyan-300"
-                onClick={() => goToOrgView?.('accounts')}
-              >
-                Open Accounts &amp; Wallets
-              </button>
-            </p>
-          )}
         </div>
 
         {loading && allAccounts.length === 0 ? (
@@ -455,7 +452,7 @@ export function PaymentMethods() {
             <motion.button
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
-              disabled={!assetChartOptions.length || savingCard}
+              disabled={savingBank}
               className="flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50"
               style={{
                 background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.4), rgba(59, 130, 246, 0.4))',
@@ -468,22 +465,6 @@ export function PaymentMethods() {
               Add bank account
             </motion.button>
           </div>
-          {!assetChartOptions.length && (
-            <p
-              className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-sm text-amber-100/95"
-              role="status"
-            >
-              <span className="font-medium text-amber-50">Create an asset account first.</span>{' '}
-              Payment methods need a chart account to link to.{' '}
-              <button
-                type="button"
-                className="text-cyan-400 underline decoration-cyan-400/50 underline-offset-2 hover:text-cyan-300"
-                onClick={() => goToOrgView?.('accounts')}
-              >
-                Open Accounts &amp; Wallets
-              </button>
-            </p>
-          )}
         </div>
 
         {loading && allAccounts.length === 0 ? (
@@ -593,10 +574,16 @@ export function PaymentMethods() {
               <label className="mb-1 block text-xs font-medium text-slate-400">Type</label>
               <select
                 value={cardSubtype}
-                onChange={(e) => setCardSubtype(e.target.value as 'credit_card' | 'line_of_credit')}
+                onChange={(e) =>
+                  setCardSubtype(
+                    e.target.value as 'credit_card' | 'line_of_credit' | 'debit_card' | 'prepaid_card',
+                  )
+                }
                 className={fieldClass}
               >
                 <option value="credit_card">Credit card</option>
+                <option value="debit_card">Debit card</option>
+                <option value="prepaid_card">Prepaid card</option>
                 <option value="line_of_credit">Line of credit</option>
               </select>
             </div>
@@ -631,12 +618,11 @@ export function PaymentMethods() {
                 value={cardChartId}
                 onChange={(e) => setCardChartId(e.target.value)}
                 className={fieldClass}
-                disabled={!assetChartOptions.length}
               >
-                <option value="">Select…</option>
+                <option value="">Auto-link standard chart account</option>
                 {assetChartOptions.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code} — {c.name}
+                    {c.code} — {c.name} ({c.type})
                   </option>
                 ))}
               </select>
@@ -653,7 +639,7 @@ export function PaymentMethods() {
             </button>
             <button
               type="button"
-              disabled={savingCard || !assetChartOptions.length}
+              disabled={savingCard}
               className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
               onClick={() => void submitCard()}
             >
@@ -732,12 +718,11 @@ export function PaymentMethods() {
                 value={bankChartId}
                 onChange={(e) => setBankChartId(e.target.value)}
                 className={fieldClass}
-                disabled={!assetChartOptions.length}
               >
-                <option value="">Select…</option>
+                <option value="">Auto-link standard chart account</option>
                 {assetChartOptions.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.code} — {c.name}
+                    {c.code} — {c.name} ({c.type})
                   </option>
                 ))}
               </select>
@@ -754,7 +739,7 @@ export function PaymentMethods() {
             </button>
             <button
               type="button"
-              disabled={savingBank || !assetChartOptions.length}
+              disabled={savingBank}
               className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50"
               onClick={() => void submitBank()}
             >

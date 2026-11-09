@@ -15,12 +15,16 @@ let client: SupabaseClient | null = null;
 let clientFingerprint = '';
 
 function envUrl(): string {
-  return import.meta.env.VITE_SUPABASE_URL?.trim() ?? '';
+  const meta = typeof import.meta !== 'undefined' && (import.meta as any)?.env ? (import.meta as any).env : {};
+  const proc = typeof process !== 'undefined' && process?.env ? process.env : {};
+  return (meta.VITE_SUPABASE_URL || proc.VITE_SUPABASE_URL || '')?.trim?.() ?? '';
 }
 
 function envKey(): string {
-  const anon = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() ?? '';
-  const publishable = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY?.trim() ?? '';
+  const meta = typeof import.meta !== 'undefined' && (import.meta as any)?.env ? (import.meta as any).env : {};
+  const proc = typeof process !== 'undefined' && process?.env ? process.env : {};
+  const anon = (meta.VITE_SUPABASE_ANON_KEY || proc.VITE_SUPABASE_ANON_KEY || '')?.trim?.() ?? '';
+  const publishable = (meta.VITE_SUPABASE_PUBLISHABLE_KEY || proc.VITE_SUPABASE_PUBLISHABLE_KEY || '')?.trim?.() ?? '';
   return anon || publishable;
 }
 

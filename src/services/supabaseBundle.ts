@@ -12,6 +12,7 @@ export async function fetchBundleFromSupabase(): Promise<{
   schemaVersion: number;
   payload: Record<string, unknown>;
 } | null> {
+  if (import.meta.env.VITE_USE_SUPABASE_DATA !== 'true') return null;
   const sb = getSupabaseClient();
   if (!sb) return null;
 
@@ -33,6 +34,7 @@ export async function upsertBundleToSupabase(
   bundle: { schemaVersion: number; payload: Record<string, unknown> },
   _opts?: { keepalive?: boolean },
 ): Promise<boolean> {
+  if (import.meta.env.VITE_USE_SUPABASE_DATA !== 'true') return false;
   const sb = getSupabaseClient();
   if (!sb) return false;
 
@@ -51,6 +53,7 @@ export async function upsertBundleToSupabase(
 
 /** Insert mock-shaped bundle when the table has no row (first-time setup after login). */
 export async function seedBundleIfEmpty(): Promise<void> {
+  if (import.meta.env.VITE_USE_SUPABASE_DATA !== 'true') return;
   const existing = await fetchBundleFromSupabase();
   if (existing) return;
   const b = buildPersistedBundleFromMocks();

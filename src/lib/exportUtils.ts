@@ -180,6 +180,76 @@ export function exportData(data: any[], columns: string[], options: Partial<Expo
   return { success: false, message: `${format.toUpperCase()} export not yet implemented` };
 }
 
+/**
+ * QuickBooks Online (.csv) & QuickBooks Desktop (.iif) Double-Entry Export
+ * Controlled system-wide by the `export_to_quickbooks` Platform Feature Flag.
+ */
+export function exportToQuickBooks(
+  transactions: any[],
+  filename = 'quickbooks-ledger-export',
+  mode: 'qbo_csv' | 'iif' = 'qbo_csv'
+) {
+  try {
+    if (mode === 'iif') {
+      const lines: string[] = [
+        '!TRNS\tTRNSID\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM\tMEMO',
+        '!SPL\tSPLID\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM\tMEMO',
+        '!ENDTRNS',
+      ];
+      transactions.forEach((t, idx) => {
+        const isCredit = t.type === 'credit' || t.type === 'income';
+        const trnsType = isCredit ? 'DEPOSIT' : 'CHECK';
+        const rawAmt = Math.abs(Number(t.amount || 0));
+        const bankAmt = isCredit ? rawAmt : -rawAmt;
+        const splitAmt = -bankAmt;
+        const dateStr = String(t.date || new Date().toISOString().slice(0, 10));
+        const bankAcct = String(t.accountName || t.bankAccountId || 'Operating Bank Account').replace(/\t/g, ' ');
+        const catAcct = String(t.category || t.categoryName || (isCredit ? 'Sales Income' : 'Operating Expense')).replace(/\t/g, ' ');
+        const memo = String(t.description || t.narration || '').replace(/[\r\n\t]+/g, ' ').slice(0, 120);
+        const docNum = String(t.id || `TXN-${idx + 1}`);
+
+        lines.push(`TRNS\t${idx + 1}\t${trnsType}\t${dateStr}\t${bankAcct}\t\t${bankAmt.toFixed(2)}\t${docNum}\t${memo}`);
+        lines.push(`SPL\t${idx + 1}\t${trnsType}\t${dateStr}\t${catAcct}\t\t${splitAmt.toFixed(2)}\t${docNum}\t${memo}`);
+        lines.push('ENDTRNS');
+      });
+
+      const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8;' });
+      const link = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      link.setAttribute('href', url);
+      link.setAttribute('download', `${filename}.iif`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      return { success: true, message: 'QuickBooks Desktop (.IIF) exported successfully' };
+    }
+
+    const qboRows = transactions.map((t, idx) => {
+      const isCredit = t.type === 'credit' || t.type === 'income';
+      const signedAmount = isCredit ? Math.abs(Number(t.amount || 0)) : -Math.abs(Number(t.amount || 0));
+      return {
+        Date: String(t.date || new Date().toISOString().slice(0, 10)),
+        Description: String(t.description || t.narration || 'Transaction').replace(/[\r\n]+/g, ' '),
+        Amount: signedAmount.toFixed(2),
+        Account: String(t.accountName || t.bankAccountId || 'Operating Bank Account'),
+        Category: String(t.category || t.categoryName || (isCredit ? 'Income' : 'Expense')),
+        Reference: String(t.id || `QBO-${idx + 1}`),
+        Currency: String(t.currency || 'PKR'),
+      };
+    });
+
+    return exportToCSV(
+      qboRows,
+      ['Date', 'Description', 'Amount', 'Account', 'Category', 'Reference', 'Currency'],
+      filename
+    );
+  } catch (error) {
+    console.error('QuickBooks export error:', error);
+    return { success: false, message: 'Failed to export to QuickBooks' };
+  }
+}
+
 // Future: Excel export with XLSX library
 /*
 import * as XLSX from 'xlsx';

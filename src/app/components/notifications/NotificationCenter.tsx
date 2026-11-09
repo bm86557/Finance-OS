@@ -15,48 +15,103 @@ import {
   Calendar,
   Settings as SettingsIcon,
   Waves,
-  ArrowRight
+  ArrowRight,
+  Receipt,
+  Clock,
+  Briefcase,
+  Megaphone,
+  CheckCircle2,
+  Wallet
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
 
-const CATEGORY_ICONS = {
+const CATEGORY_ICONS: Record<string, any> = {
   cashflow: Waves,
   categorization: Brain,
   insight: TrendingUp,
   reminder: Calendar,
-  system: SettingsIcon
+  system: SettingsIcon,
+  budget: AlertTriangle,
+  general: Bell,
+  approvals: CheckCircle2,
+  expenses: Receipt,
+  timesheets: Clock,
+  projects: Briefcase,
+  announcements: Megaphone,
+  payslips: Wallet,
 };
 
-const TYPE_STYLES = {
+const TYPE_STYLES: Record<string, string> = {
   info: 'bg-blue-500/10 border-blue-500/20 text-blue-400',
   success: 'bg-green-500/10 border-green-500/20 text-green-400',
   warning: 'bg-amber-500/10 border-amber-500/20 text-amber-400',
   error: 'bg-red-500/10 border-red-500/20 text-red-400',
-  insight: 'bg-purple-500/10 border-purple-500/20 text-purple-400'
+  insight: 'bg-purple-500/10 border-purple-500/20 text-purple-400',
 };
 
 export function NotificationCenter() {
   const [isOpen, setIsOpen] = useState(false);
   const {
     notifications,
-    unreadCount,
+    unreadCount: rawUnreadCount,
     markAsRead,
     markAllAsRead,
     removeNotification,
-    clearAll
+    clearAll,
+    refresh
   } = useNotifications();
+
+  // Route-aware runtime portal boundary guard
+  const currentPath = typeof window !== 'undefined' ? window.location.pathname : '';
+  const isEmployeePortal = currentPath.startsWith('/employee');
+
+  const visibleNotifications = notifications.filter(n => {
+    const p = String(n.portal || '').toLowerCase();
+    if (isEmployeePortal) {
+      if (p === 'organization' || p === 'platform') return false;
+      const cat = String(n.category || '').toLowerCase();
+      const ORG_CATS = [
+        'budget',
+        'categorization',
+        'cashflow',
+        'insight',
+        'profit',
+        'recurrence',
+        'recurring',
+        'audit',
+        'costing',
+        'tax',
+        'billing',
+      ];
+      if (ORG_CATS.includes(cat)) return false;
+      const actionUrl = String(n.actionUrl || '').toLowerCase();
+      if (actionUrl.startsWith('/dashboard') || actionUrl.includes('view=costing')) return false;
+    } else {
+      if (p === 'employee') return false;
+    }
+    return true;
+  });
+
+  const unreadCount = visibleNotifications.filter(n => !n.read).length;
 
   return (
     <>
       {/* Notification Bell Button */}
       <button
-        onClick={() => setIsOpen(!isOpen)}
-        className="relative p-2 rounded-lg hover:bg-white/5 transition-colors"
+        onClick={() => {
+          const next = !isOpen;
+          setIsOpen(next);
+          if (next && refresh) {
+            refresh().catch(() => null);
+          }
+        }}
+        className="relative p-2 rounded-lg hover:bg-white/5 transition-colors focus:outline-none"
+        title="Notifications"
       >
-        <Bell className="w-5 h-5 text-slate-400" />
+        <Bell className="w-5 h-5 text-slate-400 hover:text-slate-200 transition-colors" />
         {unreadCount > 0 && (
-          <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-xs font-bold rounded-full flex items-center justify-center">
+          <span className="absolute -top-1 -right-1 min-w-[20px] h-5 px-1 bg-red-500 text-white text-[11px] font-bold rounded-full flex items-center justify-center shadow-lg shadow-red-500/50">
             {unreadCount > 9 ? '9+' : unreadCount}
           </span>
         )}
@@ -78,13 +133,13 @@ export function NotificationCenter() {
               animate={{ opacity: 1, x: 0, y: 0 }}
               exit={{ opacity: 0, x: 20, y: -10 }}
               transition={{ duration: 0.2 }}
-              className="fixed right-4 top-16 w-96 bg-slate-900 border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden"
+              className="fixed right-4 top-16 w-96 max-w-[calc(100vw-2rem)] bg-slate-900 border border-white/10 rounded-xl shadow-2xl z-50 overflow-hidden"
             >
               {/* Header */}
               <div className="px-4 py-3 border-b border-white/10 bg-slate-950">
                 <div className="flex items-center justify-between">
                   <div>
-                    <h3 className="text-white font-medium">Notifications</h3>
+                    <h3 className="text-white font-medium text-sm">Notifications</h3>
                     <p className="text-xs text-slate-400">
                       {unreadCount > 0 
                         ? `${unreadCount} unread notification${unreadCount !== 1 ? 's' : ''}`
@@ -94,14 +149,14 @@ export function NotificationCenter() {
                   </div>
                   <button
                     onClick={() => setIsOpen(false)}
-                    className="text-slate-400 hover:text-white transition-colors"
+                    className="text-slate-400 hover:text-white transition-colors p-1 rounded-lg hover:bg-white/5"
                   >
                     <X className="w-4 h-4" />
                   </button>
                 </div>
 
                 {/* Actions */}
-                {notifications.length > 0 && (
+                {visibleNotifications.length > 0 && (
                   <div className="flex gap-2 mt-3">
                     {unreadCount > 0 && (
                       <Button
@@ -128,16 +183,18 @@ export function NotificationCenter() {
               </div>
 
               {/* Notifications List */}
-              <div className="max-h-[calc(100vh-200px)] overflow-y-auto">
-                {notifications.length === 0 ? (
+              <div className="max-h-[calc(100vh-220px)] overflow-y-auto">
+                {visibleNotifications.length === 0 ? (
                   <div className="px-4 py-12 text-center">
                     <Bell className="w-12 h-12 text-slate-700 mx-auto mb-3" />
-                    <p className="text-slate-400">No notifications</p>
-                    <p className="text-xs text-slate-500 mt-1">We'll notify you when something important happens</p>
+                    <p className="text-slate-400 text-sm">No notifications</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      {isEmployeePortal ? 'Personal employee updates will appear here' : 'Live organization alerts will appear here'}
+                    </p>
                   </div>
                 ) : (
                   <div className="divide-y divide-white/5">
-                    {notifications.map((notification) => (
+                    {visibleNotifications.map((notification) => (
                       <NotificationItem
                         key={notification.id}
                         notification={notification}
@@ -168,8 +225,8 @@ function NotificationItem({
   onRemove: () => void;
   onClose: () => void;
 }) {
-  const Icon = CATEGORY_ICONS[notification.category];
-  const typeStyle = TYPE_STYLES[notification.type];
+  const Icon = CATEGORY_ICONS[notification.category] || CATEGORY_ICONS.general || Bell;
+  const typeStyle = TYPE_STYLES[notification.type] || TYPE_STYLES.info;
   const navigate = useNavigate();
 
   return (
@@ -200,16 +257,18 @@ function NotificationItem({
           </p>
           <div className="flex items-center justify-between">
             <span className="text-xs text-slate-500">
-              {formatDistanceToNow(notification.timestamp, { addSuffix: true })}
+              {formatDistanceToNow(notification.timestamp instanceof Date ? notification.timestamp : new Date(notification.timestamp), { addSuffix: true })}
             </span>
             {notification.actionLabel && (
               <button
                 onClick={() => {
                   onRead();
                   onClose();
-                  if (notification.actionUrl) navigate(notification.actionUrl);
+                  if (notification.actionUrl) {
+                    navigate(notification.actionUrl);
+                  }
                 }}
-                className="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1"
+                className="text-xs text-blue-400 hover:text-blue-300 font-medium flex items-center gap-1 cursor-pointer"
               >
                 {notification.actionLabel}
                 <ArrowRight className="w-3 h-3" />

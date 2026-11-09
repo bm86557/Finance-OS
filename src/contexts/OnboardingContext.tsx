@@ -21,7 +21,9 @@ interface OnboardingContextType {
   skipOnboarding: () => void;
 }
 
-const OnboardingContext = createContext<OnboardingContextType | undefined>(undefined);
+const ONBOARDING_CONTEXT_KEY = Symbol.for('finance_os.onboarding_context');
+export const OnboardingContext = ((globalThis as any)[ONBOARDING_CONTEXT_KEY] ||
+  ((globalThis as any)[ONBOARDING_CONTEXT_KEY] = createContext<OnboardingContextType | undefined>(undefined))) as React.Context<OnboardingContextType | undefined>;
 
 const DEFAULT_STEPS: OnboardingStep[] = [
   {

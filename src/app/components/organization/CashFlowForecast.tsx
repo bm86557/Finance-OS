@@ -1,11 +1,11 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatCurrency } from '@/lib/formatters';
-import { TrendingUp, TrendingDown, Calendar, DollarSign, AlertTriangle, Target, Waves, Loader2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Calendar, DollarSign, AlertTriangle, Target, Waves, Loader2, RefreshCw } from 'lucide-react';
 import { Line, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart, ComposedChart, ReferenceLine } from 'recharts';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgServices } from '@/hooks/useOrgServices';
-import { useService } from '@/hooks/useService';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface ForecastData {
   date: string;
@@ -14,6 +14,7 @@ interface ForecastData {
   netFlow: number;
   balance: number;
   type: 'actual' | 'projected';
+  confidence?: number;
 }
 
 interface Scenario {
@@ -25,133 +26,122 @@ interface Scenario {
 
 export function CashFlowForecast() {
   const svc = useOrgServices();
+  const { currentOrganization } = useAuth();
+  const orgCurrency = currentOrganization?.currency || 'USD';
   const [timeRange, setTimeRange] = useState<'30' | '60' | '90' | '180'>('90');
   const [selectedScenario, setSelectedScenario] = useState<'realistic' | 'best' | 'worst'>('realistic');
   const [viewType, setViewType] = useState<'flow' | 'balance'>('flow');
-
-  const monthsAhead = Math.max(1, Math.round(parseInt(timeRange, 10) / 30));
-
-  const { data: forecastPayload, loading, error } = useService(
-    () => svc.reports.getForecast(monthsAhead),
-    [timeRange, svc.orgId],
-    ['transactions', 'accounts'] as const,
-  );
-
-  const currentBalance = forecastPayload?.currentCash ?? 0;
 
   const scenarios: Record<'realistic' | 'best' | 'worst', Scenario> = {
     realistic: {
       name: 'Realistic',
       multiplier: 1.0,
-      description: 'Based on current trends and confirmed contracts',
-      color: '#3b82f6'
+      description: 'Based on current trends, verified debits & credits, and confirmed recurring items',
+      color: '#3b82f6',
     },
     best: {
       name: 'Best Case',
       multiplier: 1.3,
-      description: 'All opportunities close, no delays',
-      color: '#10b981'
+      description: 'Optimistic scenario (+30% income, -20% operating spend, zero collection delays)',
+      color: '#10b981',
     },
     worst: {
       name: 'Worst Case',
       multiplier: 0.7,
-      description: 'Some clients delay, unexpected expenses',
-      color: '#ef4444'
-    }
+      description: 'Conservative stress test (-30% income, +30% expenses, 14-day collection delay)',
+      color: '#ef4444',
+    },
   };
 
-  /** Model-based daily series when the store has no `cashFlowForecasts` rows yet */
-  const syntheticSeries = useMemo(() => {
-    const data: ForecastData[] = [];
-    const days = parseInt(timeRange, 10);
-    let runningBalance = currentBalance;
-    const scenario = scenarios[selectedScenario];
+  // Live Supabase DB Forecast State
+  const [forecastData, setForecastData] = useState<any>(null);
+  const [forecastLoading, setForecastLoading] = useState(false);
+  const [forecastError, setForecastError] = useState<string | null>(null);
 
-    for (let i = 0; i <= days; i++) {
-      const date = new Date();
-      date.setDate(date.getDate() + i);
+  const fetchForecast = useCallback(async (forceRegenerate: boolean = false) => {
+    if (!svc.orgId) return;
 
-      let baseIncome = 150000;
-      let baseExpense = 100000;
+    setForecastLoading(true);
+    setForecastError(null);
+    try {
+      const { getCashFlowForecast, generateCashFlowForecast } = await import('@/services/supabaseCashFlowService');
+      const horizonDays = parseInt(timeRange, 10);
 
-      if (i % 30 === 0) {
-        baseIncome += 150000;
-        baseExpense += 200000;
-        baseExpense += 45000;
+      const result = forceRegenerate
+        ? await generateCashFlowForecast(svc.orgId, horizonDays, selectedScenario)
+        : await getCashFlowForecast(svc.orgId, horizonDays, selectedScenario);
+
+      if (result.success && result.data) {
+        setForecastData(result.data);
+      } else {
+        setForecastError(result.error || 'Failed to retrieve forecast from Supabase DB');
       }
-
-      if (date.getDay() === 1) {
-        baseExpense += 20000;
-      }
-
-      const jitter = (n: number) => ((n * 7919 + selectedScenario.length * 31) % 1000) / 1000 - 0.5;
-      const incomeVariation = jitter(i) * 50000;
-      const expenseVariation = jitter(i + 17) * 30000;
-
-      const income = (baseIncome + incomeVariation) * scenario.multiplier;
-      const expense = (baseExpense + expenseVariation) / scenario.multiplier;
-      const netFlow = income - expense;
-      runningBalance += netFlow;
-
-      data.push({
-        date: date.toISOString().split('T')[0],
-        income: Math.round(income),
-        expense: Math.round(expense),
-        netFlow: Math.round(netFlow),
-        balance: Math.round(runningBalance),
-        type: 'projected',
-      });
+    } catch (err) {
+      console.error('[CashFlowForecast] Error fetching forecast from Supabase DB:', err);
+      setForecastError(err instanceof Error ? err.message : 'Error fetching forecast');
+    } finally {
+      setForecastLoading(false);
     }
+  }, [svc.orgId, timeRange, selectedScenario]);
 
-    return data;
-  }, [timeRange, selectedScenario, currentBalance]);
+  // Fetch forecast whenever timeRange or scenario changes
+  useEffect(() => {
+    fetchForecast(false);
+  }, [fetchForecast]);
 
   const chartSeries = useMemo((): ForecastData[] => {
-    const rows = forecastPayload?.forecasts;
-    if (rows && rows.length > 0) {
-      let running = currentBalance;
-      return rows.map(f => {
-        running += f.net;
-        return {
-          date: f.date,
-          income: f.income,
-          expense: f.expenses,
-          netFlow: f.net,
-          balance: Math.round(running),
-          type: 'projected' as const,
-        };
-      });
+    if (forecastData?.forecasts && forecastData.forecasts.length > 0) {
+      return forecastData.forecasts.map((f: any) => ({
+        date: f.date,
+        income: Number(f.income || 0),
+        expense: Number(f.expenses ?? f.expense ?? 0),
+        netFlow: Number(f.net ?? f.netFlow ?? 0),
+        balance: Number(f.balance || 0),
+        type: (f.type as any) || 'projected',
+        confidence: f.confidence,
+      }));
     }
-    return syntheticSeries;
-  }, [forecastPayload?.forecasts, syntheticSeries, currentBalance]);
+    return [];
+  }, [forecastData]);
 
-  const finalBalance =
-    chartSeries.length > 0
-      ? chartSeries[chartSeries.length - 1].balance
-      : forecastPayload?.projectedCash ?? currentBalance;
-  const totalIncome = chartSeries.reduce((sum, d) => sum + d.income, 0);
-  const totalExpense = chartSeries.reduce((sum, d) => sum + d.expense, 0);
+  // Derived KPIs straight from Supabase DB forecast
+  const currentBalance = forecastData?.currentCash ?? 0;
+  const finalBalance = forecastData?.projectedCash ?? (chartSeries.length > 0 ? chartSeries[chartSeries.length - 1].balance : currentBalance);
   const netChange = finalBalance - currentBalance;
 
-  const lowestBalance =
-    chartSeries.length > 0 ? Math.min(...chartSeries.map(d => d.balance)) : currentBalance;
-  const highestBalance =
-    chartSeries.length > 0 ? Math.max(...chartSeries.map(d => d.balance)) : currentBalance;
+  const totalIncome = chartSeries.reduce((sum, d) => sum + d.income, 0);
+  const totalExpense = chartSeries.reduce((sum, d) => sum + d.expense, 0);
 
-  const dailyBurnFromSeries =
-    chartSeries.length > 0 ? totalExpense / chartSeries.length : 0;
-  const serviceDailyBurn =
-    forecastPayload && forecastPayload.burnRate > 0 ? forecastPayload.burnRate / 30 : null;
-  const burnRateDisplay = serviceDailyBurn ?? dailyBurnFromSeries;
+  const lowestBalance = chartSeries.length > 0 ? Math.min(...chartSeries.map(d => d.balance)) : currentBalance;
+  const highestBalance = chartSeries.length > 0 ? Math.max(...chartSeries.map(d => d.balance)) : currentBalance;
 
-  const runwayDays =
-    burnRateDisplay > 0 ? currentBalance / burnRateDisplay : Number.POSITIVE_INFINITY;
-  const runwayMonths = forecastPayload?.runway;
+  const burnRateDisplay = forecastData?.burnRate ?? (chartSeries.length > 0 ? Math.round(totalExpense / chartSeries.length * 30) : 0);
+  const dailyBurnDisplay = forecastData?.dailyBurn ?? Math.round(burnRateDisplay / 30);
+  const runwayMonths = forecastData?.runway ?? null;
+  const runwayStatus = forecastData?.runwayStatus ?? (runwayMonths === null && currentBalance > 0 ? 'cash_generative' : 'burning');
 
-  const cashCrunchThreshold = 500000;
+  const cashCrunchThreshold = forecastData?.cashCrunchThreshold ?? Math.max(10000, Math.round(currentBalance * 0.2));
   const cashCrunches = chartSeries.filter(d => d.balance < cashCrunchThreshold);
+  const cashCrunchDays = forecastData?.cashCrunchDays ?? cashCrunches.length;
+
+  const loading = forecastLoading;
+  const error = forecastError;
+  const runwayDays = runwayMonths != null ? runwayMonths * 30 : Number.POSITIVE_INFINITY;
 
   const monthlyData = useMemo(() => {
+    // Use pre-computed monthly breakdown from engine when available
+    if (forecastData?.monthlyBreakdown && Array.isArray(forecastData.monthlyBreakdown) && forecastData.monthlyBreakdown.length > 0) {
+      return forecastData.monthlyBreakdown.map((mb: any) => ({
+        month: mb.month,
+        income: Math.round(Number(mb.income || 0)),
+        expense: Math.round(Number(mb.expense || 0)),
+        netFlow: Math.round(Number(mb.net || 0)),
+        days: mb.daysInMonth || 30,
+        type: mb.type || 'projected',
+      }));
+    }
+
+    // Fallback: aggregate daily projections into months (legacy behavior)
     const months = new Map<string, { income: number, expense: number, count: number }>();
     
     chartSeries.forEach(d => {
@@ -169,9 +159,10 @@ export function CashFlowForecast() {
       income: Math.round(data.income),
       expense: Math.round(data.expense),
       netFlow: Math.round(data.income - data.expense),
-      days: data.count
+      days: data.count,
+      type: 'projected' as const,
     }));
-  }, [chartSeries]);
+  }, [chartSeries, forecastData?.monthlyBreakdown]);
 
   return (
     <div className="min-h-screen p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
@@ -196,10 +187,10 @@ export function CashFlowForecast() {
             </div>
           </div>
           <div className="flex items-center gap-3">
-            {loading && (
+            {(loading || forecastLoading) && (
               <span className="flex items-center gap-2 text-xs text-slate-400">
                 <Loader2 className="size-4 animate-spin" aria-hidden />
-                Updating…
+                {forecastLoading ? 'Generating forecast…' : 'Updating…'}
               </span>
             )}
             <select
@@ -216,6 +207,18 @@ export function CashFlowForecast() {
               <option value="90">90 Days</option>
               <option value="180">180 Days</option>
             </select>
+            <motion.button
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
+              onClick={() => fetchForecast(true)}
+              disabled={forecastLoading}
+              className="px-3 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 text-slate-300 hover:text-white"
+              style={AXIOM.buttons.secondary}
+              title="Force regenerate forecast from live Supabase DB"
+            >
+              <RefreshCw className={`size-3.5 ${forecastLoading ? 'animate-spin text-cyan-400' : ''}`} />
+              Regenerate
+            </motion.button>
           </div>
         </div>
       </motion.div>
@@ -289,7 +292,7 @@ export function CashFlowForecast() {
             <div>
               <p className="text-slate-400 text-sm mb-1">Current Balance</p>
               <p className="text-2xl font-bold text-white">
-                {formatCurrency(currentBalance, 'PKR')}
+                {formatCurrency(currentBalance, orgCurrency)}
               </p>
             </div>
             <div 
@@ -315,10 +318,10 @@ export function CashFlowForecast() {
             <div>
               <p className="text-slate-400 text-sm mb-1">Projected Balance</p>
               <p className={`text-2xl font-bold ${netChange > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                {formatCurrency(finalBalance, 'PKR')}
+                {formatCurrency(finalBalance, orgCurrency)}
               </p>
               <p className="text-xs text-slate-400 mt-1">
-                {netChange > 0 ? '+' : ''}{formatCurrency(netChange, 'PKR')} change
+                {netChange > 0 ? '+' : ''}{formatCurrency(netChange, orgCurrency)} change
               </p>
             </div>
             <div 
@@ -348,9 +351,9 @@ export function CashFlowForecast() {
             <div>
               <p className="text-slate-400 text-sm mb-1">Burn Rate</p>
               <p className="text-2xl font-bold text-cyan-400">
-                {formatCurrency(burnRateDisplay, 'PKR')}
+                {formatCurrency(burnRateDisplay, orgCurrency)}
               </p>
-              <p className="text-xs text-slate-400 mt-1">per day</p>
+              <p className="text-xs text-slate-400 mt-1">per month ({formatCurrency(dailyBurnDisplay, orgCurrency)}/day)</p>
             </div>
             <div 
               className="w-12 h-12 rounded-xl flex items-center justify-center"
@@ -374,15 +377,21 @@ export function CashFlowForecast() {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-slate-400 text-sm mb-1">Runway</p>
-              <p className="text-2xl font-bold text-purple-400">
-                {runwayMonths != null && Number.isFinite(runwayMonths) && runwayMonths !== Number.POSITIVE_INFINITY
-                  ? `~${runwayMonths} mo`
-                  : Number.isFinite(runwayDays)
-                    ? `${Math.round(runwayDays)} days`
-                    : '—'}
+              <p className="text-2xl font-bold">
+                {runwayStatus === 'cash_generative' || (runwayMonths == null && currentBalance > 0) ? (
+                  <span className="text-emerald-400 text-xl font-bold">Cash Generative</span>
+                ) : currentBalance <= 0 ? (
+                  <span className="text-amber-400 text-xl font-bold">0 mo</span>
+                ) : runwayMonths != null && Number.isFinite(runwayMonths) ? (
+                  <span className="text-purple-400 text-2xl font-bold">~{runwayMonths} mo</span>
+                ) : (
+                  <span className="text-slate-400 text-2xl font-bold">—</span>
+                )}
               </p>
               <p className="text-xs text-slate-400 mt-1">
-                {runwayMonths != null && Number.isFinite(runwayMonths) ? 'from monthly burn' : 'at daily burn'}
+                {runwayStatus === 'cash_generative' || (runwayMonths == null && currentBalance > 0)
+                  ? 'Net positive cash flow'
+                  : 'Months until depletion'}
               </p>
             </div>
             <div 
@@ -414,7 +423,7 @@ export function CashFlowForecast() {
             <div className="flex-1">
               <p className="text-sm text-white font-semibold mb-1">Cash Flow Alert</p>
               <p className="text-xs text-slate-400">
-                Your balance may drop below {formatCurrency(cashCrunchThreshold, 'PKR')} on {cashCrunches.length} day(s) 
+                Your balance may drop below {formatCurrency(cashCrunchThreshold, orgCurrency)} on {cashCrunches.length} day(s) 
                 in the next {timeRange} days. Consider:
               </p>
               <ul className="text-xs text-slate-400 mt-2 space-y-1 ml-4">
@@ -454,7 +463,45 @@ export function CashFlowForecast() {
         </motion.button>
       </motion.div>
 
-      {/* Charts */}
+      {/* Empty State */}
+      {chartSeries.length === 0 && !loading && !forecastLoading && (
+        <motion.div
+          {...AXIOM.animations.fadeInTop}
+          className="rounded-2xl p-8 text-center"
+          style={{
+            background: AXIOM.containers.list.background,
+            border: AXIOM.containers.list.border,
+          }}
+        >
+          <div className="flex flex-col items-center gap-4">
+            <div 
+              className="p-4 rounded-xl"
+              style={{
+                background: AXIOM.iconBoxes.cyan,
+                boxShadow: AXIOM.shadows.iconCyan,
+              }}
+            >
+              <Waves className="size-8 text-white" />
+            </div>
+            <div>
+              <h3 className="text-xl font-semibold text-white mb-2">
+                No Forecast Data Available
+              </h3>
+              <p className="text-slate-400 text-sm max-w-md">
+                Cash flow forecasts require transaction history. Add transactions or import 
+                bank statements to generate accurate projections.
+              </p>
+            </div>
+            <div className="mt-4 text-xs text-slate-500">
+              {error && <p className="text-red-400">{error}</p>}
+            </div>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Charts - Only show if we have data */}
+      {chartSeries.length > 0 && (<>
+
       <AnimatePresence mode="wait">
         {viewType === 'flow' ? (
           <motion.div
@@ -490,7 +537,7 @@ export function CashFlowForecast() {
                     borderRadius: '12px',
                     color: '#fff'
                   }}
-                  formatter={(value: any) => formatCurrency(value, 'PKR')}
+                  formatter={(value: any) => formatCurrency(value, orgCurrency)}
                   labelFormatter={(label) => new Date(label).toLocaleDateString()}
                 />
                 <Legend />
@@ -547,7 +594,7 @@ export function CashFlowForecast() {
                     borderRadius: '12px',
                     color: '#fff'
                   }}
-                  formatter={(value: any) => formatCurrency(value, 'PKR')}
+                  formatter={(value: any) => formatCurrency(value, orgCurrency)}
                   labelFormatter={(label) => new Date(label).toLocaleDateString()}
                 />
                 <Area
@@ -558,15 +605,18 @@ export function CashFlowForecast() {
                   fill="url(#balanceGradient)"
                   name="Balance"
                 />
-                {/* Threshold line */}
-                <Line
-                  type="monotone"
-                  dataKey={() => cashCrunchThreshold}
+                <Legend />
+                <ReferenceLine
+                  y={cashCrunchThreshold}
                   stroke="#f59e0b"
                   strokeWidth={2}
                   strokeDasharray="5 5"
-                  name="Alert Threshold"
-                  dot={false}
+                  label={{
+                    value: `Alert Threshold: ${formatCurrency(cashCrunchThreshold, orgCurrency)}`,
+                    fill: '#f59e0b',
+                    fontSize: 12,
+                    position: 'insideTopLeft',
+                  }}
                 />
               </AreaChart>
             </ResponsiveContainer>
@@ -584,7 +634,7 @@ export function CashFlowForecast() {
       >
         <h3 className="text-xl font-bold text-white mb-4">Monthly Breakdown</h3>
         <div className="space-y-3">
-          {monthlyData.map((month, idx) => (
+          {monthlyData.map((month: any, idx: number) => (
             <motion.div
               key={month.month}
               initial={{ opacity: 0, x: -20 }}
@@ -595,29 +645,36 @@ export function CashFlowForecast() {
             >
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <h3 className="text-white font-semibold">
-                    {new Date(month.month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
-                  </h3>
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-white font-semibold">
+                      {new Date(month.month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                    </h3>
+                    {month.type === 'actual' && (
+                      <span className="px-2 py-0.5 rounded text-xs font-medium" style={AXIOM.badges.info}>
+                        Actual
+                      </span>
+                    )}
+                  </div>
                   <p className="text-xs text-slate-400">{month.days} days</p>
                 </div>
                 <span 
                   className="px-3 py-1 rounded-lg text-sm font-medium"
                   style={month.netFlow > 0 ? AXIOM.badges.success : AXIOM.badges.danger}
                 >
-                  {month.netFlow > 0 ? '+' : ''}{formatCurrency(month.netFlow, 'PKR')}
+                  {month.netFlow > 0 ? '+' : ''}{formatCurrency(month.netFlow, orgCurrency)}
                 </span>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <p className="text-xs text-slate-400 mb-1">Income</p>
                   <p className="text-lg font-bold text-emerald-400">
-                    {formatCurrency(month.income, 'PKR')}
+                    {formatCurrency(month.income, orgCurrency)}
                   </p>
                 </div>
                 <div>
                   <p className="text-xs text-slate-400 mb-1">Expense</p>
                   <p className="text-lg font-bold text-red-400">
-                    {formatCurrency(month.expense, 'PKR')}
+                    {formatCurrency(month.expense, orgCurrency)}
                   </p>
                 </div>
               </div>
@@ -625,6 +682,7 @@ export function CashFlowForecast() {
           ))}
         </div>
       </motion.div>
+      </>)}
 
       {/* AI Insights */}
       <motion.div
@@ -648,9 +706,9 @@ export function CashFlowForecast() {
             <p className="text-lg font-bold text-white mb-3">AI Insights</p>
             <div className="space-y-2 text-sm text-slate-300">
               {netChange > 0 ? (
-                <p>✓ Your cash position is projected to improve by {formatCurrency(netChange, 'PKR')} over the next {timeRange} days.</p>
+                <p>✓ Your cash position is projected to improve by {formatCurrency(netChange, orgCurrency)} over the next {timeRange} days.</p>
               ) : (
-                <p>⚠ Your cash position may decrease by {formatCurrency(Math.abs(netChange), 'PKR')} over the next {timeRange} days.</p>
+                <p>⚠ Your cash position may decrease by {formatCurrency(Math.abs(netChange), orgCurrency)} over the next {timeRange} days.</p>
               )}
               
               {((Number.isFinite(runwayDays) && runwayDays < 90) ||
@@ -667,11 +725,11 @@ export function CashFlowForecast() {
               )}
 
               {currentBalance > 0 && lowestBalance < currentBalance * 0.5 && (
-                <p>⚠ Your balance may drop to {formatCurrency(lowestBalance, 'PKR')} (50% of current). Plan for this dip.</p>
+                <p>⚠ Your balance may drop to {formatCurrency(lowestBalance, orgCurrency)} (50% of current). Plan for this dip.</p>
               )}
               
-              <p>→ Average daily income: {formatCurrency(chartSeries.length ? totalIncome / chartSeries.length : 0, 'PKR')}</p>
-              <p>→ Average daily expense: {formatCurrency(chartSeries.length ? totalExpense / chartSeries.length : 0, 'PKR')}</p>
+              <p>→ Average daily income: {formatCurrency(chartSeries.length ? totalIncome / chartSeries.length : 0, orgCurrency)}</p>
+              <p>→ Average daily expense: {formatCurrency(chartSeries.length ? totalExpense / chartSeries.length : 0, orgCurrency)}</p>
             </div>
           </div>
         </div>

@@ -1,8 +1,16 @@
 import { motion } from 'motion/react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOrgServices } from '@/hooks/useOrgServices';
-import { fetchOrgAiSettings } from '@/services/aiSettingsService';
+import { fetchOrgAiSettings, type ExtendedOrgAiSettings } from '@/services/aiSettingsService';
 import type { OrgAiIntegrationSettings } from '@/services/types';
+import {
+  aiAssistantService,
+  type AIAnalysisData,
+  type AIInsight,
+  type FinancialPattern,
+  type AIFinancialSituation,
+  type AIProjections,
+} from '@/services/aiAssistantService';
 import {
   Brain,
   TrendingUp,
@@ -17,26 +25,9 @@ import {
   Send,
   Loader2,
   MessageCircle,
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
-
-interface AIInsight {
-  id: string;
-  type: 'warning' | 'opportunity' | 'success' | 'info';
-  category: string;
-  title: string;
-  description: string;
-  impact: 'high' | 'medium' | 'low';
-  actionable: boolean;
-  recommendation?: string;
-}
-
-interface FinancialPattern {
-  id: string;
-  pattern: string;
-  frequency: string;
-  trend: 'increasing' | 'decreasing' | 'stable';
-  suggestion: string;
-}
 
 type ChatRole = 'user' | 'assistant';
 interface ChatMessage {
@@ -46,55 +37,46 @@ interface ChatMessage {
   suggestions?: string[];
 }
 
-const CHAT_SAMPLE_RESPONSES: {
-  trigger: string[];
-  response: string;
-  suggestions?: string[];
-}[] = [
-  {
-    trigger: ['profit', 'margin'],
-    response:
-      'Your profit margin for this month is 28%, which is about 3% higher than last month in this demo. In production this would use your ledger.',
-    suggestions: ['Show me department profitability', 'Which clients are most profitable?'],
-  },
-  {
-    trigger: ['cash', 'flow', 'balance'],
-    response:
-      'Demo answer: cash and runway here are illustrative. Connect live data to personalize this.',
-    suggestions: ['Show cash flow forecast', 'List upcoming expenses'],
-  },
-  {
-    trigger: ['expense', 'spending'],
-    response:
-      'Top expense categories would appear here from your categorized transactions. This is a mock response until the API is wired.',
-    suggestions: ['Show expense breakdown', 'Compare to last quarter'],
-  },
-];
-
 const CHAT_QUICK_PROMPTS = [
-  'How is my cash position?',
+  'How is my cash position and runway?',
   'What are my biggest expenses?',
   'Explain profit margin trends',
+  'Are my personal drawings too high?',
 ];
 
 /** Hard cap (paste + typing); soft threshold shows a calm warning only */
 const CHAT_INPUT_MAX = 4000;
 const CHAT_SOFT_WARN = 2000;
 
-function matchDemoReply(text: string): { response: string; suggestions?: string[] } {
-  const lower = text.toLowerCase();
-  const hit = CHAT_SAMPLE_RESPONSES.find((r) => r.trigger.some((k) => lower.includes(k)));
-  if (hit) return { response: hit.response, suggestions: hit.suggestions };
-  return {
-    response:
-      'I can help with cash flow, expenses, margins, and forecasts. This reply is a demo — in production it would use your org data. Try the quick prompts or ask something specific.',
-    suggestions: ['Why did profit change?', 'Show cash flow forecast'],
-  };
-}
-
 export function AIFinancialAssistant() {
   const { orgId } = useOrgServices();
-  const [aiSettings, setAiSettings] = useState<OrgAiIntegrationSettings | null>(null);
+  const [aiSettings, setAiSettings] = useState<ExtendedOrgAiSettings | null>(null);
+
+  // Live analysis state (pattern recognition, situation, projections, insights)
+  const [analysis, setAnalysis] = useState<AIAnalysisData | null>(null);
+  const [loadingAnalysis, setLoadingAnalysis] = useState<boolean>(true);
+  const [refreshingAnalysis, setRefreshingAnalysis] = useState<boolean>(false);
+
+  const loadAnalysis = useCallback(async (isRefresh = false) => {
+    if (!orgId) return;
+    if (isRefresh) setRefreshingAnalysis(true);
+    else setLoadingAnalysis(true);
+    try {
+      const res = await aiAssistantService.getAnalysis(orgId);
+      if (res.success && res.data) {
+        setAnalysis(res.data);
+      }
+    } catch (err) {
+      console.error('Failed to load AI analysis:', err);
+    } finally {
+      setLoadingAnalysis(false);
+      setRefreshingAnalysis(false);
+    }
+  }, [orgId]);
+
+  useEffect(() => {
+    void loadAnalysis();
+  }, [loadAnalysis]);
 
   useEffect(() => {
     const sync = () => {
@@ -108,71 +90,30 @@ export function AIFinancialAssistant() {
     return () => window.removeEventListener('finance-os-ai-settings', sync);
   }, [orgId]);
 
-  const aiInsights: AIInsight[] = [
-    {
-      id: '1',
-      type: 'warning',
-      category: 'Personal vs Business',
-      title: 'High Personal Expense Ratio Detected',
-      description: 'You\'re drawing 42% of business revenue as personal expenses. Industry standard for agencies is 15-25%.',
-      impact: 'high',
-      actionable: true,
-      recommendation: 'Consider reducing personal drawings to PKR 180,000/month to maintain healthy cash flow.'
-    }
-  ];
-
-  const financialPatterns: FinancialPattern[] = [
-    {
-      id: '1',
-      pattern: 'Peak Revenue Months',
-      frequency: 'Q4 (Oct-Dec)',
-      trend: 'increasing',
-      suggestion: 'Your revenue increases 35% in Q4. Plan for increased hiring/expenses in Q3 to capture demand.'
-    },
-    {
-      id: '2',
-      pattern: 'Cash Withdrawal Pattern',
-      frequency: 'Every 15th of month',
-      trend: 'stable',
-      suggestion: 'You consistently withdraw PKR 150,000 on the 15th. Set up automated transfer for better planning.'
-    },
-    {
-      id: '3',
-      pattern: 'Client Payment Delays',
-      frequency: 'Average 18 days',
-      trend: 'increasing',
-      suggestion: 'Payment delays increasing by 3 days/quarter. Implement stricter payment terms or advance billing.'
-    },
-    {
-      id: '4',
-      pattern: 'Office Expense Spike',
-      frequency: 'January & July',
-      trend: 'stable',
-      suggestion: 'Office expenses spike in Jan (utilities) and July (maintenance). Budget extra PKR 40,000 for these months.'
-    }
-  ];
-
-  const currentSituation = {
-    cashPosition: 'healthy',
-    burnRate: 'PKR 420,000/month',
-    runway: '8.5 months',
-    profitMargin: '32%',
-    personalDrawings: '42% of revenue (too high)',
-    teamUtilization: '78%'
+  const currentSituation: AIFinancialSituation = analysis?.situation ?? {
+    cashPosition: loadingAnalysis ? 'analyzing...' : 'healthy',
+    burnRate: loadingAnalysis ? 'calculating...' : '$0/month',
+    runway: loadingAnalysis ? 'calculating...' : '0 months',
+    profitMargin: loadingAnalysis ? 'calculating...' : '0%',
+    personalDrawings: loadingAnalysis ? 'calculating...' : '0% (none)',
+    teamUtilization: loadingAnalysis ? 'calculating...' : '85%',
   };
 
-  const futureProjections = {
+  const futureProjections: AIProjections = analysis?.projections ?? {
     nextQuarter: {
-      revenue: 'PKR 1.85M',
-      profit: 'PKR 580K',
-      confidence: 85
+      revenue: loadingAnalysis ? 'calculating...' : '$0',
+      profit: loadingAnalysis ? 'calculating...' : '$0',
+      confidence: 75,
     },
     nextYear: {
-      revenue: 'PKR 7.2M',
-      profit: 'PKR 2.3M',
-      confidence: 72
-    }
+      revenue: loadingAnalysis ? 'calculating...' : '$0',
+      profit: loadingAnalysis ? 'calculating...' : '$0',
+      confidence: 65,
+    },
   };
+
+  const aiInsights: AIInsight[] = analysis?.insights ?? [];
+  const financialPatterns: FinancialPattern[] = analysis?.patterns ?? [];
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -200,68 +141,96 @@ export function AIFinancialAssistant() {
       role: 'user',
       content: raw,
     };
-    // Commit user bubble before sending=true so the log never briefly shows neither empty hero nor bubbles (BUG-ORG-P04-001).
+    // Commit user bubble before sending=true so the log never briefly shows neither empty hero nor bubbles
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setSending(true);
 
     try {
-      await new Promise<void>((resolve, reject) => {
-        window.setTimeout(() => {
-          if (raw.toLowerCase() === 'error demo') {
-            reject(new Error('Assistant is unavailable right now. Try again in a moment.'));
-            return;
-          }
-          resolve();
-        }, 700);
-      });
+      const history = messages.map((m) => ({ role: m.role, content: m.content }));
+      const res = await aiAssistantService.sendMessage(orgId, raw, history);
 
-      const { response, suggestions } = matchDemoReply(raw);
-      const assistantMsg: ChatMessage = {
-        id: `a-${Date.now()}`,
-        role: 'assistant',
-        content: response,
-        suggestions,
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
+      if (res.success && res.data) {
+        const assistantMsg: ChatMessage = {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: res.data.reply,
+          suggestions: res.data.suggestions,
+        };
+        setMessages((prev) => [...prev, assistantMsg]);
+      } else {
+        throw new Error(res.error || 'AI Assistant is currently unavailable.');
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Something went wrong. Try again.';
       setSendError(msg);
     } finally {
       setSending(false);
     }
-  }, [input, sending]);
+  }, [input, sending, messages, orgId]);
 
   return (
     <div className="min-h-screen p-8 space-y-6" style={{ background: '#0a0a0a' }}>
-      {/* Header with Dashboard Gradient */}
+      {/* Header with Dashboard Gradient and Actions */}
       <motion.div
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col md:flex-row md:items-center justify-between gap-4"
       >
-        <div className="flex items-center gap-3 mb-2">
-          <div 
-            className="p-3 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
-            style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
-          >
-            <Brain className="size-6 text-white" />
+        <div>
+          <div className="flex items-center gap-3 mb-2">
+            <div
+              className="p-3 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
+              style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
+            >
+              <Brain className="size-6 text-white" />
+            </div>
+            <h1 className="text-4xl font-bold" style={{
+              background: 'linear-gradient(135deg, #ffffff 0%, #a855f7 100%)',
+              WebkitBackgroundClip: 'text',
+              WebkitTextFillColor: 'transparent',
+            }}>AI Financial Assistant</h1>
           </div>
-          <h1 className="text-4xl font-bold" style={{
-            background: 'linear-gradient(135deg, #ffffff 0%, #a855f7 100%)',
-            WebkitBackgroundClip: 'text',
-            WebkitTextFillColor: 'transparent',
-          }}>AI Financial Assistant</h1>
+          <p className="text-slate-400 text-xs">Pattern recognition, financial intelligence, and strategic recommendations</p>
+          {aiSettings && (aiSettings.providerName.trim() || aiSettings.modelName.trim()) && (
+            <p className="text-slate-500 text-xs mt-2 max-w-2xl leading-relaxed">
+              Provider: {aiSettings.providerName.trim() || 'Gemini'}
+              {aiSettings.modelName.trim() ? ` · Model: ${aiSettings.modelName.trim()}` : ''}
+              {aiSettings.useCustomKey && ' · Custom API Key active'}
+            </p>
+          )}
         </div>
-        <p className="text-slate-400 text-xs">Pattern recognition, insights, and intelligent recommendations</p>
-        {aiSettings && (aiSettings.providerName.trim() || aiSettings.modelName.trim()) && (
-          <p className="text-slate-500 text-xs mt-2 max-w-2xl leading-relaxed">
-            Integration: {aiSettings.providerName.trim() || 'Custom provider'}
-            {aiSettings.modelName.trim() ? ` · Model: ${aiSettings.modelName.trim()}` : ''}
-            {aiSettings.useCustomKey && aiSettings.apiKey
-              ? ' · API key saved on this device (Integrations). Chat still uses demo replies until your backend uses this key.'
-              : ''}
-          </p>
-        )}
+
+        <div className="flex items-center gap-3">
+          {aiSettings?.quotaExceeded ? (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-amber-500/40 bg-amber-950/40 text-amber-200 text-xs font-medium">
+              <AlertTriangle className="size-3.5 text-amber-400" />
+              <span>Org Key Quota Reached</span>
+            </div>
+          ) : aiSettings?.useCustomKey ? (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-emerald-500/40 bg-emerald-950/40 text-emerald-200 text-xs font-medium">
+              <span className="size-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              <span>{aiSettings.providerName || 'Your API Key'} Connected</span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-purple-500/30 bg-purple-950/40 text-purple-200 text-xs font-medium">
+
+              <Sparkles className="size-3.5 text-purple-400" />
+              <span>Finance OS AI Connected</span>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => void loadAnalysis(true)}
+            disabled={refreshingAnalysis || loadingAnalysis}
+            className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium text-white bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700 transition-colors disabled:opacity-50"
+            title="Refresh Pattern Recognition and Insights"
+          >
+            <RefreshCw className={`size-3.5 ${refreshingAnalysis ? 'animate-spin' : ''}`} />
+            <span>{refreshingAnalysis ? 'Analyzing...' : 'Refresh Insights'}</span>
+          </button>
+        </div>
       </motion.div>
 
       {/* ORG-P04: chat panel — send path + empty state + errors in UI */}
@@ -279,7 +248,7 @@ export function AIFinancialAssistant() {
           <div>
             <h2 className="text-lg font-semibold text-white">Ask the assistant</h2>
             <p className="text-xs text-slate-400">
-              Demo replies for now — type a question or use a quick prompt. Live answers will use your org data when connected.
+              Live Gemini AI financial intelligence connected to your ledger. Ask questions or use a quick prompt.
             </p>
           </div>
         </div>
@@ -325,11 +294,10 @@ export function AIFinancialAssistant() {
                 className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
               >
                 <div
-                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                    m.role === 'user'
-                      ? 'bg-purple-600/35 text-white ring-1 ring-purple-400/30'
-                      : 'border border-slate-600/80 bg-slate-900/80 text-slate-100'
-                  }`}
+                  className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${m.role === 'user'
+                    ? 'bg-purple-600/35 text-white ring-1 ring-purple-400/30'
+                    : 'border border-slate-600/80 bg-slate-900/80 text-slate-100'
+                    }`}
                 >
                   {m.content}
                   {m.role === 'assistant' && m.suggestions && m.suggestions.length > 0 && (
@@ -429,16 +397,16 @@ export function AIFinancialAssistant() {
           boxShadow: '0 20px 60px -20px rgba(6, 182, 212, 0.5)',
         }}
       >
-        <div 
+        <div
           className="absolute inset-0 opacity-40"
           style={{
             background: 'radial-gradient(circle at 50% 50%, rgba(6, 182, 212, 0.3), transparent 70%)',
           }}
         />
-        
+
         <div className="relative z-10">
           <div className="flex items-center gap-3 mb-6">
-            <div 
+            <div
               className="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center"
               style={{ boxShadow: '0 10px 30px -10px rgba(6, 182, 212, 0.6)' }}
             >
@@ -451,7 +419,7 @@ export function AIFinancialAssistant() {
           </div>
 
           <div className="grid md:grid-cols-3 gap-4">
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.2 }}
@@ -468,7 +436,7 @@ export function AIFinancialAssistant() {
               <p className="font-bold text-white text-xl capitalize">{currentSituation.cashPosition}</p>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.25 }}
@@ -485,7 +453,7 @@ export function AIFinancialAssistant() {
               <p className="font-bold text-white text-xl">{currentSituation.burnRate}</p>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.3 }}
@@ -502,7 +470,7 @@ export function AIFinancialAssistant() {
               <p className="font-bold text-white text-xl">{currentSituation.runway}</p>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.35 }}
@@ -519,7 +487,7 @@ export function AIFinancialAssistant() {
               <p className="font-bold text-white text-xl">{currentSituation.profitMargin}</p>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.4 }}
@@ -531,12 +499,16 @@ export function AIFinancialAssistant() {
             >
               <div className="flex items-center justify-between mb-2">
                 <span className="text-sm text-slate-400">Personal Drawings</span>
-                <AlertTriangle className="size-4 text-red-400" />
+                {currentSituation.personalDrawings.toLowerCase().includes('high') ? (
+                  <AlertTriangle className="size-4 text-amber-400" />
+                ) : (
+                  <CheckCircle2 className="size-4 text-emerald-400" />
+                )}
               </div>
               <p className="font-bold text-white text-xl">{currentSituation.personalDrawings}</p>
             </motion.div>
 
-            <motion.div 
+            <motion.div
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
               transition={{ delay: 0.45 }}
@@ -569,16 +541,16 @@ export function AIFinancialAssistant() {
             boxShadow: '0 20px 60px -20px rgba(16, 185, 129, 0.5)',
           }}
         >
-          <div 
+          <div
             className="absolute inset-0 opacity-40"
             style={{
               background: 'radial-gradient(circle at 50% 50%, rgba(16, 185, 129, 0.3), transparent 70%)',
             }}
           />
-          
+
           <div className="relative z-10">
             <div className="flex items-center gap-3 mb-6">
-              <div 
+              <div
                 className="w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-500 to-green-500 flex items-center justify-center"
                 style={{ boxShadow: '0 10px 30px -10px rgba(16, 185, 129, 0.6)' }}
               >
@@ -599,7 +571,7 @@ export function AIFinancialAssistant() {
                 <p className="text-3xl font-bold text-white mb-3">{futureProjections.nextQuarter.revenue}</p>
                 <div className="flex items-center gap-2">
                   <div className="flex-1 bg-slate-800 rounded-full h-2">
-                    <motion.div 
+                    <motion.div
                       className="bg-gradient-to-r from-emerald-500 to-green-500 h-2 rounded-full"
                       initial={{ width: 0 }}
                       animate={{ width: `${futureProjections.nextQuarter.confidence}%` }}
@@ -629,16 +601,16 @@ export function AIFinancialAssistant() {
             boxShadow: '0 20px 60px -20px rgba(59, 130, 246, 0.5)',
           }}
         >
-          <div 
+          <div
             className="absolute inset-0 opacity-40"
             style={{
               background: 'radial-gradient(circle at 50% 50%, rgba(59, 130, 246, 0.3), transparent 70%)',
             }}
           />
-          
+
           <div className="relative z-10">
             <div className="flex items-center gap-3 mb-6">
-              <div 
+              <div
                 className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center"
                 style={{ boxShadow: '0 10px 30px -10px rgba(59, 130, 246, 0.6)' }}
               >
@@ -659,7 +631,7 @@ export function AIFinancialAssistant() {
                 <p className="text-3xl font-bold text-white mb-3">{futureProjections.nextYear.revenue}</p>
                 <div className="flex items-center gap-2">
                   <div className="flex-1 bg-slate-800 rounded-full h-2">
-                    <motion.div 
+                    <motion.div
                       className="bg-gradient-to-r from-blue-500 to-cyan-500 h-2 rounded-full"
                       initial={{ width: 0 }}
                       animate={{ width: `${futureProjections.nextYear.confidence}%` }}
@@ -692,7 +664,7 @@ export function AIFinancialAssistant() {
         }}
       >
         <div className="flex items-center gap-3 mb-6">
-          <div 
+          <div
             className="w-12 h-12 rounded-xl bg-gradient-to-br from-yellow-500 to-amber-500 flex items-center justify-center"
             style={{ boxShadow: '0 10px 30px -10px rgba(245, 158, 11, 0.6)' }}
           >
@@ -705,96 +677,104 @@ export function AIFinancialAssistant() {
         </div>
 
         <div className="space-y-3">
-          {aiInsights.map((insight, idx) => (
-            <motion.div
-              key={insight.id}
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: 0.8 + idx * 0.1 }}
-              className={`p-5 rounded-2xl border ${
-                insight.type === 'warning'
+          {aiInsights.length === 0 ? (
+            <div className="py-8 text-center text-sm text-slate-400">
+              {loadingAnalysis ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 className="size-4 animate-spin text-purple-400" />
+                  <span>Analyzing financial ledger and detecting insights...</span>
+                </div>
+              ) : (
+                'No critical anomalies or insights detected yet. As you record transactions, AI will automatically flag opportunities and risks.'
+              )}
+            </div>
+          ) : (
+            aiInsights.map((insight, idx) => (
+              <motion.div
+                key={insight.id}
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.8 + idx * 0.1 }}
+                className={`p-5 rounded-2xl border ${insight.type === 'warning'
                   ? 'bg-red-900/10 border-red-600/30'
                   : insight.type === 'opportunity'
-                  ? 'bg-cyan-900/10 border-cyan-600/30'
-                  : insight.type === 'success'
-                  ? 'bg-green-900/10 border-green-600/30'
-                  : 'bg-blue-900/10 border-blue-600/30'
-              }`}
-            >
-              <div className="flex items-start justify-between mb-2">
-                <div className="flex items-start gap-3 flex-1">
-                  <div className={`p-2 rounded-lg ${
-                    insight.type === 'warning'
+                    ? 'bg-cyan-900/10 border-cyan-600/30'
+                    : insight.type === 'success'
+                      ? 'bg-green-900/10 border-green-600/30'
+                      : 'bg-blue-900/10 border-blue-600/30'
+                  }`}
+              >
+                <div className="flex items-start justify-between mb-2">
+                  <div className="flex items-start gap-3 flex-1">
+                    <div className={`p-2 rounded-lg ${insight.type === 'warning'
                       ? 'bg-red-600/20'
                       : insight.type === 'opportunity'
-                      ? 'bg-cyan-600/20'
-                      : insight.type === 'success'
-                      ? 'bg-green-600/20'
-                      : 'bg-blue-600/20'
-                  }`}>
-                    {insight.type === 'warning' && <AlertTriangle className="size-4 text-red-400" />}
-                    {insight.type === 'opportunity' && <TrendingUp className="size-4 text-cyan-400" />}
-                    {insight.type === 'success' && <CheckCircle2 className="size-4 text-green-400" />}
-                    {insight.type === 'info' && <Brain className="size-4 text-blue-400" />}
-                  </div>
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2 mb-1">
-                      <h3 className="font-semibold text-white">{insight.title}</h3>
-                      <div className="px-2 py-1 rounded text-xs text-slate-300 border border-slate-600">
-                        {insight.category}
-                      </div>
-                      <div className={`px-2 py-1 rounded text-xs font-medium ${
-                        insight.impact === 'high' 
-                          ? 'bg-red-500/20 text-red-300 border border-red-400/30' 
-                          : insight.impact === 'medium' 
-                          ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-400/30' 
-                          : 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
+                        ? 'bg-cyan-600/20'
+                        : insight.type === 'success'
+                          ? 'bg-green-600/20'
+                          : 'bg-blue-600/20'
                       }`}>
-                        {insight.impact} impact
-                      </div>
+                      {insight.type === 'warning' && <AlertTriangle className="size-4 text-red-400" />}
+                      {insight.type === 'opportunity' && <TrendingUp className="size-4 text-cyan-400" />}
+                      {insight.type === 'success' && <CheckCircle2 className="size-4 text-green-400" />}
+                      {insight.type === 'info' && <Brain className="size-4 text-blue-400" />}
                     </div>
-                    <p className="text-sm text-slate-300 mb-2">{insight.description}</p>
-                    {insight.recommendation && (
-                      <div className={`p-3 rounded-lg mt-2 ${
-                        insight.type === 'warning'
+                    <div className="flex-1">
+                      <div className="flex items-center gap-2 mb-1">
+                        <h3 className="font-semibold text-white">{insight.title}</h3>
+                        <div className="px-2 py-1 rounded text-xs text-slate-300 border border-slate-600">
+                          {insight.category}
+                        </div>
+                        <div className={`px-2 py-1 rounded text-xs font-medium ${insight.impact === 'high'
+                          ? 'bg-red-500/20 text-red-300 border border-red-400/30'
+                          : insight.impact === 'medium'
+                            ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-400/30'
+                            : 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
+                          }`}>
+                          {insight.impact} impact
+                        </div>
+                      </div>
+                      <p className="text-sm text-slate-300 mb-2">{insight.description}</p>
+                      {insight.recommendation && (
+                        <div className={`p-3 rounded-lg mt-2 ${insight.type === 'warning'
                           ? 'bg-red-950/50'
                           : insight.type === 'opportunity'
-                          ? 'bg-cyan-950/50'
-                          : 'bg-green-950/50'
-                      }`}>
-                        <div
-                          className={`mb-1 flex items-center gap-1.5 text-xs ${
-                            insight.type === 'warning'
+                            ? 'bg-cyan-950/50'
+                            : 'bg-green-950/50'
+                          }`}>
+                          <div
+                            className={`mb-1 flex items-center gap-1.5 text-xs ${insight.type === 'warning'
                               ? 'text-red-400'
                               : insight.type === 'opportunity'
                                 ? 'text-cyan-400'
                                 : 'text-green-400'
-                          }`}
-                        >
-                          <Lightbulb className="size-3.5 shrink-0" aria-hidden />
-                          AI recommendation
+                              }`}
+                          >
+                            <Lightbulb className="size-3.5 shrink-0" aria-hidden />
+                            AI recommendation
+                          </div>
+                          <p className="text-sm text-white">{insight.recommendation}</p>
                         </div>
-                        <p className="text-sm text-white">{insight.recommendation}</p>
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </div>
+                  {insight.actionable && (
+                    <motion.button
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.95 }}
+                      className="px-4 py-2 rounded-lg text-sm font-medium text-white ml-4"
+                      style={{
+                        background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.3), rgba(236, 72, 153, 0.3))',
+                        border: '1px solid rgba(168, 85, 247, 0.5)',
+                      }}
+                    >
+                      Take Action
+                    </motion.button>
+                  )}
                 </div>
-                {insight.actionable && (
-                  <motion.button
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    className="px-4 py-2 rounded-lg text-sm font-medium text-white ml-4"
-                    style={{
-                      background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.3), rgba(236, 72, 153, 0.3))',
-                      border: '1px solid rgba(168, 85, 247, 0.5)',
-                    }}
-                  >
-                    Take Action
-                  </motion.button>
-                )}
-              </div>
-            </motion.div>
-          ))}
+              </motion.div>
+            ))
+          )}
         </div>
       </motion.div>
 
@@ -811,7 +791,7 @@ export function AIFinancialAssistant() {
         }}
       >
         <div className="flex items-center gap-3 mb-6">
-          <div 
+          <div
             className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
             style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
           >
@@ -824,42 +804,54 @@ export function AIFinancialAssistant() {
         </div>
 
         <div className="space-y-3">
-          {financialPatterns.map((pattern, idx) => (
-            <motion.div 
-              key={pattern.id} 
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: 1.0 + idx * 0.1 }}
-              className="p-5 rounded-2xl"
-              style={{
-                background: 'rgba(0, 0, 0, 0.3)',
-                border: '1px solid rgba(148, 163, 184, 0.1)',
-              }}
-            >
-              <div className="flex items-start justify-between mb-2">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1">
-                    <h3 className="font-semibold text-white">{pattern.pattern}</h3>
-                    <div className={`px-2 py-1 rounded text-xs font-medium flex items-center gap-1 ${
-                      pattern.trend === 'increasing' 
-                        ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
-                        : pattern.trend === 'decreasing' 
-                        ? 'bg-red-500/20 text-red-300 border border-red-400/30' 
-                        : 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
-                    }`}>
-                      {pattern.trend === 'increasing' && <TrendingUp className="size-3" />}
-                      {pattern.trend === 'decreasing' && <TrendingDown className="size-3" />}
-                      {pattern.trend}
+          {financialPatterns.length === 0 ? (
+            <div className="py-8 text-center text-sm text-slate-400">
+              {loadingAnalysis ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 className="size-4 animate-spin text-purple-400" />
+                  <span>Recognizing revenue rhythms and expenditure cycles...</span>
+                </div>
+              ) : (
+                'Patterns will emerge here as transaction history grows across billing cycles.'
+              )}
+            </div>
+          ) : (
+            financialPatterns.map((pattern, idx) => (
+              <motion.div
+                key={pattern.id}
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 1.0 + idx * 0.1 }}
+                className="p-5 rounded-2xl"
+                style={{
+                  background: 'rgba(0, 0, 0, 0.3)',
+                  border: '1px solid rgba(148, 163, 184, 0.1)',
+                }}
+              >
+                <div className="flex items-start justify-between mb-2">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-1">
+                      <h3 className="font-semibold text-white">{pattern.pattern}</h3>
+                      <div className={`px-2 py-1 rounded text-xs font-medium flex items-center gap-1 ${pattern.trend === 'increasing'
+                        ? 'bg-green-500/20 text-green-300 border border-green-400/30'
+                        : pattern.trend === 'decreasing'
+                          ? 'bg-red-500/20 text-red-300 border border-red-400/30'
+                          : 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
+                        }`}>
+                        {pattern.trend === 'increasing' && <TrendingUp className="size-3" />}
+                        {pattern.trend === 'decreasing' && <TrendingDown className="size-3" />}
+                        {pattern.trend}
+                      </div>
+                    </div>
+                    <p className="text-sm text-slate-400 mb-2">Occurs: {pattern.frequency}</p>
+                    <div className="p-3 bg-purple-900/20 rounded-lg border border-purple-600/30">
+                      <p className="text-sm text-purple-300">{pattern.suggestion}</p>
                     </div>
                   </div>
-                  <p className="text-sm text-slate-400 mb-2">Occurs: {pattern.frequency}</p>
-                  <div className="p-3 bg-purple-900/20 rounded-lg border border-purple-600/30">
-                    <p className="text-sm text-purple-300">{pattern.suggestion}</p>
-                  </div>
                 </div>
-              </div>
-            </motion.div>
-          ))}
+              </motion.div>
+            ))
+          )}
         </div>
       </motion.div>
 
@@ -875,16 +867,16 @@ export function AIFinancialAssistant() {
           boxShadow: '0 20px 60px -20px rgba(168, 85, 247, 0.5)',
         }}
       >
-        <div 
+        <div
           className="absolute inset-0 opacity-40"
           style={{
             background: 'radial-gradient(circle at 50% 50%, rgba(139, 92, 246, 0.3), transparent 70%)',
           }}
         />
-        
+
         <div className="relative z-10">
           <div className="flex items-start gap-4">
-            <div 
+            <div
               className="p-3 rounded-xl bg-purple-600/20"
               style={{ border: '1px solid rgba(168, 85, 247, 0.3)' }}
             >

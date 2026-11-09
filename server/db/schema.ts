@@ -1,9 +1,10 @@
-import { integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+/**
+ * @deprecated Decommissioned in Milestone 1. Finance OS operates exclusively on Supabase PostgreSQL.
+ * SQLite schema definitions are removed.
+ */
 
-/** Single-row snapshot: same shape as `localStorage` bundle (`schemaVersion` + `payload` arrays). */
-export const appBundle = sqliteTable('app_bundle', {
-  id: integer('id').primaryKey(),
-  schemaVersion: integer('schema_version').notNull(),
-  payloadJson: text('payload_json').notNull(),
-  updatedAt: text('updated_at').notNull(),
+export const appBundle: any = new Proxy({}, {
+  get(_target, prop) {
+    throw new Error(`SQLite appBundle.${String(prop)} is decommissioned. All persistence is strictly Supabase PostgreSQL.`);
+  },
 });

@@ -34,6 +34,7 @@ import {
   Lightbulb,
   Shield,
   Activity,
+  Plus,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { useNavigate } from 'react-router';

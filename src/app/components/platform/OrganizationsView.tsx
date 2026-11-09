@@ -1,13 +1,14 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
 import { AXIOM } from '../../../styles/axiom-tokens';
-// ── Phase 8: Wired to platformService for org metadata ──────────────────────
+// ── Live tenant data: rows come from the `organizations` table in Supabase ───
+import { platformOrganizationService } from '@/services/platformOrganizationService';
+import type { PlatformOrganization } from '@/services/platformOrganizationService';
+import { orgInvitationService } from '@/services/orgInvitationService';
+import { useService, useServiceArray } from '@/hooks/useService';
 import { platformService } from '@/services/platformService';
-import type { PlatformOrgMeta } from '@/services/platformService';
-import { organizationService } from '@/services/organizationService';
-import { useService } from '@/hooks/useService';
-import type { Organization } from '@/services/types';
-import { Search, Plus, Building2, Users, FileText, Settings, Eye, ChevronRight, Globe, Loader2 } from 'lucide-react';
+import { usePlatformOrganizations } from '@/hooks/usePlatformOrganizations';
+import { Search, Plus, Building2, Users, FileText, Settings, Eye, Globe, Loader2, Mail, Clock, Radio } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -18,50 +19,140 @@ import {
   DialogTitle,
 } from '../ui/dialog';
 
-type EnrichedOrg = Organization & PlatformOrgMeta;
+type EnrichedOrg = PlatformOrganization;
 
 export function OrganizationsView() {
   const [searchTerm, setSearchTerm] = useState('');
+  const [tierFilter, setTierFilter] = useState<'all' | 'free' | 'paid'>('all');
+  const { data: platformPlans = [] } = useServiceArray(
+    () => platformService.getPlans(),
+    [],
+    ['platformPlans']
+  );
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newOrgName, setNewOrgName] = useState('');
   const [newOrgAdminEmail, setNewOrgAdminEmail] = useState('');
-  const [newOrgPlan, setNewOrgPlan] = useState('Basic (Trial)');
+  const [newOrgAdminName, setNewOrgAdminName] = useState('');
+  const [newOrgPlan, setNewOrgPlan] = useState('basic');
   const [creatingOrg, setCreatingOrg] = useState(false);
 
-  // Fetch all orgs from the service layer (platform admin sees all)
-  const { data: orgResult, loading: orgsLoading, refetch: refetchOrgs } = useService(
-    () => organizationService.getAll({ page: 1, pageSize: 100 }),
+  // Real tenants straight from the Supabase `organizations` table, kept live via Realtime.
+  const {
+    organizations: allOrgs,
+    loading,
+    error: orgsError,
+    realtime,
+    refetch: refetchOrgs,
+  } = usePlatformOrganizations();
+
+  // Fetch pending invitations
+  const { data: invitationsResult, loading: invitationsLoading, refetch: refetchInvitations } = useService(
+    () => orgInvitationService.getAllInvitations(),
     []
   );
 
+  const pendingInvitations = invitationsResult?.filter(inv => inv.status === 'pending') || [];
+
+  // Helper to check if an organization came from an accepted invitation
+  const getOrgInvitationStatus = (org: EnrichedOrg) => {
+    // Check if there's an accepted invitation that created this org
+    const acceptedInvite = invitationsResult?.find(
+      inv => inv.createdOrganizationId === org.id && inv.status === 'accepted'
+    );
+    
+    if (acceptedInvite) {
+      return { 
+        type: 'active' as const, 
+        label: '✅ Joined Finance OS', 
+        admin: acceptedInvite.adminEmail,
+        joinedAt: acceptedInvite.acceptedAt,
+        color: 'emerald'
+      };
+    }
+    
+    // Check if there's a pending invitation for an org with this exact name
+    const pendingInvite = pendingInvitations.find(
+      inv => inv.organizationName.toLowerCase() === org.name.toLowerCase()
+    );
+    
+    if (pendingInvite) {
+      return { 
+        type: 'pending' as const, 
+        label: '⏳ Invitation Pending', 
+        admin: pendingInvite.adminEmail,
+        color: 'amber',
+        inviteToken: pendingInvite.token
+      };
+    }
+    
+    // Organization exists but no invitation record - likely created directly or invitation deleted
+    return { 
+      type: 'no_invite' as const, 
+      label: '✅ Active (No Invite Record)', 
+      admin: null,
+      color: 'blue'
+    };
+  };
+
+
   const handleCreateOrg = async () => {
     const name = newOrgName.trim();
+    const email = newOrgAdminEmail.trim();
+    
     if (!name) {
       toast.error('Enter an organization name.');
       return;
     }
-    if (newOrgAdminEmail.trim() && !/^\S+@\S+\.\S+$/.test(newOrgAdminEmail.trim())) {
-      toast.error('Enter a valid admin email, or leave it blank.');
+    
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+      toast.error('Enter a valid admin email address.');
       return;
     }
+
     setCreatingOrg(true);
-    const res = await organizationService.create({
-      name,
-      currency: 'PKR',
-      fiscalYearStart: '01-01',
-      settings: { theme: 'dark', notifications: true },
-    });
-    setCreatingOrg(false);
-    if (!res.success) {
-      toast.error(res.error || 'Could not create organization.');
-      return;
+    
+    try {
+      // Create invitation instead of directly creating organization
+      const res = await orgInvitationService.createInvitation({
+        organizationName: name,
+        adminEmail: email,
+        adminName: newOrgAdminName.trim() || undefined,
+        plan: newOrgPlan || 'basic',
+      });
+
+      console.log('[handleCreateOrg] Invitation service response:', res);
+
+      if (!res.success) {
+        console.error('[handleCreateOrg] Invitation creation failed:', res.error);
+        toast.error(res.error || 'Could not send invitation.');
+        setCreatingOrg(false);
+        return;
+      }
+
+      const inviteLink = `${window.location.origin}/accept-org-invite/${res.data.token}`;
+      
+      toast.success(`Invitation created for ${email}`, {
+        description: `Copy the invitation link and send it to the admin.`,
+        duration: 6000,
+      });
+      
+      // Show invitation link in console
+      console.log('📧 Invitation Link:', inviteLink);
+      
+      setShowCreateForm(false);
+      setNewOrgName('');
+      setNewOrgAdminEmail('');
+      setNewOrgAdminName('');
+      setNewOrgPlan('basic');
+      
+      await refetchOrgs();
+      await refetchInvitations();
+    } catch (error) {
+      console.error('[handleCreateOrg] Unexpected error:', error);
+      toast.error(`Failed to create invitation: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setCreatingOrg(false);
     }
-    toast.success(`"${name}" created on the ${newOrgPlan} plan.`);
-    setShowCreateForm(false);
-    setNewOrgName('');
-    setNewOrgAdminEmail('');
-    setNewOrgPlan('Basic (Trial)');
-    await refetchOrgs();
   };
 
   const [viewingOrg, setViewingOrg] = useState<EnrichedOrg | null>(null);
@@ -69,6 +160,7 @@ export function OrganizationsView() {
   const [manageName, setManageName] = useState('');
   const [manageCurrency, setManageCurrency] = useState('');
   const [manageFiscalYearStart, setManageFiscalYearStart] = useState('');
+  const [managePlan, setManagePlan] = useState('basic');
   const [savingManage, setSavingManage] = useState(false);
 
   const openManage = (org: EnrichedOrg) => {
@@ -76,6 +168,7 @@ export function OrganizationsView() {
     setManageName(org.name);
     setManageCurrency(org.currency);
     setManageFiscalYearStart(org.fiscalYearStart);
+    setManagePlan(org.plan?.toLowerCase() || 'basic');
   };
 
   const handleSaveManage = async () => {
@@ -86,10 +179,11 @@ export function OrganizationsView() {
       return;
     }
     setSavingManage(true);
-    const res = await organizationService.update(managingOrg.id, {
+    const res = await platformOrganizationService.update(managingOrg.id, {
       name,
       currency: manageCurrency.trim().toUpperCase(),
       fiscalYearStart: manageFiscalYearStart,
+      plan: managePlan,
     });
     setSavingManage(false);
     if (!res.success) {
@@ -101,23 +195,14 @@ export function OrganizationsView() {
     await refetchOrgs();
   };
 
-  // Fetch platform-level metadata overlay from platformService
-  const { data: orgMetaMap, loading: metaLoading } = useService(
-    () => platformService.getAllOrgMeta(),
-    []
-  );
-
-  const loading = orgsLoading || metaLoading;
-  const defaultMeta = platformService.getDefaultOrgMeta();
-
-  const allOrgs: EnrichedOrg[] = (orgResult?.items ?? []).map(org => ({
-    ...org,
-    ...((orgMetaMap && orgMetaMap[org.id]) || defaultMeta),
-  }));
-
-  const filteredOrgs = allOrgs.filter(org =>
-    org.name.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const filteredOrgs = allOrgs.filter(org => {
+    const matches = org.name.toLowerCase().includes(searchTerm.toLowerCase());
+    if (!matches) return false;
+    const isFree = org.plan?.toLowerCase() === 'basic' || (org.billing?.amount || 0) === 0;
+    if (tierFilter === 'free') return isFree;
+    if (tierFilter === 'paid') return !isFree;
+    return true;
+  });
 
   const statusConfig: Record<string, { color: string; bg: string; border: string }> = {
     active: { color: '#34d399', bg: 'rgba(16, 185, 129, 0.1)', border: 'rgba(16, 185, 129, 0.3)' },
@@ -133,6 +218,15 @@ export function OrganizationsView() {
         <div>
           <h1 className="text-4xl font-bold mb-2" style={AXIOM.text.titleStyle as any}>Organizations</h1>
           <p className="text-slate-400 font-mono">Manage all client organizations across the platform</p>
+          <p className="text-xs font-mono mt-2 flex items-center gap-2" style={{ color: realtime === 'live' ? '#34d399' : '#94a3b8' }}>
+            <Radio className="size-3.5" />
+            {realtime === 'live'
+              ? 'Live — synced with Supabase'
+              : realtime === 'connecting'
+                ? 'Connecting to Supabase realtime...'
+                : 'Auto-refresh every 30s (realtime offline)'}
+            <span className="text-slate-500">· {allOrgs.length} in database</span>
+          </p>
         </div>
         <button
           onClick={() => setShowCreateForm(!showCreateForm)}
@@ -143,6 +237,13 @@ export function OrganizationsView() {
           Create Organization
         </button>
       </motion.div>
+
+      {/* Error */}
+      {orgsError && (
+        <div className="rounded-xl p-4 text-sm font-mono" style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#fca5a5' }}>
+          {orgsError}
+        </div>
+      )}
 
       {/* Summary Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
@@ -179,7 +280,7 @@ export function OrganizationsView() {
         ))}
       </div>
 
-      {/* Create Form */}
+      {/* Create Form - Now sends invitation instead of creating directly */}
       {showCreateForm && (
         <motion.div
           initial={{ opacity: 0, height: 0 }}
@@ -191,13 +292,16 @@ export function OrganizationsView() {
             boxShadow: '0 20px 60px -20px rgba(168, 85, 247, 0.3)',
           }}
         >
-          <h3 className="text-white font-bold mb-4 flex items-center gap-2">
-            <Plus className="size-5 text-purple-400" />
-            New Organization
+          <h3 className="text-white font-bold mb-2 flex items-center gap-2">
+            <Mail className="size-5 text-purple-400" />
+            Invite Organization Admin
           </h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <p className="text-xs text-slate-400 font-mono mb-4">
+            Send an invitation email to create a new organization. The admin will set their password and activate the organization.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-1">
-              <label className="text-xs text-slate-400 font-mono">Organization Name</label>
+              <label className="text-xs text-slate-400 font-mono">Organization Name *</label>
               <input
                 type="text"
                 value={newOrgName}
@@ -205,10 +309,11 @@ export function OrganizationsView() {
                 placeholder="Acme Corporation"
                 className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                required
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-slate-400 font-mono">Admin Email</label>
+              <label className="text-xs text-slate-400 font-mono">Admin Email *</label>
               <input
                 type="email"
                 value={newOrgAdminEmail}
@@ -216,20 +321,33 @@ export function OrganizationsView() {
                 placeholder="admin@acme.com"
                 className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                required
               />
             </div>
             <div className="space-y-1">
-              <label className="text-xs text-slate-400 font-mono">Plan</label>
+              <label className="text-xs text-slate-400 font-mono">Admin Name (Optional)</label>
+              <input
+                type="text"
+                value={newOrgAdminName}
+                onChange={(e) => setNewOrgAdminName(e.target.value)}
+                placeholder="John Doe"
+                className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-slate-400 font-mono">Subscription Plan</label>
               <select
                 value={newOrgPlan}
                 onChange={(e) => setNewOrgPlan(e.target.value)}
                 className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
               >
-                <option>Basic (Trial)</option>
-                <option>Professional</option>
-                <option>Enterprise</option>
+                <option value="basic">Basic (Trial)</option>
+                <option value="professional">Professional</option>
+                <option value="enterprise">Enterprise</option>
               </select>
+              <p className="text-xs text-slate-500 font-mono mt-1">Select initial subscription plan for organization</p>
             </div>
           </div>
           <div className="flex items-center gap-3 mt-4">
@@ -239,8 +357,8 @@ export function OrganizationsView() {
               className="flex items-center gap-2 px-6 py-2 rounded-lg text-white text-sm font-medium disabled:opacity-50"
               style={AXIOM.buttons.success}
             >
-              {creatingOrg ? <Loader2 className="size-4 animate-spin" /> : null}
-              Create Organization
+              {creatingOrg ? <Loader2 className="size-4 animate-spin" /> : <Mail className="size-4" />}
+              {creatingOrg ? 'Sending Invitation...' : 'Send Invitation'}
             </button>
             <button onClick={() => setShowCreateForm(false)} className="px-4 py-2 rounded-lg text-slate-400 text-sm" style={AXIOM.buttons.outline}>
               Cancel
@@ -249,18 +367,136 @@ export function OrganizationsView() {
         </motion.div>
       )}
 
-      {/* Search */}
-      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }}>
-        <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
-          <input
-            type="text"
-            placeholder="Search organizations..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="w-full pl-10 pr-4 py-3 rounded-lg text-white font-mono text-sm"
-            style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
-          />
+      {/* Pending Invitations Section */}
+      {pendingInvitations.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl p-6"
+          style={{
+            background: AXIOM.backgrounds.chartContainer,
+            border: '1px solid rgba(251, 191, 36, 0.3)',
+            boxShadow: '0 20px 60px -20px rgba(251, 191, 36, 0.2)',
+          }}
+        >
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-white font-bold flex items-center gap-2">
+              <Clock className="size-5 text-amber-400" />
+              Pending Invitations ({pendingInvitations.length})
+            </h3>
+          </div>
+          <div className="space-y-3">
+            {pendingInvitations.map((inv) => (
+              <div
+                key={inv.id}
+                className="flex items-center justify-between p-4 rounded-lg"
+                style={{
+                  background: 'rgba(0,0,0,0.2)',
+                  border: '1px solid rgba(251, 191, 36, 0.2)',
+                }}
+              >
+                <div className="flex-1">
+                  <p className="text-white font-medium">{inv.organizationName}</p>
+                  <p className="text-xs text-slate-400 font-mono mt-1">
+                    Invited: {inv.adminEmail}
+                  </p>
+                  <p className="text-xs text-amber-400 font-mono mt-1">
+                    Expires: {new Date(inv.expiresAt).toLocaleDateString()}
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <code className="text-xs text-emerald-400 bg-black/30 px-2 py-1 rounded font-mono">
+                      {window.location.origin}/accept-org-invite/{inv.token.substring(0, 12)}...
+                    </code>
+                    <button
+                      onClick={() => {
+                        const link = `${window.location.origin}/accept-org-invite/${inv.token}`;
+                        navigator.clipboard.writeText(link);
+                        toast.success('Invitation link copied!', {
+                          description: 'Share this link with the organization admin',
+                        });
+                      }}
+                      className="text-xs text-emerald-400 hover:text-emerald-300 font-mono flex items-center gap-1"
+                    >
+                      <Mail className="size-3" />
+                      Copy Link
+                    </button>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="px-3 py-1 rounded-full text-xs font-medium bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                    Pending
+                  </span>
+                  <button
+                    onClick={async () => {
+                      const result = await orgInvitationService.resendInvitation(inv.id);
+                      if (result.success) {
+                        toast.success('Invitation email resent!', {
+                          description: 'Check the admin\'s email inbox',
+                        });
+                      } else {
+                        toast.error(result.error || 'Failed to resend email');
+                      }
+                    }}
+                    className="text-xs px-3 py-1 rounded bg-blue-500/20 text-blue-300 hover:bg-blue-500/30 border border-blue-500/30 font-mono"
+                  >
+                    Resend
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (confirm('Cancel this invitation?')) {
+                        await orgInvitationService.cancelInvitation(inv.id);
+                        toast.success('Invitation cancelled');
+                        await refetchInvitations();
+                      }
+                    }}
+                    className="text-xs text-red-400 hover:text-red-300 font-mono"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      )}
+
+      {/* Search & Dynamic Tier Filter */}
+      <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.2 }} className="space-y-3">
+        <div className="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between">
+          <div className="relative flex-1">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search organizations..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              className="w-full pl-10 pr-4 py-3 rounded-lg text-white font-mono text-sm"
+              style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+            />
+          </div>
+          <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-900/80 border border-slate-800 shrink-0 font-mono text-xs">
+            <button
+              type="button"
+              onClick={() => setTierFilter('all')}
+              className={'px-3 py-1.5 rounded-lg transition-all ' + (tierFilter === 'all' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold' : 'text-slate-400 hover:text-slate-200')}
+            >
+              All Tiers ({allOrgs.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setTierFilter('free')}
+              className={'px-3 py-1.5 rounded-lg transition-all ' + (tierFilter === 'free' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 font-bold' : 'text-slate-400 hover:text-slate-200')}
+            >
+              Free Tier ({allOrgs.filter(o => o.plan?.toLowerCase() === 'basic' || (o.billing?.amount || 0) === 0).length})
+            </button>
+            <button
+              type="button"
+              onClick={() => setTierFilter('paid')}
+              className={'px-3 py-1.5 rounded-lg transition-all ' + (tierFilter === 'paid' ? 'bg-purple-500/20 text-purple-300 border border-purple-500/40 font-bold' : 'text-slate-400 hover:text-slate-200')}
+            >
+              Paid Tiers ({allOrgs.filter(o => o.plan?.toLowerCase() !== 'basic' && (o.billing?.amount || 0) > 0).length})
+            </button>
+          </div>
         </div>
       </motion.div>
 
@@ -272,11 +508,31 @@ export function OrganizationsView() {
         </div>
       )}
 
+      {/* Empty State */}
+      {!loading && filteredOrgs.length === 0 && (
+        <div
+          className="rounded-2xl p-10 text-center"
+          style={{ background: AXIOM.backgrounds.chartContainer, border: '1px solid rgba(148, 163, 184, 0.2)' }}
+        >
+          <Building2 className="size-8 mx-auto mb-3 text-slate-500" />
+          <p className="text-white font-medium">
+            {searchTerm ? 'No organization matches your search' : 'No organizations yet'}
+          </p>
+          <p className="text-xs text-slate-400 font-mono mt-1">
+            {searchTerm
+              ? 'Try a different name.'
+              : 'The organizations table in Supabase is empty — create the first tenant to get started.'}
+          </p>
+        </div>
+      )}
+
       {/* Organizations Grid */}
       {!loading && (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {filteredOrgs.map((org, i) => {
           const sc = statusConfig[org.status] || statusConfig.active;
+          const inviteStatus = getOrgInvitationStatus(org);
+          
           return (
             <motion.div
               key={org.id}
@@ -291,7 +547,7 @@ export function OrganizationsView() {
               }}
             >
               {/* Header */}
-              <div className="flex items-start justify-between mb-5">
+              <div className="flex items-start justify-between mb-3">
                 <div className="flex items-center gap-3">
                   <div className="size-12 rounded-xl flex items-center justify-center" style={{
                     background: AXIOM.iconBoxes.purple,
@@ -299,7 +555,7 @@ export function OrganizationsView() {
                   }}>
                     <Building2 className="size-6 text-white" />
                   </div>
-                  <div>
+                  <div className="flex-1">
                     <h3 className="text-white font-bold group-hover:text-purple-400 transition-colors">{org.name}</h3>
                     <p className="text-xs text-slate-400 font-mono mt-0.5">Created {new Date(org.createdAt).toLocaleDateString()}</p>
                   </div>
@@ -313,17 +569,84 @@ export function OrganizationsView() {
                 </span>
               </div>
 
+              {/* Invitation Status Row */}
+              <div className="mb-4 p-3 rounded-lg" style={{
+                background: inviteStatus.color === 'emerald' 
+                  ? 'rgba(16, 185, 129, 0.1)' 
+                  : inviteStatus.color === 'amber'
+                  ? 'rgba(251, 191, 36, 0.1)'
+                  : 'rgba(59, 130, 246, 0.1)',
+                border: inviteStatus.color === 'emerald'
+                  ? '1px solid rgba(16, 185, 129, 0.3)'
+                  : inviteStatus.color === 'amber'
+                  ? '1px solid rgba(251, 191, 36, 0.3)'
+                  : '1px solid rgba(59, 130, 246, 0.3)',
+              }}>
+                <div className="flex items-center justify-between">
+                  <div className="flex-1">
+                    <p className="text-xs font-mono mb-1" style={{
+                      color: inviteStatus.color === 'emerald' 
+                        ? '#34d399' 
+                        : inviteStatus.color === 'amber'
+                        ? '#fbbf24'
+                        : '#60a5fa'
+                    }}>
+                      {inviteStatus.label}
+                    </p>
+                    {inviteStatus.admin && (
+                      <p className="text-xs text-slate-400 font-mono">
+                        Admin: {inviteStatus.admin}
+                      </p>
+                    )}
+                    {inviteStatus.joinedAt && (
+                      <p className="text-xs text-slate-500 font-mono">
+                        Joined: {new Date(inviteStatus.joinedAt).toLocaleDateString()}
+                      </p>
+                    )}
+                  </div>
+                  {inviteStatus.type === 'pending' && inviteStatus.inviteToken && (
+                    <button
+                      onClick={() => {
+                        const link = `${window.location.origin}/accept-org-invite/${inviteStatus.inviteToken}`;
+                        navigator.clipboard.writeText(link);
+                        toast.success('Invitation link copied!');
+                      }}
+                      className="text-xs px-2 py-1 rounded bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 font-mono flex items-center gap-1"
+                    >
+                      <Mail className="size-3" />
+                      Copy Link
+                    </button>
+                  )}
+                </div>
+              </div>
+
               {/* Plan & Billing */}
               <div className="flex items-center justify-between p-3 rounded-lg mb-4" style={{
                 ...AXIOM.containers.item,
               }}>
                 <div>
-                  <p className="text-xs text-slate-400 font-mono">Plan</p>
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <p className="text-xs text-slate-400 font-mono">Plan</p>
+                    {(org.plan?.toLowerCase() === 'basic' || (org.billing?.amount || 0) === 0) ? (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/30">
+                        Free Tier
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300 border border-purple-500/40 font-bold">
+                        Paid Tier
+                      </span>
+                    )}
+                  </div>
                   <p className="text-sm text-white font-medium">{org.plan}</p>
                 </div>
                 <div className="text-right">
                   <p className="text-xs text-slate-400 font-mono">Next Invoice</p>
                   <p className="text-sm text-white font-medium font-mono">Rs {org.billing.amount.toLocaleString()}</p>
+                  {org.billing.daysRemaining != null && org.billing.amount > 0 && (
+                    <p className="text-[10px] font-mono text-cyan-400">
+                      {org.billing.daysRemaining}d remaining
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -380,7 +703,15 @@ export function OrganizationsView() {
               <div className="flex justify-between"><span className="text-slate-400">Plan</span><span className="text-white">{viewingOrg.plan}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Currency</span><span className="text-white">{viewingOrg.currency}</span></div>
               <div className="flex justify-between"><span className="text-slate-400">Fiscal year start</span><span className="text-white">{viewingOrg.fiscalYearStart}</span></div>
-              <div className="flex justify-between"><span className="text-slate-400">Next invoice</span><span className="text-white">Rs {viewingOrg.billing.amount.toLocaleString()}</span></div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Next invoice</span>
+                <span className="text-white">
+                  Rs {viewingOrg.billing.amount.toLocaleString()}
+                  {viewingOrg.billing.daysRemaining != null && viewingOrg.billing.amount > 0 && (
+                    <span className="text-cyan-400 text-xs ml-2">({viewingOrg.billing.daysRemaining} days remaining)</span>
+                  )}
+                </span>
+              </div>
               <div className="border-t border-white/10 pt-3 space-y-2">
                 <div className="flex justify-between"><span className="text-slate-400">Users</span><span className="text-white">{viewingOrg.limits.usersUsed}/{viewingOrg.limits.users}</span></div>
                 <div className="flex justify-between"><span className="text-slate-400">Statements</span><span className="text-white">{viewingOrg.limits.statementsUsed}/{viewingOrg.limits.statements}</span></div>
@@ -431,6 +762,26 @@ export function OrganizationsView() {
                 className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
               />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-slate-400 font-mono">Subscription Plan</label>
+              <select
+                value={managePlan}
+                onChange={(e) => setManagePlan(e.target.value)}
+                className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              >
+                <optgroup label="Free Tier" className="bg-slate-900 text-slate-300">
+                  {(platformPlans.filter(p => p.price === 0).length > 0 ? platformPlans.filter(p => p.price === 0) : [{ slug: 'basic', name: 'Basic' }]).map(p => (
+                    <option key={p.slug} value={p.slug}>{p.name} (Free)</option>
+                  ))}
+                </optgroup>
+                <optgroup label="Paid Tiers" className="bg-slate-900 text-slate-300">
+                  {(platformPlans.filter(p => p.price > 0).length > 0 ? platformPlans.filter(p => p.price > 0) : [{ slug: 'professional', name: 'Professional', price: 49900 }, { slug: 'enterprise', name: 'Enterprise', price: 99900 }]).map(p => (
+                    <option key={p.slug} value={p.slug}>{p.name} (Rs {(p.price || 0).toLocaleString()}/mo)</option>
+                  ))}
+                </optgroup>
+              </select>
             </div>
           </div>
           <DialogFooter>

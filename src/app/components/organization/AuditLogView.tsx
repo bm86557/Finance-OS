@@ -33,6 +33,7 @@ interface AuditEntry {
   entityType: string;
   entityName: string;
   timestamp: string;
+  rawTimestamp?: string;
   changes?: { field: string; oldValue: string; newValue: string }[];
   metadata?: { ipAddress?: string; location?: string; device?: string };
 }
@@ -42,26 +43,28 @@ export function AuditLogView() {
   const [filterUser, setFilterUser] = useState('');
   const [filterAction, setFilterAction] = useState('all');
   const [filterEntity, setFilterEntity] = useState('all');
-  const [dateFrom, setDateFrom] = useState('2025-01-01');
-  const [dateTo, setDateTo] = useState('2025-01-31');
+  const currentYear = new Date().getFullYear();
+  const [dateFrom, setDateFrom] = useState(`${currentYear}-01-01`);
+  const [dateTo, setDateTo] = useState(`${currentYear}-12-31`);
 
   const { currentOrganization } = useAuth();
-  const orgId = currentOrganization?.id || 'org-001';
+  const orgId = currentOrganization?.id || '';
 
   const { data: rawLogs, loading } = useServiceArray(
-    () => auditService.getAll(orgId),
+    () => (orgId ? auditService.getAll(orgId) : Promise.resolve({ success: true, data: [] })),
     [orgId]
   );
 
-  // Map service data to view model
-  const logs: AuditEntry[] = rawLogs.map(l => ({
+  // Map service data to view model safely
+  const logs: AuditEntry[] = (rawLogs || []).map(l => ({
     id: l.id,
-    user: { name: l.userName, role: 'admin' },
-    action: l.action.toLowerCase(),
-    entityType: l.resource.toLowerCase(),
-    entityName: l.details,
-    timestamp: new Date(l.timestamp).toLocaleString(),
-    metadata: { ipAddress: l.ipAddress },
+    user: { name: l.userName || 'System Admin', role: 'admin' },
+    action: (l.action || 'activity').toLowerCase(),
+    entityType: (l.resource || 'financial').toLowerCase(),
+    entityName: l.details || 'System event',
+    timestamp: l.timestamp ? new Date(l.timestamp).toLocaleString() : new Date().toLocaleString(),
+    rawTimestamp: l.timestamp || new Date().toISOString(),
+    metadata: { ipAddress: l.ipAddress || '127.0.0.1' },
   }));
 
   const getActionIcon = (action: string) => {
@@ -132,6 +135,8 @@ export function AuditLogView() {
     if (filterUser && !log.user?.name?.toLowerCase().includes(filterUser.toLowerCase())) return false;
     if (filterAction !== 'all' && log.action !== filterAction) return false;
     if (filterEntity !== 'all' && log.entityType !== filterEntity) return false;
+    if (dateFrom && log.rawTimestamp && new Date(log.rawTimestamp) < new Date(`${dateFrom}T00:00:00`)) return false;
+    if (dateTo && log.rawTimestamp && new Date(log.rawTimestamp) > new Date(`${dateTo}T23:59:59`)) return false;
     return true;
   });
 
@@ -141,13 +146,12 @@ export function AuditLogView() {
       <ViewHeader
         title="Audit Log"
         description="Track all changes and activities in your organization"
-        action={
-          <Button onClick={handleExport} className="bg-gradient-to-r from-blue-600 to-cyan-600">
-            <Download className="size-4 mr-2" />
-            Export Log
-          </Button>
-        }
-      />
+      >
+        <Button onClick={handleExport} className="bg-gradient-to-r from-blue-600 to-cyan-600">
+          <Download className="size-4 mr-2" />
+          Export Log
+        </Button>
+      </ViewHeader>
 
       {/* Filters */}
       <Card className="bg-slate-900 border-slate-800">

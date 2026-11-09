@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { motion } from 'motion/react';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService, useServiceArray } from '@/hooks/useService';
+import { useAuth } from '@/contexts/AuthContext';
 import { formatCurrency } from '@/lib/formatters';
+import { convertCurrency } from '@/lib/currencyUtils';
 import { dashboardFallbackAnalytics } from '@/lib/dashboardFallbackAnalytics';
 import { 
   TrendingUp, 
@@ -277,7 +279,8 @@ function TimelineEvent({
   currency,
   type,
   delay = 0,
-  theme = 'dark'
+  theme = 'dark',
+  isMasked = false
 }: {
   date: string;
   title: string;
@@ -286,6 +289,7 @@ function TimelineEvent({
   type: 'income' | 'expense';
   delay?: number;
   theme?: 'light' | 'dark';
+  isMasked?: boolean;
 }) {
   return (
     <motion.div
@@ -320,7 +324,7 @@ function TimelineEvent({
           </p>
           <p className={`font-medium text-sm mb-1 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{title}</p>
           <p className={`text-xs font-mono font-semibold ${type === 'income' ? 'text-emerald-400' : 'text-red-400'}`}>
-            {type === 'income' ? '+' : '-'}{formatCurrency(amount, currency)}
+            {isMasked ? '•••••• (Confidential)' : `${type === 'income' ? '+' : '-'}${formatCurrency(amount, currency)}`}
           </p>
         </div>
       </div>
@@ -328,7 +332,7 @@ function TimelineEvent({
   );
 }
 
-type UpcomingLine = { date: string; title: string; amount: number; currency: string };
+type UpcomingLine = { date: string; title: string; amount: number; currency: string; isMasked?: boolean };
 
 function upcomingPanelSurface(theme: 'light' | 'dark') {
   return theme === 'dark'
@@ -346,6 +350,7 @@ function UpcomingPanelContent({
   goToOrgView,
   onDismiss,
   dismissStyle = 'close',
+  currency = 'USD',
 }: {
   theme: 'light' | 'dark';
   totalUpcomingPayments: number;
@@ -355,6 +360,7 @@ function UpcomingPanelContent({
   goToOrgView?: (view: string) => void;
   onDismiss?: () => void;
   dismissStyle?: 'close' | 'collapse';
+  currency?: string;
 }) {
   return (
     <>
@@ -411,7 +417,7 @@ function UpcomingPanelContent({
           >
             <p className="text-emerald-400 text-xs mb-1 uppercase tracking-wider font-bold">Payments</p>
             <p className={`text-xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-              {formatCurrency(totalUpcomingPayments, 'PKR', { compact: true })}
+              {formatCurrency(totalUpcomingPayments, currency, { compact: true })}
             </p>
           </motion.div>
           <motion.div
@@ -427,7 +433,7 @@ function UpcomingPanelContent({
           >
             <p className="text-red-400 text-xs mb-1 uppercase tracking-wider font-bold">Expenses</p>
             <p className={`text-xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
-              {formatCurrency(totalUpcomingExpenses, 'PKR', { compact: true })}
+              {formatCurrency(totalUpcomingExpenses, currency, { compact: true })}
             </p>
           </motion.div>
         </div>
@@ -454,18 +460,22 @@ function UpcomingPanelContent({
           </div>
         </div>
         <div className="space-y-0">
-          {upcomingPayments.map((event, idx) => (
-            <TimelineEvent
-              key={`pay-${idx}`}
-              date={event.date}
-              title={event.title}
-              amount={event.amount}
-              currency={event.currency}
-              type="income"
-              delay={0.05 + idx * 0.05}
-              theme={theme}
-            />
-          ))}
+          {upcomingPayments.length > 0 ? (
+            upcomingPayments.map((event, idx) => (
+              <TimelineEvent
+                key={`pay-${idx}`}
+                date={event.date}
+                title={event.title}
+                amount={event.amount}
+                currency={event.currency}
+                type="income"
+                delay={0.05 + idx * 0.05}
+                theme={theme}
+              />
+            ))
+          ) : (
+            <p className="text-xs text-slate-500 italic py-2 pl-2">No incoming payments scheduled for next 30 days.</p>
+          )}
         </div>
       </div>
 
@@ -490,18 +500,23 @@ function UpcomingPanelContent({
           </div>
         </div>
         <div className="space-y-0">
-          {upcomingExpenses.map((event, idx) => (
-            <TimelineEvent
-              key={`exp-${idx}`}
-              date={event.date}
-              title={event.title}
-              amount={event.amount}
-              currency={event.currency}
-              type="expense"
-              delay={0.1 + idx * 0.05}
-              theme={theme}
-            />
-          ))}
+          {upcomingExpenses.length > 0 ? (
+            upcomingExpenses.map((event, idx) => (
+              <TimelineEvent
+                key={`exp-${idx}`}
+                date={event.date}
+                title={event.title}
+                amount={event.amount}
+                currency={event.currency}
+                type="expense"
+                delay={0.1 + idx * 0.05}
+                theme={theme}
+                isMasked={event.isMasked}
+              />
+            ))
+          ) : (
+            <p className="text-xs text-slate-500 italic py-2 pl-2">No outgoing expenses scheduled for next 30 days.</p>
+          )}
         </div>
       </div>
 
@@ -531,29 +546,79 @@ function UpcomingPanelContent({
 }
 
 // Profit Intelligence Neon Graph Component
-function ProfitIntelligenceGraph() {
-  const [timePeriod, setTimePeriod] = useState<TimePeriod>('1M');
+function ProfitIntelligenceGraph({ currency, chartData }: { currency?: string; chartData?: any }) {
+  const [timePeriod, setTimePeriod] = useState<TimePeriod>('1Y');
   const [visibleLines, setVisibleLines] = useState<Set<string>>(
-    new Set(['Departments', 'Projects', 'Clients'])
+    new Set(['Net Profit', 'Revenue', 'Expenses'])
   );
   const { theme } = useTheme();
+  const { currentOrganization } = useAuth();
+  const orgCurrency = currency || currentOrganization?.currency || 'USD';
   
-  // All 7 profit dimensions in ONE dataset
-  const profitDimensions = {
-    lines: ['Departments', 'Projects', 'Clients', 'Overhead', 'What If', 'Business vs Personal', 'Per Sq Ft'],
-    colors: ['#3b82f6', '#06b6d4', '#8b5cf6', '#10b981', '#f59e0b', '#ec4899', '#ef4444'],
-    data: Array.from({ length: 12 }, (_, i) => ({
-      month: ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][i],
-      Departments: 1000 + Math.sin(i * 0.5) * 500 + i * 200,
-      Projects: 800 + Math.cos(i * 0.7) * 400 + i * 150,
-      Clients: 1200 + Math.sin(i * 0.3) * 600 + i * 180,
-      Overhead: 500 + Math.sin(i * 0.8) * 200 + i * 80,
-      'What If': 1100 + Math.cos(i * 0.6) * 550 + i * 170,
-      'Business vs Personal': 900 + Math.sin(i * 0.4) * 450 + i * 160,
-      'Per Sq Ft': 300 + Math.cos(i * 0.9) * 150 + i * 60,
-    }))
-  };
+  const defaultMonths = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   
+  const profitDimensions = useMemo(() => {
+    const profitList = chartData?.profitData || [];
+    const deptList = chartData?.departmentData || [];
+    
+    // Extract unique department names from departmentData
+    const deptKeys: string[] = [];
+    if (Array.isArray(deptList) && deptList.length > 0) {
+      Object.keys(deptList[0]).forEach(k => {
+        if (k !== 'name' && !deptKeys.includes(k)) deptKeys.push(k);
+      });
+    }
+
+    const lines = ['Net Profit', 'Revenue', 'Expenses', ...deptKeys];
+    const colors = ['#3b82f6', '#10b981', '#ef4444', '#06b6d4', '#8b5cf6', '#f59e0b', '#ec4899'];
+
+    const listToMap = Array.isArray(profitList) && profitList.length > 0 ? profitList : defaultMonths.map(m => ({ name: m }));
+    const data = listToMap.map((p: any, i: number) => {
+      const m = p.name || p.month || defaultMonths[i] || `M${i + 1}`;
+      const d = deptList[i] || {};
+      const row: Record<string, any> = {
+        month: m,
+        'Net Profit': p.Profit ?? p['Net Profit'] ?? 0,
+        Revenue: p.Revenue ?? 0,
+        Expenses: p.Expenses ?? 0,
+      };
+      deptKeys.forEach(dk => {
+        row[dk] = d[dk] ?? 0;
+      });
+      return row;
+    });
+
+    return { lines, colors, data };
+  }, [chartData]);
+
+  const displayedData = useMemo(() => {
+    const full = profitDimensions.data;
+    const tail = (n: number) => full.slice(Math.max(0, full.length - n));
+    switch (timePeriod) {
+      case '1W': {
+        const weekly = (chartData as any)?.weeklyProfitData;
+        if (Array.isArray(weekly) && weekly.length > 0) {
+          return weekly.map((w: any) => ({
+            month: w.name || w.month || '',
+            'Net Profit': w['Net Profit'] ?? w.Profit ?? 0,
+            Revenue: w.Revenue ?? 0,
+            Expenses: w.Expenses ?? 0,
+          }));
+        }
+        return tail(2);
+      }
+      case '1M':
+        return tail(1);
+      case '3M':
+        return tail(3);
+      case '6M':
+        return tail(6);
+      case '1Y':
+      default:
+        return full;
+    }
+  }, [profitDimensions.data, timePeriod, chartData]);
+
   const toggleLine = (line: string) => {
     const newVisible = new Set(visibleLines);
     if (newVisible.has(line)) {
@@ -698,14 +763,17 @@ function ProfitIntelligenceGraph() {
           }}
         >
           <ResponsiveContainer width="100%" height="100%">
-            <ComposedChart data={profitDimensions.data}>
+            <ComposedChart data={displayedData}>
               <defs>
-                {profitDimensions.lines.map((line: string, idx: number) => (
-                  <linearGradient key={`gradient-${line}`} id={`area-gradient-${line}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor={profitDimensions.colors[idx]} stopOpacity={0.6}/>
-                    <stop offset="95%" stopColor={profitDimensions.colors[idx]} stopOpacity={0.02}/>
-                  </linearGradient>
-                ))}
+                {profitDimensions.lines.map((line: string, idx: number) => {
+                  const clr = profitDimensions.colors[idx % profitDimensions.colors.length];
+                  return (
+                    <linearGradient key={`gradient-${line}`} id={`area-gradient-${line}`} x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={clr} stopOpacity={0.6}/>
+                      <stop offset="95%" stopColor={clr} stopOpacity={0.02}/>
+                    </linearGradient>
+                  );
+                })}
               </defs>
               
               <CartesianGrid 
@@ -725,7 +793,7 @@ function ProfitIntelligenceGraph() {
                 style={{ fontSize: '12px', fontWeight: 600 }}
                 tickLine={false}
                 axisLine={{ stroke: theme === 'dark' ? 'rgba(148, 163, 184, 0.2)' : 'rgba(148, 163, 184, 0.3)' }}
-                tickFormatter={(value) => `₨${(value / 1000).toFixed(0)}K`}
+                tickFormatter={(value) => formatCurrency(value, orgCurrency, { compact: true })}
               />
               <Tooltip 
                 contentStyle={{ 
@@ -747,34 +815,35 @@ function ProfitIntelligenceGraph() {
                   fontSize: '12px',
                   fontWeight: 600
                 }}
-                formatter={(value: any) => [`₨${(value / 1000).toFixed(1)}K`, '']}
+                formatter={(value: any) => [formatCurrency(Number(value) || 0, orgCurrency, { compact: true }), '']}
               />
               
-              {profitDimensions.lines.map((line: string, idx: number) => (
-                visibleLines.has(line) && (
+              {profitDimensions.lines.map((line: string, idx: number) => {
+                const clr = profitDimensions.colors[idx % profitDimensions.colors.length];
+                return visibleLines.has(line) && (
                   <Area
                     key={line}
                     type="monotone"
                     dataKey={line}
-                    stroke={profitDimensions.colors[idx]}
+                    stroke={clr}
                     strokeWidth={3}
                     fill={`url(#area-gradient-${line})`}
                     dot={{ 
-                      fill: profitDimensions.colors[idx], 
+                      fill: clr, 
                       r: 4,
                       strokeWidth: 2,
                       stroke: theme === 'dark' ? '#0a0a0a' : '#ffffff'
                     }}
                     activeDot={{ 
                       r: 6, 
-                      fill: profitDimensions.colors[idx],
+                      fill: clr,
                       stroke: theme === 'dark' ? '#0a0a0a' : '#ffffff',
                       strokeWidth: 3
                     }}
                     animationDuration={1500}
                   />
-                )
-              ))}
+                );
+              })}
             </ComposedChart>
           </ResponsiveContainer>
         </div>
@@ -782,32 +851,35 @@ function ProfitIntelligenceGraph() {
         {/* Line Toggles - Modern Pill Design */}
         <div className="flex items-center justify-between gap-4">
           <div className="flex flex-wrap gap-2">
-            {profitDimensions.lines.map((line: string, idx: number) => (
-              <motion.button
-                key={line}
-                onClick={() => toggleLine(line)}
-                whileHover={{ scale: 1.05, y: -2 }}
-                whileTap={{ scale: 0.95 }}
-                className="px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5"
-                style={{
-                  background: visibleLines.has(line) 
-                    ? `linear-gradient(135deg, ${profitDimensions.colors[idx]}, ${profitDimensions.colors[idx]}dd)`
-                    : theme === 'dark' ? 'rgba(0, 0, 0, 0.3)' : 'rgba(255, 255, 255, 0.6)',
-                  border: `2px solid ${visibleLines.has(line) ? profitDimensions.colors[idx] : theme === 'dark' ? 'rgba(148, 163, 184, 0.2)' : 'rgba(148, 163, 184, 0.25)'}`,
-                  color: visibleLines.has(line) ? '#ffffff' : theme === 'dark' ? '#64748b' : '#94a3b8',
-                  boxShadow: visibleLines.has(line) ? `0 4px 16px -4px ${profitDimensions.colors[idx]}80` : 'none',
-                }}
-              >
-                <div 
-                  className="w-2.5 h-2.5 rounded-full"
+            {profitDimensions.lines.map((line: string, idx: number) => {
+              const clr = profitDimensions.colors[idx % profitDimensions.colors.length];
+              return (
+                <motion.button
+                  key={line}
+                  onClick={() => toggleLine(line)}
+                  whileHover={{ scale: 1.05, y: -2 }}
+                  whileTap={{ scale: 0.95 }}
+                  className="px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2.5"
                   style={{
-                    background: profitDimensions.colors[idx],
-                    boxShadow: visibleLines.has(line) ? `0 0 8px ${profitDimensions.colors[idx]}` : 'none',
+                    background: visibleLines.has(line) 
+                      ? `linear-gradient(135deg, ${clr}, ${clr}dd)`
+                      : theme === 'dark' ? 'rgba(0, 0, 0, 0.3)' : 'rgba(255, 255, 255, 0.6)',
+                    border: `2px solid ${visibleLines.has(line) ? clr : theme === 'dark' ? 'rgba(148, 163, 184, 0.2)' : 'rgba(148, 163, 184, 0.25)'}`,
+                    color: visibleLines.has(line) ? '#ffffff' : theme === 'dark' ? '#64748b' : '#94a3b8',
+                    boxShadow: visibleLines.has(line) ? `0 4px 16px -4px ${clr}80` : 'none',
                   }}
-                />
-                {line}
-              </motion.button>
-            ))}
+                >
+                  <div 
+                    className="w-2.5 h-2.5 rounded-full"
+                    style={{
+                      background: clr,
+                      boxShadow: visibleLines.has(line) ? `0 0 8px ${clr}` : 'none',
+                    }}
+                  />
+                  {line}
+                </motion.button>
+              );
+            })}
           </div>
           
           <motion.button
@@ -840,6 +912,9 @@ export function OrgDashboard() {
   const [mobileUpcomingOpen, setMobileUpcomingOpen] = useState(false);
   const analytics = dashboardFallbackAnalytics;
   const { theme } = useTheme();
+  const { currentOrganization, userRole, accessRole } = useAuth();
+  const canViewPayroll = userRole === 'owner' || userRole === 'admin' || accessRole === 'org_admin';
+  const orgCurrency = currentOrganization?.currency || 'USD';
   const goToOrgView = useOrgWorkspaceNav();
 
   useEffect(() => {
@@ -870,7 +945,7 @@ export function OrgDashboard() {
   } = useServiceArray(
     () => svc.accounts.getBankAccounts(),
     [svc.orgId],
-    ['bankAccounts'],
+    ['bankAccounts', 'transactions'],
   );
   const {
     data: dashboardKPIs,
@@ -880,6 +955,7 @@ export function OrgDashboard() {
   } = useService(
     () => svc.reports.getDashboardSummary(),
     [svc.orgId],
+    ['bankAccounts', 'transactions', 'budgets', 'recurringTransactions'],
   );
 
   const refreshDashboardData = () => {
@@ -890,42 +966,75 @@ export function OrgDashboard() {
   const getProfitByPeriod = (): number => {
     switch (profitPeriod) {
       case 'weekly':
-        return safeFinite(analytics.weeklyProfit, analytics.monthlyProfit);
+        return safeFinite(dashboardKPIs?.weeklyProfit, 0);
       case 'monthly':
-        return safeFinite(dashboardKPIs?.netProfit, analytics.monthlyProfit);
+        return safeFinite(dashboardKPIs?.monthlyProfit, 0);
       case 'yearly':
-        return safeFinite(analytics.yearlyProfit, analytics.monthlyProfit);
+        return safeFinite(dashboardKPIs?.yearlyProfit ?? dashboardKPIs?.netProfit, 0);
     }
   };
 
-  const sumAccountsPkr = bankAccounts.reduce((sum, acc) => {
-    const b = safeFinite(acc.balance, 0);
-    if (acc.currency === 'PKR') return sum + b;
-    if (acc.currency === 'USD') return sum + b * 280;
-    return sum + b;
-  }, 0);
+  const getProfitPercentageByPeriod = (): string => {
+    let change: number | null | undefined = null;
+    switch (profitPeriod) {
+      case 'weekly':
+        change = dashboardKPIs?.weeklyProfitChange;
+        break;
+      case 'monthly':
+        change = dashboardKPIs?.monthlyProfitChange ?? dashboardKPIs?.profitChange;
+        break;
+      case 'yearly':
+        change = dashboardKPIs?.yearlyProfitChange;
+        break;
+    }
+    if (change == null) return '—';
+    return `${change >= 0 ? '+' : ''}${change.toFixed(1)}%`;
+  };
+
+  // Separate physical cash accounts from digital bank/wallet accounts
+  const physicalCashAccounts = bankAccounts.filter(acc => acc.accountType === 'cash');
+  const digitalBankAccounts = bankAccounts.filter(
+    acc => acc.accountType !== 'cash' && acc.accountType !== 'credit_card' && acc.accountType !== 'line_of_credit'
+  );
+
+  // Normalize balances against organization base currency
+  const physicalCashBalanceBase = physicalCashAccounts.reduce(
+    (sum, acc) => sum + convertCurrency(safeFinite(acc.balance, 0), acc.currency || orgCurrency, orgCurrency),
+    0
+  );
+  const digitalBankBalanceBase = digitalBankAccounts.reduce(
+    (sum, acc) => sum + convertCurrency(safeFinite(acc.balance, 0), acc.currency || orgCurrency, orgCurrency),
+    0
+  );
+  const creditLiabilities = bankAccounts
+    .filter(acc => acc.accountType === 'credit_card' || acc.accountType === 'line_of_credit')
+    .reduce((sum, acc) => sum + Math.abs(convertCurrency(safeFinite(acc.balance, 0), acc.currency || orgCurrency, orgCurrency)), 0);
+
+  const netAccountBalance = digitalBankBalanceBase + physicalCashBalanceBase - creditLiabilities;
 
   const totalBalance =
-    bankAccounts.length > 0
-      ? safeFinite(sumAccountsPkr, analytics.netWorth)
+    dashboardKPIs?.totalBankBalanceBase != null
+      ? safeFinite(dashboardKPIs.totalBankBalanceBase, 0)
+      : bankAccounts.length > 0
+      ? safeFinite(netAccountBalance, analytics.netWorth)
       : analytics.netWorth;
 
-  const netWorthFromSummary =
-    dashboardKPIs != null
-      ? safeFinite(
-          safeFinite(dashboardKPIs.cashOnHand, 0) +
-            safeFinite(dashboardKPIs.accountsReceivable, 0) -
-            Math.abs(safeFinite(dashboardKPIs.accountsPayable, 0)),
-          analytics.netWorth,
-        )
-      : safeFinite(analytics.netWorth, 0);
+  const netWorthDisplay =
+    dashboardKPIs?.netWorth != null
+      ? safeFinite(dashboardKPIs.netWorth, totalBalance)
+      : dashboardKPIs != null
+        ? safeFinite(
+            safeFinite(dashboardKPIs.cashOnHand, 0) +
+              safeFinite(dashboardKPIs.accountsReceivable, 0) -
+              Math.abs(safeFinite(dashboardKPIs.accountsPayable, 0)),
+            analytics.netWorth,
+          )
+        : totalBalance;
 
-  // Net worth is assets minus liabilities (cash + receivables − payables), never just the sum of
-  // bank balances — that's `totalBalance` above. Always use the full calc; `netWorthFromSummary`
-  // already falls back to `analytics.netWorth` when dashboardKPIs isn't loaded yet.
-  const netWorthDisplay = netWorthFromSummary;
-
-  const cashOnHand = safeFinite(dashboardKPIs?.cashOnHand, analytics.cashInHand);
+  const cashOnHand =
+    dashboardKPIs?.cashOnHand != null
+      ? safeFinite(dashboardKPIs.cashOnHand, 0)
+      : physicalCashBalanceBase;
   const monthlyProfitDisplay = safeFinite(getProfitByPeriod(), analytics.monthlyProfit);
 
   const profitLabel =
@@ -934,32 +1043,65 @@ export function OrgDashboard() {
       : profitPeriod === 'yearly'
         ? 'Yearly Profit'
         : 'Monthly Profit';
-  
-  // Mock department data for 3D chart
-  const departments = [
-    { name: 'Development', value: 4200000, color: 'purple' },
-    { name: 'Design', value: 2800000, color: 'cyan' },
-    { name: 'Marketing', value: 3500000, color: 'pink' },
-    { name: 'Sales', value: 4800000, color: 'green' },
-  ];
-  
-  const maxDeptValue = Math.max(...departments.map(d => d.value));
 
-  // Mock upcoming transactions
-  const upcomingPayments = [
-    { date: 'Jan 10', title: 'Client Payment - ABC Corp', amount: 850000, currency: 'PKR' },
-    { date: 'Jan 15', title: 'Project Milestone - XYZ Ltd', amount: 650000, currency: 'PKR' },
-    { date: 'Jan 20', title: 'Consulting Revenue', amount: 320000, currency: 'PKR' },
-  ];
-  
-  const upcomingExpenses = [
-    { date: 'Jan 12', title: 'Payroll Processing', amount: 1200000, currency: 'PKR' },
-    { date: 'Jan 18', title: 'Software Subscriptions', amount: 45000, currency: 'PKR' },
-    { date: 'Jan 25', title: 'Office Rent', amount: 180000, currency: 'PKR' },
-  ];
-  
-  const totalUpcomingPayments = upcomingPayments.reduce((sum, p) => sum + p.amount, 0);
-  const totalUpcomingExpenses = upcomingExpenses.reduce((sum, e) => sum + e.amount, 0);
+  // Real upcoming transactions with RBAC payroll confidentiality
+  const upcomingPayments = useMemo(() => {
+    if (!dashboardKPIs?.upcomingPayments || dashboardKPIs.upcomingPayments.length === 0) {
+      return [];
+    }
+    return dashboardKPIs.upcomingPayments.map((p: any) => {
+      const isPayroll =
+        /payroll|salary|wage/i.test(p.title || '') ||
+        /payroll|salary|wage/i.test(p.category || '');
+      if (isPayroll && !canViewPayroll) {
+        return {
+          ...p,
+          title: 'Team Payroll (Confidential)',
+          amount: 0,
+          isMasked: true,
+        };
+      }
+      return p;
+    });
+  }, [dashboardKPIs?.upcomingPayments, canViewPayroll]);
+
+  const upcomingExpenses = useMemo(() => {
+    if (!dashboardKPIs?.upcomingExpenses || dashboardKPIs.upcomingExpenses.length === 0) {
+      return [];
+    }
+    return dashboardKPIs.upcomingExpenses.map((e: any) => {
+      const isPayroll =
+        /payroll|salary|wage/i.test(e.title || '') ||
+        /payroll|salary|wage/i.test(e.category || '');
+      if (isPayroll && !canViewPayroll) {
+        return {
+          ...e,
+          title: 'Team Payroll (Confidential)',
+          amount: 0,
+          isMasked: true,
+        };
+      }
+      return e;
+    });
+  }, [dashboardKPIs?.upcomingExpenses, canViewPayroll]);
+
+  const totalUpcomingPayments = useMemo(() => {
+    if (!canViewPayroll) {
+      return upcomingPayments
+        .filter((p: any) => !p.isMasked)
+        .reduce((sum: number, p: any) => sum + convertCurrency(Number(p.amount || 0), p.currency || orgCurrency, orgCurrency), 0);
+    }
+    return dashboardKPIs?.totalUpcomingPayments ?? upcomingPayments.reduce((sum: number, p: any) => sum + convertCurrency(Number(p.amount || 0), p.currency || orgCurrency, orgCurrency), 0);
+  }, [canViewPayroll, dashboardKPIs?.totalUpcomingPayments, upcomingPayments, orgCurrency]);
+
+  const totalUpcomingExpenses = useMemo(() => {
+    if (!canViewPayroll) {
+      return upcomingExpenses
+        .filter((e: any) => !e.isMasked)
+        .reduce((sum: number, e: any) => sum + convertCurrency(Number(e.amount || 0), e.currency || orgCurrency, orgCurrency), 0);
+    }
+    return dashboardKPIs?.totalUpcomingExpenses ?? upcomingExpenses.reduce((sum: number, e: any) => sum + convertCurrency(Number(e.amount || 0), e.currency || orgCurrency, orgCurrency), 0);
+  }, [canViewPayroll, dashboardKPIs?.totalUpcomingExpenses, upcomingExpenses, orgCurrency]);
 
   return (
     <div
@@ -985,6 +1127,17 @@ export function OrgDashboard() {
               >
                 Try again
               </button>
+            </div>
+          )}
+          {Boolean(dashboardKPIs?.pendingTransactions && dashboardKPIs.pendingTransactions > 0) && (
+            <div
+              className="mx-4 sm:mx-6 lg:mx-8 mt-3 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-blue-200 text-sm font-mono border border-blue-500/35"
+              style={{ background: 'rgba(59, 130, 246, 0.08)' }}
+              role="status"
+            >
+              <span>
+                {dashboardKPIs?.pendingTransactions} transaction{dashboardKPIs?.pendingTransactions === 1 ? '' : 's'} pending review ({formatCurrency(dashboardKPIs?.pendingReviewAmount ?? 0, orgCurrency)}). Operating analytics reflect posted transactions.
+              </span>
             </div>
           )}
           {(accountsLoading || kpisLoading) && (
@@ -1090,9 +1243,9 @@ export function OrgDashboard() {
                 icon={TrendingUp}
                 label="Total Balance"
                 value={totalBalance}
-                currency="PKR"
-                percentage="12.5%"
-                trend="up"
+                currency={orgCurrency}
+                percentage={dashboardKPIs?.totalBalanceChange != null ? `${dashboardKPIs.totalBalanceChange >= 0 ? '+' : ''}${dashboardKPIs.totalBalanceChange.toFixed(1)}%` : '—'}
+                trend={(dashboardKPIs?.totalBalanceChange ?? 0) >= 0 ? 'up' : 'down'}
                 delay={0.1}
               />
               
@@ -1100,9 +1253,9 @@ export function OrgDashboard() {
                 icon={Wallet}
                 label="Cash in Hand"
                 value={cashOnHand}
-                currency="PKR"
-                percentage="8.2%"
-                trend="up"
+                currency={orgCurrency}
+                percentage={dashboardKPIs?.cashOnHandChange != null ? `${dashboardKPIs.cashOnHandChange >= 0 ? '+' : ''}${dashboardKPIs.cashOnHandChange.toFixed(1)}%` : '—'}
+                trend={(dashboardKPIs?.cashOnHandChange ?? 0) >= 0 ? 'up' : 'down'}
                 delay={0.2}
               />
               
@@ -1110,20 +1263,34 @@ export function OrgDashboard() {
                 icon={DollarSign}
                 label={profitLabel}
                 value={monthlyProfitDisplay}
-                currency="PKR"
-                percentage="15.7%"
-                trend="up"
+                currency={orgCurrency}
+                percentage={getProfitPercentageByPeriod()}
+                trend={(profitPeriod === 'weekly' ? (dashboardKPIs?.weeklyProfit ?? 0) : profitPeriod === 'yearly' ? (dashboardKPIs?.yearlyProfit ?? 0) : (dashboardKPIs?.monthlyProfit ?? 0)) >= 0 ? 'up' : 'down'}
                 delay={0.3}
+                subtitle={
+                  profitPeriod === 'weekly'
+                    ? (dashboardKPIs?.weeklyRevenue != null && dashboardKPIs?.weeklyExpenses != null
+                        ? `Rev ${formatCurrency(dashboardKPIs.weeklyRevenue, orgCurrency, { compact: true })} • Exp ${formatCurrency(dashboardKPIs.weeklyExpenses, orgCurrency, { compact: true })}`
+                        : undefined)
+                    : profitPeriod === 'yearly'
+                      ? (dashboardKPIs?.yearlyRevenue != null && dashboardKPIs?.yearlyExpenses != null
+                          ? `Rev ${formatCurrency(dashboardKPIs.yearlyRevenue, orgCurrency, { compact: true })} • Exp ${formatCurrency(dashboardKPIs.yearlyExpenses, orgCurrency, { compact: true })}`
+                          : `Cumulative: ${formatCurrency(dashboardKPIs?.netProfit ?? 0, orgCurrency, { compact: true })}`)
+                      : (dashboardKPIs?.monthlyRevenue != null && dashboardKPIs?.monthlyExpenses != null
+                          ? `Rev ${formatCurrency(dashboardKPIs.monthlyRevenue, orgCurrency, { compact: true })} • Exp ${formatCurrency(dashboardKPIs.monthlyExpenses, orgCurrency, { compact: true })}`
+                          : `Cumulative: ${formatCurrency(dashboardKPIs?.netProfit ?? 0, orgCurrency, { compact: true })}`)
+                }
               />
               
               <ModernKPICard
                 icon={BarChart3}
                 label="Net Worth"
                 value={netWorthDisplay}
-                currency="PKR"
-                percentage="12.5%"
-                trend="up"
+                currency={orgCurrency}
+                percentage={dashboardKPIs?.netWorthChange != null ? `${dashboardKPIs.netWorthChange >= 0 ? '+' : ''}${dashboardKPIs.netWorthChange.toFixed(1)}%` : 'Assets − Liab'}
+                trend={(dashboardKPIs?.netWorthChange ?? 0) >= 0 ? 'up' : 'down'}
                 delay={0.4}
+                subtitle={dashboardKPIs?.totalAssets != null && dashboardKPIs?.totalLiabilities != null ? `Assets ${formatCurrency(dashboardKPIs.totalAssets, orgCurrency, { compact: true })} · Liab ${formatCurrency(dashboardKPIs.totalLiabilities, orgCurrency, { compact: true })}` : undefined}
               />
             </div>
           </div>
@@ -1132,7 +1299,7 @@ export function OrgDashboard() {
           <div className="p-4 sm:p-6 lg:p-8 space-y-6 sm:space-y-8">
 
           {/* Profit Intelligence Graph */}
-          <ProfitIntelligenceGraph />
+          <ProfitIntelligenceGraph currency={orgCurrency} chartData={dashboardKPIs?.chartData} />
 
           {/* Account Progress Bars - UNIFIED BLUE THEME */}
           <motion.div
@@ -1351,6 +1518,7 @@ export function OrgDashboard() {
                 goToOrgView={goToOrgView ?? undefined}
                 onDismiss={() => setDesktopUpcomingOpen(false)}
                 dismissStyle="collapse"
+                currency={orgCurrency}
               />
             </aside>
           ) : (
@@ -1424,6 +1592,7 @@ export function OrgDashboard() {
               }}
               onDismiss={() => setMobileUpcomingOpen(false)}
               dismissStyle="close"
+              currency={orgCurrency}
             />
           </motion.div>
         </div>

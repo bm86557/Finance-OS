@@ -9,9 +9,10 @@ import { Building2, Sparkles, Lock, Mail, Cpu, Orbit, Zap, Shield } from 'lucide
 import { mockUsers } from '../../lib/mockData';
 import { useTheme } from '@/contexts/ThemeContext';
 import { SupabaseConnectionPanel } from './SupabaseConnectionPanel';
+import type { PortalType } from '@/services/authSessionTypes';
 
 interface LoginPageProps {
-  onLogin: (email: string, password: string) => Promise<void>;
+  onLogin: (email: string, password: string, orgSlug?: string, portalType?: PortalType) => Promise<void>;
 }
 
 export function LoginPage({ onLogin }: LoginPageProps) {
@@ -22,6 +23,18 @@ export function LoginPage({ onLogin }: LoginPageProps) {
   const [scanProgress, setScanProgress] = useState(0);
   const navigate = useNavigate();
   const { theme } = useTheme();
+
+  // Check for URL messages
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const message = params.get('message');
+    
+    if (message === 'email_expired') {
+      setError('Email verification link expired. Please sign up again or try logging in if you already have an account.');
+      // Clear the message from URL
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, []);
 
   useEffect(() => {
     if (isLoading && scanProgress < 100) {
@@ -302,9 +315,17 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 </div>
 
                 {/* Footer Note */}
-                <p className="text-xs text-center text-slate-500 font-mono">
-                  Demo account — click a name above to sign in instantly
-                </p>
+                <div className="text-center space-y-2">
+                  <p className="text-xs text-slate-500 font-mono">
+                    Demo account — click a name above to sign in instantly
+                  </p>
+                  <p className="text-sm text-slate-400 font-mono">
+                    Joining a team?{' '}
+                    <a href="/login/employee" className="text-purple-400 hover:text-purple-300 transition-colors">
+                      Use your invitation email
+                    </a>
+                  </p>
+                </div>
               </CardContent>
             </Card>
           </motion.div>

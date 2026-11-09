@@ -1,6 +1,6 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router';
-import React, { Suspense, Component, type ErrorInfo, type ReactNode } from 'react';
-import { useAuth } from '../contexts/AuthContext';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router';
+import React, { Suspense, Component, useEffect, type ErrorInfo, type ReactNode } from 'react';
+import { useAuth, AuthProvider } from '@/contexts/AuthContext';
 import { logErrorBoundary, logSilentUiFailure } from '../lib/diagnostics';
 import { ThemeProvider } from '../contexts/ThemeContext';
 import { OnboardingProvider } from '../contexts/OnboardingContext';
@@ -11,6 +11,13 @@ import { PlatformLoginPage } from './components/PlatformLoginPage';
 import { EmployeeLoginPage } from './components/EmployeeLoginPage';
 import { BingLoginPage } from './components/BingLoginPage';
 import { LoginPage } from './components/LoginPage';
+import { AdminSignupPage } from './components/AdminSignupPage';
+import { PlatformSignupPage } from './components/PlatformSignupPage';
+import { BingSignupPage } from './components/BingSignupPage';
+import { AcceptInvitePage } from './components/AcceptInvitePage';
+import { AcceptOrgInvitePage } from './components/AcceptOrgInvitePage';
+import { ResetPasswordPage } from './components/ResetPasswordPage';
+import { AuthErrorHandler } from './components/AuthErrorHandler';
 
 // Lazy load heavy workspace components
 const PlatformDashboard = React.lazy(() =>
@@ -173,7 +180,8 @@ function EmployeeRoute({ children }: { children: React.ReactNode }) {
 
 // Smart redirect after login
 function SmartRedirect() {
-  const { user, getRedirectPath } = useAuth();
+  const { user, isLoading, getRedirectPath } = useAuth();
+  if (isLoading) return <LoadingScreen />;
   if (!user) return <Navigate to="/" replace />;
   return <Navigate to={getRedirectPath()} replace />;
 }
@@ -181,17 +189,50 @@ function SmartRedirect() {
 // App Routes Component
 function AppRoutes() {
   const { user, login } = useAuth();
+  const location = useLocation();
+
+  // Handle Supabase auth errors from URL hash
+  useEffect(() => {
+    const handleAuthError = () => {
+      const hash = window.location.hash;
+      if (hash.includes('error=access_denied') || hash.includes('error_code=otp_expired')) {
+        // Clear the error from URL
+        window.history.replaceState({}, document.title, window.location.pathname);
+        
+        // Show user-friendly message
+        console.warn('Email verification failed or expired. You can sign up again or try logging in.');
+      }
+    };
+
+    handleAuthError();
+  }, [location]);
 
   return (
     <Routes>
+      {/* Auth Error Handler */}
+      <Route path="*" element={<AuthErrorHandler />} />
+      
       {/* Landing Page - Entry Point */}
       <Route path="/" element={!user ? <LandingPage /> : <SmartRedirect />} />
       
-      {/* Login Routes */}
-      <Route path="/login/admin" element={!user ? <AdminLoginPage onLogin={login} /> : <SmartRedirect />} />
-      <Route path="/login/platform" element={!user ? <PlatformLoginPage onLogin={login} /> : <SmartRedirect />} />
-      <Route path="/login/employee/:orgSlug" element={!user ? <EmployeeLoginPage onLogin={login} /> : <SmartRedirect />} />
-      <Route path="/login/employee" element={!user ? <EmployeeLoginPage onLogin={login} /> : <SmartRedirect />} />
+      {/* Login & Setup Routes */}
+      {/* Public signup removed — employee access is invite-only.
+          /signup now redirects to the portal chooser instead of creating an open account. */}
+      <Route path="/signup" element={<Navigate to="/login" replace />} />
+      <Route path="/signup/admin" element={!user ? <AdminSignupPage onLogin={login} /> : <Navigate to="/dashboard" replace />} />
+      <Route path="/signup/platform" element={!user ? <PlatformSignupPage onLogin={login} /> : <Navigate to="/platform" replace />} />
+      <Route path="/signup/employee" element={<Navigate to="/login/employee?notice=invite_only" replace />} />
+      <Route path="/signup/employee/:orgSlug" element={<Navigate to="/login/employee?notice=invite_only" replace />} />
+      <Route path="/signup/bing" element={!user ? <BingSignupPage onLogin={login} /> : <SmartRedirect />} />
+      
+      <Route path="/accept-invite" element={<AcceptInvitePage />} />
+      <Route path="/accept-org-invite/:token" element={<AcceptOrgInvitePage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
+      
+      <Route path="/login/admin" element={!user ? <AdminLoginPage onLogin={login} /> : <Navigate to="/dashboard" replace />} />
+      <Route path="/login/platform" element={!user ? <PlatformLoginPage onLogin={login} /> : <Navigate to="/platform" replace />} />
+      <Route path="/login/employee/:orgSlug" element={!user ? <EmployeeLoginPage onLogin={login} /> : <Navigate to="/employee" replace />} />
+      <Route path="/login/employee" element={!user ? <EmployeeLoginPage onLogin={login} /> : <Navigate to="/employee" replace />} />
       <Route path="/login/bing" element={!user ? <BingLoginPage onLogin={login} /> : <SmartRedirect />} />
       <Route path="/login" element={!user ? <LoginPage onLogin={login} /> : <SmartRedirect />} />
       
@@ -201,7 +242,7 @@ function AppRoutes() {
       <Route
         path="/dashboard"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <OrganizationWorkspace />
           </ProtectedRoute>
         }
@@ -210,7 +251,7 @@ function AppRoutes() {
       <Route
         path="/organization"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <OrganizationDashboard />
           </ProtectedRoute>
         }
@@ -219,7 +260,7 @@ function AppRoutes() {
       <Route
         path="/organization/workspace"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <OrganizationWorkspace />
           </ProtectedRoute>
         }
@@ -228,7 +269,7 @@ function AppRoutes() {
       <Route
         path="/profit-intelligence"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <ProfitIntelligence />
           </ProtectedRoute>
         }
@@ -237,7 +278,7 @@ function AppRoutes() {
       <Route
         path="/financial-reports"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <FinancialReports />
           </ProtectedRoute>
         }
@@ -246,7 +287,7 @@ function AppRoutes() {
       <Route
         path="/ai-classification"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
             <AIClassificationEngine />
           </ProtectedRoute>
         }
@@ -285,34 +326,36 @@ function AppRoutes() {
 export default function App() {
   return (
     <ErrorBoundary>
-      <BrowserRouter>
-        <ThemeProvider>
-          <NotificationProvider>
-            <OnboardingProvider>
-              <Suspense fallback={<LoadingScreen />}>
-                <SilentErrorBoundary>
-                  <MagneticCursor />
-                </SilentErrorBoundary>
-                <SilentErrorBoundary>
-                  <OnboardingWizard />
-                </SilentErrorBoundary>
-                <SilentErrorBoundary>
-                  <CommandPalette />
-                </SilentErrorBoundary>
-                <SilentErrorBoundary>
-                  <KeyboardShortcuts />
-                </SilentErrorBoundary>
-                <SilentErrorBoundary>
-                  <AIAssistantChat />
-                </SilentErrorBoundary>
-                <ErrorBoundary>
-                  <AppRoutes />
-                </ErrorBoundary>
-              </Suspense>
-            </OnboardingProvider>
-          </NotificationProvider>
-        </ThemeProvider>
-      </BrowserRouter>
+      <AuthProvider>
+        <BrowserRouter>
+          <ThemeProvider>
+            <NotificationProvider>
+              <OnboardingProvider>
+                <Suspense fallback={<LoadingScreen />}>
+                  <SilentErrorBoundary>
+                    <MagneticCursor />
+                  </SilentErrorBoundary>
+                  <SilentErrorBoundary>
+                    <OnboardingWizard />
+                  </SilentErrorBoundary>
+                  <SilentErrorBoundary>
+                    <CommandPalette />
+                  </SilentErrorBoundary>
+                  <SilentErrorBoundary>
+                    <KeyboardShortcuts />
+                  </SilentErrorBoundary>
+                  <SilentErrorBoundary>
+                    <AIAssistantChat />
+                  </SilentErrorBoundary>
+                  <ErrorBoundary>
+                    <AppRoutes />
+                  </ErrorBoundary>
+                </Suspense>
+              </OnboardingProvider>
+            </NotificationProvider>
+          </ThemeProvider>
+        </BrowserRouter>
+      </AuthProvider>
     </ErrorBoundary>
   );
 }

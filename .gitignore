@@ -7,3 +7,51 @@ data/*.db-wal
 .env.local
 *.local
 *.zip
+# Dependencies & Build
+node_modules/
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+*.local
+
+# Database files (prevent SQLite leaks)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+data/
+server/local.db
+
+# User Excluded Folders (as requested)
+backend report/
+docs/
+scripts/
+supabase/migrations/
+supabase/
+*.sql
+
+# Root scratch and test scripts
+*.mjs
+*.ps1
+test-*.js
+test-*.html
+*.pdf
+*.md
+
+# Editor & AI Agent task logs
+.agents/
+.cursor/
+.claude/
+.vscode/
+public/Screenshot*.png
+# User Excluded Folders (as requested)
+backend report/
+docs/
+scripts/
+supabase/*
+!supabase/schema.sql
+*.sql
+!supabase/schema.sql

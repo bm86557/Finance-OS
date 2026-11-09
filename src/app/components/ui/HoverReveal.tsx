@@ -46,10 +46,11 @@ export function HoverReveal({
       <motion.div
         className="absolute inset-0 flex items-center justify-center"
         initial={{ opacity: 0, ...animation }}
-        animate={{
-          opacity: isHovered ? 1 : 0,
-          [direction === 'up' || direction === 'down' ? 'y' : 'x']: isHovered ? 0 : animation[direction === 'up' || direction === 'down' ? 'y' : 'x'][0],
-        }}
+        animate={
+          direction === 'up' || direction === 'down'
+            ? { opacity: isHovered ? 1 : 0, y: isHovered ? 0 : (animation as { y: number[] }).y[0] }
+            : { opacity: isHovered ? 1 : 0, x: isHovered ? 0 : (animation as { x: number[] }).x[0] }
+        }
         transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
       >
         {revealContent}

@@ -4,6 +4,7 @@ import { ReactNode, useRef, MouseEvent } from 'react';
 interface HolographicCardProps {
   children: ReactNode;
   className?: string;
+  style?: React.CSSProperties;
   glowColor?: string;
   intensity?: 'low' | 'medium' | 'high';
   enableTilt?: boolean;

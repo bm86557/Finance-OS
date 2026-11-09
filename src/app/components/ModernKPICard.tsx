@@ -12,6 +12,7 @@ interface ModernKPICardProps {
   percentage: string;
   trend: 'up' | 'down';
   delay?: number;
+  subtitle?: string;
 }
 
 export function ModernKPICard({
@@ -22,6 +23,7 @@ export function ModernKPICard({
   percentage,
   trend,
   delay = 0,
+  subtitle,
 }: ModernKPICardProps) {
   const { theme } = useTheme();
 
@@ -117,10 +119,10 @@ export function ModernKPICard({
             {formatCurrency(value, currency, { compact: true })}
           </p>
 
-          {/* Currency badge */}
-          <div className="mt-3">
+          {/* Currency badge and optional subtitle */}
+          <div className="mt-3 flex items-center justify-between gap-2">
             <span 
-              className="text-xs font-medium px-2 py-1 rounded"
+              className="text-xs font-medium px-2 py-1 rounded shrink-0"
               style={{
                 background: theme === 'dark' 
                   ? 'rgba(59, 130, 246, 0.15)'
@@ -130,6 +132,11 @@ export function ModernKPICard({
             >
               {currency}
             </span>
+            {subtitle && (
+              <span className={`text-[11px] font-mono truncate ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`} title={subtitle}>
+                {subtitle}
+              </span>
+            )}
           </div>
         </div>
 

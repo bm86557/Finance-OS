@@ -19,6 +19,9 @@ import {
   Eye
 } from 'lucide-react';
 import { toast } from 'sonner';
+import { useOrgServices } from '@/hooks/useOrgServices';
+import { usePlatformSettings } from '@/hooks/usePlatformSettings';
+import { exportToQuickBooks } from '@/lib/exportUtils';
 
 interface ReportConfig {
   id: string;
@@ -31,6 +34,8 @@ interface ReportConfig {
 }
 
 export function CompleteExportCenter() {
+  const svc = useOrgServices();
+  const { featureFlags } = usePlatformSettings();
   const [reports, setReports] = useState<ReportConfig[]>([
     {
       id: 'profit-loss',
@@ -151,14 +156,28 @@ export function CompleteExportCenter() {
           <h2 className="text-2xl font-bold text-white mb-2">Export Center</h2>
           <p className="text-slate-400">Generate and download financial reports</p>
         </div>
-        <Button
-          onClick={handleGenerateReports}
-          className="bg-gradient-to-r from-blue-600 to-cyan-600"
-          disabled={selectedReports.length === 0}
-        >
-          <Download className="size-4 mr-2" />
-          Generate {selectedReports.length > 0 && `(${selectedReports.length})`}
-        </Button>
+          <Button
+            onClick={handleGenerateReports}
+            className="bg-gradient-to-r from-blue-600 to-cyan-600"
+            disabled={selectedReports.length === 0}
+          >
+            <Download className="size-4 mr-2" />
+            Generate {selectedReports.length > 0 && `(${selectedReports.length})`}
+          </Button>
+          {featureFlags.export_to_quickbooks && (
+            <Button
+              onClick={async () => {
+                const txRes = await svc.transactions.getAll({ pageSize: 1000 });
+                const txList = txRes.success && txRes.data?.items ? txRes.data.items : [];
+                exportToQuickBooks(txList, `quickbooks-export-${dateFrom}-to-${dateTo}`, 'iif');
+                toast.success('Exported ledger in QuickBooks (.IIF) format');
+              }}
+              className="bg-emerald-600 hover:bg-emerald-500 text-white ml-2"
+            >
+              <FileSpreadsheet className="size-4 mr-2" />
+              Export to QuickBooks
+            </Button>
+          )}
       </div>
 
       {/* Export Configuration */}

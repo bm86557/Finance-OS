@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useAuth } from '../../../contexts/AuthContext';
+import { useAuth } from '@/contexts/AuthContext';
 import { PlatformLayout } from './PlatformLayout';
 import { PlatformHome } from './PlatformHome';
 import { OrganizationsView } from './OrganizationsView';
@@ -15,7 +15,7 @@ export function PlatformDashboard() {
   const renderView = () => {
     switch (currentView) {
       case 'home':
-        return <PlatformHome />;
+        return <PlatformHome onNavigate={(v) => setCurrentView(v as PlatformView)} />;
       case 'organizations':
         return <OrganizationsView />;
       case 'plans':
@@ -23,12 +23,12 @@ export function PlatformDashboard() {
       case 'settings':
         return <PlatformSettingsView />;
       default:
-        return <PlatformHome />;
+        return <PlatformHome onNavigate={(v) => setCurrentView(v as PlatformView)} />;
     }
   };
 
   return (
-    <PlatformLayout currentView={currentView} onViewChange={setCurrentView}>
+    <PlatformLayout currentView={currentView} onViewChange={(v) => setCurrentView(v as PlatformView)}>
       {renderView()}
     </PlatformLayout>
   );

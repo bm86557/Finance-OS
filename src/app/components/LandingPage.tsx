@@ -67,7 +67,7 @@ export function LandingPage() {
       glowColor: 'rgba(236, 72, 153, 0.3)',
       path: '/login/bing',
       credentials: [
-        { email: 'Any of the above', role: 'Auto-detect' },
+        { email: 'admin@financeos.com', role: 'Platform Admin' },
       ],
       password: 'demo',
     },

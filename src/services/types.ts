@@ -12,7 +12,7 @@
 // Domain Entity Types (moved from mockDatabase.ts)
 // ═══════════════════════════════════════════════════════════════════════════
 
-export type UserRole = 'owner' | 'admin' | 'viewer' | 'employee';
+export type UserRole = 'owner' | 'admin' | 'viewer' | 'employee' | 'accountant' | 'manager';
 export type PlatformRole = 'platform_admin' | 'platform_manager' | 'organization_user';
 
 export interface Organization {
@@ -22,11 +22,41 @@ export interface Organization {
   name: string;
   logo?: string;
   currency: string;
+  baseCurrency?: string;
   fiscalYearStart: string; // MM-DD format
+  taxId?: string;
+  defaultTaxRate?: number;
+  accountingBasis?: 'cash' | 'accrual';
+  settingsVersion?: number;
   createdAt: string;
   settings: {
     theme: string;
     notifications: boolean;
+    enabledCurrencies?: string[];
+    timezone?: string;
+    dateFormat?: string;
+    accountingBasis?: 'cash' | 'accrual';
+    defaultTaxRate?: number;
+    taxRegistrationNumber?: string;
+    teamSettings?: {
+      requireApproval?: boolean;
+      allowComments?: boolean;
+      activityNotify?: boolean;
+    };
+    notificationPreferences?: {
+      email?: boolean;
+      transactionAlerts?: boolean;
+      budgetAlerts?: boolean;
+      reportAlerts?: boolean;
+    };
+    whiteLabel?: {
+      brandName?: string;
+      subtitle?: string;
+      hideDefaultBranding?: boolean;
+    };
+    features?: Record<string, boolean>;
+    limits?: any;
+    [key: string]: any;
   };
 }
 
@@ -38,10 +68,10 @@ export interface User {
   role: PlatformRole; // Platform-level role
   createdAt: string;
   /**
-   * Server-only bcrypt hash. Must NEVER reach the client — every response that includes a User
-   * strips this via `server/lib/serialize.ts`'s `toPublicUser`/`toPublicUsers`. Optional so mock
-   * data and any code constructing a `User` without a hash still compiles; the server backfills
-   * it once via `server/lib/seedPasswords.ts`.
+   * @deprecated Legacy field. Passwords now live exclusively in Supabase Auth and no route reads
+   * or writes a local hash — the local bcrypt flow (server/lib/passwords.ts) has been deleted.
+   * Kept on the type only so existing mock/bundle payloads still compile during the store
+   * migration; safe to remove once those payloads are gone.
    */
   passwordHash?: string;
 }
@@ -50,6 +80,10 @@ export interface OrganizationMember {
   userId: string;
   organizationId: string;
   role: UserRole;
+  portalType?: 'organization_admin' | 'employee' | 'platform_admin' | 'ai_assistant';
+  status?: 'active' | 'pending' | 'rejected';
+  /** Team/department label. Mirrors the `organization_members.department` column. */
+  department?: string;
   joinedAt: string;
 }
 
@@ -73,9 +107,10 @@ export interface BankAccount {
   accountId: string; // Links to Chart of Accounts
   bankName: string;
   accountNumber: string;
-  accountType: 'checking' | 'savings' | 'credit_card' | 'line_of_credit' | 'cash' | 'online_wallet';
+  accountType: 'checking' | 'savings' | 'credit_card' | 'line_of_credit' | 'cash' | 'online_wallet' | 'debit_card' | 'prepaid_card';
   currency: string;
   balance: number;
+  openingBalance?: number;
   lastSyncedAt?: string;
   isActive: boolean;
   iban?: string;
@@ -105,6 +140,19 @@ export interface Transaction {
   createdAt: string;
   classifiedAt?: string;
   classifiedBy?: string; // user or 'auto'
+  idempotencyKey?: string;
+  originalAmount?: number;
+  originalCurrency?: string;
+  fxRateToBase?: number;
+  baseCurrency?: string;
+  sourceImportId?: string; // Link to import_history_records
+  sourceFileName?: string; // Cached from import_history_records
+  sourceFileType?: string; // 'csv' | 'pdf'
+  sourceImportedAt?: string; // When the file was imported
+  // AI classification tracking
+  suggestedCategoryId?: string; // What AI originally suggested
+  suggestedConfidence?: number; // AI's original confidence score
+  aiReasoning?: string; // Why AI suggested this category
 }
 
 export interface Category {
@@ -128,6 +176,8 @@ export interface Department {
   headId?: string; // User ID of department head
   costCenter: string;
   isActive: boolean;
+  squareFootage?: number;
+  customWeight?: number;
 }
 
 export interface Project {
@@ -143,6 +193,26 @@ export interface Project {
   quotedAmount: number;
   actualCost: number;
   currency: string;
+  initialBaselineCost?: number;
+  committedRemainingWork?: number;
+}
+
+export interface ProjectTask {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  title: string;
+  description?: string;
+  status: 'todo' | 'in_progress' | 'completed' | 'blocked';
+  assignedTo?: string;
+  assignedToName?: string;
+  startDate?: string;
+  estimatedHours?: number;
+  loggedHours?: number;
+  priority?: 'low' | 'medium' | 'high' | 'urgent';
+  dueDate?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface Asset {
@@ -219,13 +289,36 @@ export interface OverheadAllocation {
   id: string;
   organizationId: string;
   name: string;
-  allocationBase: 'revenue' | 'headcount' | 'direct_cost' | 'equal';
+  allocationBase: 'revenue' | 'headcount' | 'direct_cost' | 'equal' | 'custom';
   accountIds: string[]; // Overhead expense accounts to allocate
   departments: {
     departmentId: string;
     percentage: number;
   }[];
+  amount?: number; // Optional monthly pool amount
 }
+
+export interface CommissionStructure {
+  id: string;
+  organizationId: string;
+  companyName: string;
+  country?: string;
+  currency: string;
+  yourProfitPercentage: number;
+  middlemanPercentage: number;
+  exchangeRateToPKR?: number;
+  createdAt?: string;
+}
+
+export interface ExchangeRate {
+  id?: string;
+  base: string;
+  quote: string;
+  rate: number;
+  asOf: string;
+  source?: string;
+}
+
 
 export interface RecurringTransaction {
   id: string;
@@ -246,6 +339,8 @@ export interface RecurringTransaction {
   /** When both are set, list UI can show real run progress (e.g. posted vs cap). */
   generatedOccurrenceCount?: number;
   totalOccurrencesExpected?: number;
+  /** Whether this recurring transaction has been paid for the current period (month/week/etc) */
+  isPaidForCurrentPeriod?: boolean;
 }
 
 export interface Budget {
@@ -258,10 +353,20 @@ export interface Budget {
   categoryId?: string;
   departmentId?: string;
   projectId?: string;
+  clientId?: string;
   budgetedAmount: number;
   spentAmount: number;
   currency: string;
-  status: 'active' | 'exceeded' | 'completed';
+  status: 'active' | 'exceeded' | 'completed' | 'on-track' | 'warning';
+  lifecycleStatus?: 'draft' | 'active' | 'archived' | 'rolled_over' | 'versioned';
+  version?: number;
+  isCurrent?: boolean;
+  parentBudgetId?: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  rolledFromId?: string;
+  alertThreshold?: number;
+  scope?: 'business' | 'personal';
 }
 
 /** Org-scoped loan / liability record (receivable or payable). */
@@ -354,10 +459,87 @@ export interface EmployeeExpense {
   status: 'draft' | 'submitted' | 'approved' | 'rejected' | 'reimbursed';
   receiptUrl?: string;
   notes?: string;
+  rejectionReason?: string;
   projectId?: string;
   submittedAt?: string;
   reviewedBy?: string;
   reviewedAt?: string;
+  reimbursedAt?: string;
+  settlementTransactionId?: string;
+}
+
+export type EmployeeSessionTimeout = '15 minutes' | '30 minutes' | '1 hour' | '4 hours' | '8 hours';
+
+export interface EmployeeNotificationPreferences {
+  emailNotifications: boolean;
+  expenseApprovals: boolean;
+  timesheetReminders: boolean;
+  projectUpdates: boolean;
+  companyAnnouncements: boolean;
+}
+
+export interface EmployeeSecuritySettings {
+  twoFactorEnabled: boolean;
+  sessionTimeout: EmployeeSessionTimeout;
+}
+
+export interface EmployeeUserSettings {
+  userId: string;
+  organizationId: string;
+  profile: {
+    fullName: string;
+    email: string;
+    phone?: string;
+    department?: string;
+    position?: string;
+    role?: string;
+    avatarUrl?: string;
+  };
+  notifications: EmployeeNotificationPreferences;
+  security: EmployeeSecuritySettings;
+  updatedAt?: string;
+}
+
+export interface EmployeeSalaryHistory {
+  id: string;
+  organizationId: string;
+  userId: string;
+  fixedSalary: number;
+  effectiveDate: string;
+  reason?: string;
+  createdBy?: string;
+  createdAt: string;
+}
+
+export interface EmployeeCompensationOverview {
+  userId: string;
+  name: string;
+  email?: string;
+  role: string;
+  position?: string;
+  departmentId?: string;
+  departmentName?: string;
+  fixedSalary: number;
+  loggedHoursMonth: number;
+  totalLoggedHours: number;
+}
+
+export interface EmployeePayrollBatch {
+  id: string;
+  organizationId: string;
+  period: string;
+  status: 'draft' | 'approved' | 'disbursed';
+  totalGross: number;
+  totalNet: number;
+  employeeCount: number;
+  createdAt: string;
+}
+
+export interface EmployeeSalaryAdjustmentInput {
+  userId: string;
+  fixedSalary: number;
+  effectiveDate: string;
+  reason?: string;
 }
 
 export interface EmployeePayslip {
@@ -395,7 +577,8 @@ export interface EmployeeTeamMember {
   department: string;
   avatar?: string;
   joinedAt: string;
-  status: 'active' | 'away' | 'offline';
+  status: 'active' | 'away' | 'offline' | 'pending' | 'rejected';
+  isPending?: boolean;
 }
 
 export interface CompanyAnnouncement {
@@ -518,10 +701,20 @@ export interface DepartmentProfitability {
   totalHours: number;
   /** Hours spent on billable/client work */
   billableHours: number;
-  /** billableHours / totalHours × 100 */
-  utilization: number;
-  /** directCosts / totalHours — effective cost rate per hour */
+  /** billableHours / totalHours × 100 — null when no timesheet data */
+  utilization: number | null;
+  /** (directCosts + allocatedOverhead) / billableHours (or totalHours if no timesheets) */
   costPerHour: number;
+  /** Monthly approved department budget */
+  budget?: number;
+  /** Direct costs + allocated overhead spent against budget */
+  budgetSpent?: number;
+  /** Remaining available budget this period */
+  budgetRemaining?: number;
+  /** Percentage of budget utilized */
+  budgetUtilization?: number;
+  /** Budgeted standard capacity hourly rate */
+  standardRate?: number;
 }
 
 export interface ProjectProfitability {
@@ -530,10 +723,41 @@ export interface ProjectProfitability {
   clientName: string;
   quotedAmount: number;
   actualCost: number;
+  revenue?: number; // sum of credits
   profit: number;
   profitMargin: number;
   status: string;
   budgetVariance: number; // percentage over/under
+  directCost?: number;
+  laborCost?: number;
+  loggedHours?: number;
+  contributorCount?: number;
+}
+
+export interface SquareFootProfitability {
+  departmentId: string;
+  departmentName: string;
+  squareFootage: number;
+  revenue: number;
+  cost: number;
+  profit: number;
+  revPerSqft: number;
+  costPerSqft: number;
+  profitPerSqft: number;
+  spaceSharePct: number;
+}
+
+export interface ProjectDetails {
+  project: Project;
+  income: Transaction[];
+  expenses: Transaction[];
+  summary: {
+    totalRevenue: number;
+    totalCosts: number;
+    netProfit: number;
+    varianceAmount: number;  // actualCost - quotedAmount
+    variancePct: number;     // ((actualCost - quotedAmount) / quotedAmount) * 100
+  };
 }
 
 // Bulk operation result
@@ -570,6 +794,7 @@ export interface ImportResult {
 /** Single import history entry — enriched with classification stats */
 export interface ImportHistoryRecord {
   id: string;
+  organizationId?: string;
   fileName: string;
   importedAt: string;
   transactionCount: number;
@@ -582,6 +807,14 @@ export interface ImportHistoryRecord {
   needsReview: number;
   /** Number of duplicate transactions detected */
   duplicatesFound: number;
+  fileType?: 'csv' | 'pdf';
+  fileSize?: number;
+  fileContent?: string;
+  bankAccountId?: string;
+  /** Time-limited signed URL for the original statement in Supabase Storage */
+  fileUrl?: string;
+  /** Storage object path: `{orgId}/{timestamp}_{fileName}` */
+  filePath?: string;
 }
 
 /** Optional per-org AI provider settings (see aiSettingsService — browser storage for demo) */
