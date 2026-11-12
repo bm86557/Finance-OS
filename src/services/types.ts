@@ -156,6 +156,32 @@ export interface Transaction {
   suggestedCategoryId?: string; // What AI originally suggested
   suggestedConfidence?: number; // AI's original confidence score
   aiReasoning?: string; // Why AI suggested this category
+  valueDate?: string;
+  isTransfer?: boolean;
+  worldScope?: string;
+  originalNarration?: string;
+  normalizedNarration?: string;
+  source?: string;
+  counterpartyId?: string;
+  clientId?: string;
+  costCenterId?: string;
+  baseAmount?: number;
+  transferGroupId?: string;
+  classificationResultId?: string;
+  approvalRequestId?: string;
+  journalEntryId?: string;
+  postedJournalId?: string;
+  sourceImportRowId?: string;
+  reversalOfTransactionId?: string;
+  reversedByTransactionId?: string;
+  version?: number;
+  correctionReason?: string;
+  ownerUserId?: string;
+  createdBy?: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  postedAt?: string;
+  updatedAt?: string;
 }
 
 export interface Category {
@@ -239,6 +265,15 @@ export interface Asset {
   disposalAmount?: number;
   departmentId?: string;
   locationDetails?: string;
+  purchasePaymentMethod?: string;
+  purchaseBankAccountId?: string;
+  purchaseTransactionId?: string;
+  placedInServiceDate?: string;
+  costBasis?: number;
+  taxDepreciationMethod?: string;
+  taxUsefulLifeYears?: number;
+  accumulatedTaxDepreciation?: number;
+  gainLossOnDisposal?: number;
 }
 
 export interface DepreciationSchedule {
@@ -251,6 +286,7 @@ export interface DepreciationSchedule {
   closingValue: number;
   status: 'scheduled' | 'posted' | 'reversed';
   journalEntryId?: string;
+  postedAt?: string;
 }
 
 export interface InventoryItem {
@@ -278,7 +314,7 @@ export interface InventoryTransaction {
   organizationId: string;
   inventoryItemId: string;
   date: string;
-  type: 'purchase' | 'sale' | 'adjustment' | 'transfer';
+  type: 'purchase' | 'sale' | 'adjustment' | 'transfer' | 'write_off';
   quantity: number;
   unitCost: number;
   totalAmount: number;
@@ -299,6 +335,8 @@ export interface OverheadAllocation {
     percentage: number;
   }[];
   amount?: number; // Optional monthly pool amount
+  policyVersion?: number;
+  isOperating?: boolean;
 }
 
 export interface CommissionStructure {
@@ -403,6 +441,11 @@ export interface Loan {
   nextPaymentDate?: string;
   paymentsCount?: number;
   paymentsCompleted?: number;
+  termMonths?: number;
+  rateType?: 'fixed' | 'floating' | string;
+  lastPaymentDate?: string;
+  lastPaymentMonth?: string;
+  accruedInterest?: number;
 }
 
 export interface CashFlowForecast {
@@ -642,6 +685,18 @@ export interface TransactionFilters extends PaginationParams, DateRangeFilter {
   minAmount?: number;
   maxAmount?: number;
   tags?: string[];
+  counterpartyId?: string;
+  clientId?: string;
+  costCenterId?: string;
+  source?: string;
+  sourceImportId?: string;
+  worldScope?: string;
+  currency?: string;
+  createdBy?: string;
+  valueDateFrom?: string;
+  valueDateTo?: string;
+  minConfidence?: number;
+  maxConfidence?: number;
 }
 
 // Dashboard summary types

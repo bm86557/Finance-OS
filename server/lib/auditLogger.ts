@@ -28,11 +28,13 @@ export interface AuditLogEntry {
 }
 
 export interface WriteAuditParams {
-  organizationId: string;
+  organizationId?: string;
   action: string;
-  entityType: string;
-  entityId?: string;
-  description: string;
+  entityType?: string;
+  entity?: string;
+  entityId?: string | string[];
+  description?: string;
+  details?: Record<string, unknown>;
   beforeState?: Record<string, unknown> | null;
   afterState?: Record<string, unknown> | null;
   metadata?: Record<string, unknown>;
@@ -77,20 +79,23 @@ export async function logAuditEvent(req: Request | null, params: WriteAuditParam
   }
 
   const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId);
+  const entityIdVal = Array.isArray(params.entityId) ? params.entityId[0] : (params.entityId ?? '');
+  const orgIdVal = params.organizationId || (membership as any)?.organizationId || (user as any)?.organizationId || '';
   const { error } = await sb.from('audit_logs').insert({
-    organization_id: params.organizationId,
+    organization_id: orgIdVal,
     actor_user_id: isUuid ? userId : null,
     actor_email: user?.email || userName,
     actor_role: userRole,
     is_support_session: isSupportSession,
     action: params.action,
-    entity_type: params.entityType,
-    entity_id: params.entityId ?? '',
-    description: params.description,
+    entity_type: params.entityType || params.entity || 'general',
+    entity_id: entityIdVal,
+    description: params.description || `${params.action} ${params.entity || params.entityType || 'record'}`,
     before_state: params.beforeState ?? null,
     after_state: params.afterState ?? null,
     metadata: {
       ...(params.metadata ?? {}),
+      ...(params.details ? { details: params.details } : {}),
       ...(changes ? { changes } : {}),
       actor_name: userName,
     },
