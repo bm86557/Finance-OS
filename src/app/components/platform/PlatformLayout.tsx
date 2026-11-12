@@ -1,10 +1,11 @@
 import { ReactNode } from 'react';
+import { useNavigate } from 'react-router';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '../ui/button';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { 
   Building2, LayoutDashboard, CreditCard, Settings, LogOut, User, 
-  Cpu, Radio, Brain, ChevronRight, Shield, Activity
+  Cpu, Radio, Brain, ChevronRight, Shield, Activity, ArrowRight
 } from 'lucide-react';
 import { cn } from '../ui/utils';
 
@@ -16,6 +17,7 @@ interface PlatformLayoutProps {
 
 export function PlatformLayout({ children, currentView, onViewChange }: PlatformLayoutProps) {
   const { user, logout } = useAuth();
+  const navigate = useNavigate();
 
   const navItems = [
     { id: 'home', label: 'Dashboard', icon: LayoutDashboard },
@@ -149,18 +151,25 @@ export function PlatformLayout({ children, currentView, onViewChange }: Platform
             ))}
           </nav>
 
-          {/* Footer */}
+          {/* Footer - Standalone AI Portal Launcher */}
           <div className="p-4" style={{ borderTop: '1px solid rgba(168, 85, 247, 0.15)' }}>
-            <div className="p-3 rounded-lg" style={{
-              background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.1), rgba(236, 72, 153, 0.1))',
-              border: '1px solid rgba(168, 85, 247, 0.2)',
-            }}>
-              <div className="flex items-center gap-2 mb-2">
-                <Brain className="size-4 text-purple-400" />
-                <span className="text-xs text-purple-400 font-mono">AI ENGINE</span>
+            <button
+              onClick={() => navigate('/ai-portal')}
+              className="w-full p-3 rounded-lg text-left transition-all hover:border-pink-500/50 group cursor-pointer"
+              style={{
+                background: 'linear-gradient(135deg, rgba(236, 72, 153, 0.15), rgba(168, 85, 247, 0.15))',
+                border: '1px solid rgba(236, 72, 153, 0.3)',
+              }}
+            >
+              <div className="flex items-center justify-between mb-1">
+                <div className="flex items-center gap-2">
+                  <Brain className="size-4 text-pink-400 group-hover:rotate-12 transition-transform" />
+                  <span className="text-xs text-pink-300 font-mono font-bold">AI COMMAND PORTAL</span>
+                </div>
+                <ArrowRight className="size-3.5 text-pink-400 group-hover:translate-x-1 transition-transform" />
               </div>
-              <p className="text-xs text-slate-400 font-mono">Neural Network Active</p>
-            </div>
+              <p className="text-[10px] text-slate-400 font-mono">Launch Standalone 4th Portal</p>
+            </button>
           </div>
         </div>
 

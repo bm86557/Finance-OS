@@ -48,6 +48,50 @@ const CHAT_QUICK_PROMPTS = [
 const CHAT_INPUT_MAX = 4000;
 const CHAT_SOFT_WARN = 2000;
 
+function renderFormattedContent(content: string) {
+  const lines = content.split('\n');
+  return lines.map((line, idx) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return <div key={idx} className="h-2" />;
+    }
+    const isHeader4 = trimmed.startsWith('#### ');
+    const isHeader3 = trimmed.startsWith('### ');
+    const isHeader2 = trimmed.startsWith('## ');
+    const isHeader1 = trimmed.startsWith('# ');
+    const isBullet = trimmed.startsWith('* ') || trimmed.startsWith('- ') || /^\d+\.\s/.test(trimmed);
+
+    if (isHeader1 || isHeader2) {
+      const text = trimmed.replace(/^#+\s*/, '');
+      return (
+        <h3 key={idx} className="font-bold text-white text-base mt-3 mb-1.5 border-b border-slate-700/50 pb-1">
+          {text}
+        </h3>
+      );
+    }
+    if (isHeader3 || isHeader4) {
+      const text = trimmed.replace(/^#+\s*/, '');
+      return (
+        <h4 key={idx} className="font-semibold text-purple-300 text-sm mt-2.5 mb-1">
+          {text}
+        </h4>
+      );
+    }
+
+    const parts = trimmed.split(/(\*\*[^*]+\*\*)/g);
+    return (
+      <p key={idx} className={`text-sm leading-relaxed ${isBullet ? 'pl-3 text-slate-200 my-1' : 'my-1 text-slate-300'}`}>
+        {parts.map((part, pIdx) => {
+          if (part.startsWith('**') && part.endsWith('**')) {
+            return <strong key={pIdx} className="font-semibold text-white">{part.slice(2, -2)}</strong>;
+          }
+          return part;
+        })}
+      </p>
+    );
+  });
+}
+
 export function AIFinancialAssistant() {
   const { orgId } = useOrgServices();
   const [aiSettings, setAiSettings] = useState<ExtendedOrgAiSettings | null>(null);
@@ -296,10 +340,10 @@ export function AIFinancialAssistant() {
                 <div
                   className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${m.role === 'user'
                     ? 'bg-purple-600/35 text-white ring-1 ring-purple-400/30'
-                    : 'border border-slate-600/80 bg-slate-900/80 text-slate-100'
+                    : 'border border-slate-600/80 bg-slate-900/80 text-slate-100 whitespace-pre-wrap'
                     }`}
                 >
-                  {m.content}
+                  {m.role === 'user' ? m.content : renderFormattedContent(m.content)}
                   {m.role === 'assistant' && m.suggestions && m.suggestions.length > 0 && (
                     <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-600/50 pt-3">
                       {m.suggestions.map((s) => (

@@ -58,18 +58,18 @@ export function LandingPage() {
     },
     {
       id: 'bing',
-      title: 'AI Assistant',
-      subtitle: 'AI-Powered Access',
-      description: 'Intelligent authentication with natural language commands and smart routing',
+      title: 'AI Command Portal',
+      subtitle: 'Global AI Control Tower',
+      description: 'Centralized model gateway, token metering, cost-margin telemetry, and air-gap privacy vault',
       icon: Sparkles,
       color: 'pink',
-      gradient: 'from-pink-500 via-rose-400 to-orange-500',
+      gradient: 'from-pink-500 via-rose-400 to-purple-500',
       glowColor: 'rgba(236, 72, 153, 0.3)',
       path: '/login/bing',
       credentials: [
-        { email: 'admin@financeos.com', role: 'Platform Admin' },
+        { email: 'Platform Admin Account', role: 'Super Admin' },
       ],
-      password: 'demo',
+      password: '',
     },
   ];
 
@@ -230,7 +230,11 @@ export function LandingPage() {
                 <div className={`p-3 rounded-lg mb-4 ${theme === 'dark' ? 'bg-black/30' : 'bg-slate-50'}`} style={{
                   border: theme === 'dark' ? `1px solid ${loginType.glowColor}` : '1px solid rgba(0,0,0,0.1)',
                 }}>
-                  <p className="text-[10px] text-slate-500 font-mono mb-2">DEMO ACCOUNTS:</p>
+                  {loginType.id === 'bing' ? (
+                    <p className="text-[10px] text-pink-400 font-mono mb-2 font-semibold">AUTHENTICATION REQUIREMENT:</p>
+                  ) : (
+                    <p className="text-[10px] text-slate-500 font-mono mb-2">DEMO ACCOUNTS:</p>
+                  )}
                   {loginType.credentials.map((cred, ci) => (
                     <div key={ci} className="flex items-center justify-between mb-1 last:mb-0">
                       <span className={`text-[11px] font-mono ${theme === 'dark' ? 'text-slate-300' : 'text-slate-700'} truncate flex-1`}>{cred.email}</span>
@@ -238,7 +242,11 @@ export function LandingPage() {
                     </div>
                   ))}
                   <div className="mt-1.5 pt-1.5" style={{ borderTop: theme === 'dark' ? '1px solid rgba(148,163,184,0.1)' : '1px solid rgba(0,0,0,0.05)' }}>
-                    <span className="text-[10px] text-slate-500 font-mono">One-click sign-in on the next screen — no password needed</span>
+                    {loginType.id === 'bing' ? (
+                      <span className="text-[10px] text-pink-400/80 font-mono">Sign in with your platform administrator credentials</span>
+                    ) : (
+                      <span className="text-[10px] text-slate-500 font-mono">One-click sign-in on the next screen — no password needed</span>
+                    )}
                   </div>
                 </div>
 

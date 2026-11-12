@@ -153,6 +153,7 @@ export function PlansView() {
                   {[
                     { label: 'Users', value: plan.limits?.users ?? 5 },
                     { label: 'Statements/month', value: plan.limits?.statements ?? 100 },
+                    { label: 'AI credits/month', value: plan.limits?.ai_credits ?? (plan.slug === 'enterprise' ? 2500 : plan.slug === 'professional' ? 500 : 100) },
                     { label: 'Currencies', value: plan.limits?.currencies ?? 2 },
                     { label: 'Storage', value: `${plan.limits?.storage ?? 2048} MB` },
                   ].map((limit) => (

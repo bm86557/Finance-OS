@@ -67,6 +67,7 @@ import { Router, type Request, type Response } from 'express';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { getGlobalPlatformSettings } from './platformSettings.js';
+import { convertCurrency } from '../lib/fxConverter.js';
 import type { ServiceResponse } from '../../src/services/types.js';
 
 interface WhatIfScenario {
@@ -165,6 +166,128 @@ export function createSimulatorRouter(): Router {
     next();
   });
 
+  async function computeLiveOrgBaseline(sb: any, orgId: string): Promise<(SimulatorBaseline & { liquidCash: number }) | null> {
+    try {
+      const { data: orgRow } = await sb
+        .from('organizations')
+        .select('currency, base_currency')
+        .eq('id', orgId)
+        .maybeSingle();
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
+
+      // 1. Live liquid cash from active bank accounts
+      const { data: bankAccounts } = await sb
+        .from('bank_accounts')
+        .select('id, balance, currency, type, is_active')
+        .eq('organization_id', orgId)
+        .eq('is_active', true);
+
+      let liquidCash = 0;
+      for (const b of (bankAccounts || [])) {
+        const bBal = Number(b.balance ?? 0);
+        const bCurr = String(b.currency || orgCurrency).toUpperCase();
+        liquidCash += convertCurrency(bBal, bCurr, orgCurrency);
+      }
+
+      // 2. Trailing 90 days of transactions
+      const now = new Date();
+      const ninetyDaysAgo = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+      const { data: txns } = await sb
+        .from('transactions')
+        .select('amount, type, currency, is_transfer, transfer_group_id, tags, category_id, description, narration, date')
+        .eq('organization_id', orgId)
+        .gte('date', ninetyDaysAgo);
+
+      let total90dIncome = 0;
+      let total90dExpense = 0;
+      let validTxnCount = 0;
+
+      for (const t of (txns || [])) {
+        // Exclude internal transfers and loan principal repayments (§14, §15, §33 Invariant 8)
+        const tags: string[] = Array.isArray(t.tags) ? t.tags.map(String) : [];
+        const isTransfer = Boolean(t.is_transfer || t.transfer_group_id || tags.includes('transfer'));
+        const desc = String(t.description || '').toLowerCase();
+        const narr = String(t.narration || '').toLowerCase();
+        const isLoanPrincipal = tags.includes('loan_principal') || desc.includes('principal repayment') || narr.includes('principal repayment');
+
+        if (isTransfer || isLoanPrincipal) continue;
+
+        const rawAmt = Number(t.amount || 0);
+        const rawCurr = String(t.currency || orgCurrency).toUpperCase();
+        const converted = convertCurrency(rawAmt, rawCurr, orgCurrency);
+
+        if (t.type === 'income') {
+          total90dIncome += converted;
+          validTxnCount++;
+        } else if (t.type === 'expense') {
+          total90dExpense += converted;
+          validTxnCount++;
+        }
+      }
+
+      // 3. Current active team and average salary
+      const { data: members } = await sb
+        .from('organization_members')
+        .select('fixed_salary, salary_currency')
+        .eq('organization_id', orgId)
+        .neq('status', 'suspended');
+
+      const currentTeam = members?.length || 0;
+      let totalSalary = 0;
+      let salariedCount = 0;
+      for (const m of (members || [])) {
+        const sal = Number(m.fixed_salary || 0);
+        if (sal > 0) {
+          salariedCount++;
+          const sCurr = String(m.salary_currency || orgCurrency).toUpperCase();
+          totalSalary += convertCurrency(sal, sCurr, orgCurrency);
+        }
+      }
+      const avgSalary = salariedCount > 0 ? Math.round(totalSalary / salariedCount) : 0;
+
+      // 4. Utilization rate from trailing 90d timesheets
+      const { data: tsEntries } = await sb
+        .from('timesheet_entries')
+        .select('hours, billable')
+        .eq('organization_id', orgId)
+        .gte('date', ninetyDaysAgo);
+
+      let totalHours = 0;
+      let billableHours = 0;
+      for (const te of (tsEntries || [])) {
+        const h = Number(te.hours || 0);
+        totalHours += h;
+        if (te.billable !== false) billableHours += h;
+      }
+      const utilizationRate = totalHours > 0 ? Math.round((billableHours / totalHours) * 100) : 75;
+
+      const monthlyRevenue = Math.round(total90dIncome / 3);
+      const monthlyExpense = Math.round(total90dExpense / 3);
+      const hasSufficientHistory = validTxnCount >= 3;
+
+      return {
+        monthlyRevenue,
+        monthlyExpense,
+        currentTeam: currentTeam || 1,
+        avgSalary,
+        utilizationRate,
+        liquidCash: Math.round(liquidCash),
+        historyDays: 90,
+        hasSufficientHistory,
+        currency: orgCurrency,
+        thresholds: {
+          healthy_margin_pct: 30,
+          minimum_margin_pct: 20,
+          good_revenue_per_head: currentTeam > 0 ? Math.round(monthlyRevenue / currentTeam) : 140000,
+        },
+      };
+    } catch (err) {
+      console.warn('[simulator.computeLiveOrgBaseline] Error computing live baseline:', err);
+      return null;
+    }
+  }
+
   /**
    * GET /organizations/:organizationId/simulator/baseline
    * Returns real baseline metrics from actual org data
@@ -175,18 +298,35 @@ export function createSimulatorRouter(): Router {
     const selectedSnapshot = APPROVED_SNAPSHOTS[snapshotParam] || APPROVED_SNAPSHOTS['live_90d'];
     const sb = getSupabaseAdminClient();
 
+    let orgCurrency = 'USD';
+    if (sb) {
+      try {
+        const { data: orgRow } = await sb
+          .from('organizations')
+          .select('currency, base_currency')
+          .eq('id', orgId)
+          .maybeSingle();
+        if (orgRow) {
+          orgCurrency = String(orgRow.base_currency || orgRow.currency || 'USD').toUpperCase().trim();
+        }
+      } catch {
+        /* fallback to default */
+      }
+    }
+
     if (snapshotParam !== 'live_90d') {
-      // Return specific approved historical snapshot requested (§14)
+      // Return specific approved historical snapshot requested (§14), converted to org base currency
+      const scaleToOrg = (amt: number) => Math.round(convertCurrency(amt, 'PKR', orgCurrency));
       return ok(res, {
-        monthlyRevenue: selectedSnapshot.monthlyRevenue,
-        monthlyExpense: selectedSnapshot.monthlyExpense,
+        monthlyRevenue: scaleToOrg(selectedSnapshot.monthlyRevenue),
+        monthlyExpense: scaleToOrg(selectedSnapshot.monthlyExpense),
         currentTeam: selectedSnapshot.currentTeam,
-        avgSalary: selectedSnapshot.avgSalary,
+        avgSalary: scaleToOrg(selectedSnapshot.avgSalary),
         utilizationRate: selectedSnapshot.utilizationRate,
-        liquidCash: selectedSnapshot.liquidCash,
+        liquidCash: scaleToOrg(selectedSnapshot.liquidCash),
         historyDays: 90,
         hasSufficientHistory: true,
-        currency: 'PKR',
+        currency: orgCurrency,
         snapshotId: selectedSnapshot.id,
         snapshotName: selectedSnapshot.name,
         snapshotDescription: selectedSnapshot.description,
@@ -198,19 +338,50 @@ export function createSimulatorRouter(): Router {
         thresholds: {
           healthy_margin_pct: 30,
           minimum_margin_pct: 20,
-          good_revenue_per_head: 140000,
+          good_revenue_per_head: scaleToOrg(140000),
         },
       });
     }
 
     if (sb) {
       try {
+        // 1. Try computeLiveOrgBaseline directly from actual ledger, bank accounts & members
+        const liveBaseline = await computeLiveOrgBaseline(sb, orgId);
+        if (liveBaseline && liveBaseline.hasSufficientHistory) {
+          return ok(res, {
+            ...liveBaseline,
+            snapshotId: 'live_90d',
+            snapshotName: 'Live Trailing 90-Day Performance',
+            availableSnapshots: Object.values(APPROVED_SNAPSHOTS).map(s => ({
+              id: s.id,
+              name: s.name,
+              description: s.description,
+            })),
+          });
+        }
+
+        // 2. Try stored RPC if present
         const { data, error } = await sb.rpc('simulator_baseline', { p_org: orgId });
         if (!error && data) {
           const baseData = data as SimulatorBaseline;
           return ok(res, {
             ...baseData,
-            liquidCash: 12500000,
+            liquidCash: liveBaseline?.liquidCash ?? Math.round(convertCurrency(12500000, 'PKR', orgCurrency)),
+            currency: orgCurrency,
+            snapshotId: 'live_90d',
+            snapshotName: 'Live Trailing 90-Day Performance',
+            availableSnapshots: Object.values(APPROVED_SNAPSHOTS).map(s => ({
+              id: s.id,
+              name: s.name,
+              description: s.description,
+            })),
+          });
+        }
+
+        // If live baseline computed (even if small history), return it with org currency
+        if (liveBaseline) {
+          return ok(res, {
+            ...liveBaseline,
             snapshotId: 'live_90d',
             snapshotName: 'Live Trailing 90-Day Performance',
             availableSnapshots: Object.values(APPROVED_SNAPSHOTS).map(s => ({
@@ -221,21 +392,22 @@ export function createSimulatorRouter(): Router {
           });
         }
       } catch (err) {
-        console.warn('[simulator.baseline] RPC fallback to snapshot:', err);
+        console.warn('[simulator.baseline] Baseline calculation fallback to snapshot:', err);
       }
     }
 
-    // High fidelity default fallback
+    // High fidelity default fallback scaled to organization base currency
+    const scale = (amt: number) => Math.round(convertCurrency(amt, 'PKR', orgCurrency));
     return ok(res, {
-      monthlyRevenue: selectedSnapshot.monthlyRevenue,
-      monthlyExpense: selectedSnapshot.monthlyExpense,
+      monthlyRevenue: scale(selectedSnapshot.monthlyRevenue),
+      monthlyExpense: scale(selectedSnapshot.monthlyExpense),
       currentTeam: selectedSnapshot.currentTeam,
-      avgSalary: selectedSnapshot.avgSalary,
+      avgSalary: scale(selectedSnapshot.avgSalary),
       utilizationRate: selectedSnapshot.utilizationRate,
-      liquidCash: selectedSnapshot.liquidCash,
+      liquidCash: scale(selectedSnapshot.liquidCash),
       historyDays: 90,
       hasSufficientHistory: true,
-      currency: 'PKR',
+      currency: orgCurrency,
       snapshotId: selectedSnapshot.id,
       snapshotName: selectedSnapshot.name,
       availableSnapshots: Object.values(APPROVED_SNAPSHOTS).map(s => ({
@@ -246,7 +418,7 @@ export function createSimulatorRouter(): Router {
       thresholds: {
         healthy_margin_pct: 30,
         minimum_margin_pct: 20,
-        good_revenue_per_head: 140000,
+        good_revenue_per_head: scale(140000),
       },
     });
   });

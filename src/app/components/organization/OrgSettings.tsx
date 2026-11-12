@@ -202,6 +202,8 @@ export function OrgSettings() {
   );
 
   const { hasPlanFeature, currentPlan, allowedFeatures = [], subscription } = usePlanEntitlements();
+  const isFreeTier = !currentPlan || currentPlan.slug === 'basic' || currentPlan.slug === 'free' || (currentPlan.price ?? 0) === 0;
+  const maxCurrencies = currentPlan?.limits?.currencies ?? 2;
   const cycle = useMemo(() => {
     return calculateSubscriptionCycle(subscription, currentPlan?.price, currentPlan?.slug);
   }, [subscription, currentPlan?.price, currentPlan?.slug]);
@@ -319,21 +321,31 @@ export function OrgSettings() {
       } catch { }
     }
 
-    // Hydrate enabled currencies from global platform currencies
+    // Hydrate enabled currencies considering plan quota and tier allowance (§3.1, §5.1)
+    const isFree = !currentPlan || currentPlan.slug === 'basic' || currentPlan.slug === 'free' || (currentPlan.price ?? 0) === 0;
+    const maxCurrs = currentPlan?.limits?.currencies ?? 2;
+    const allowedTierCodes = isFree ? new Set(['USD', 'PKR']) : new Set(availablePlatformCurrencies.map((c) => c.code));
+
     if (Array.isArray(orgRecord.settings?.enabledCurrencies) && orgRecord.settings.enabledCurrencies.length > 0) {
-      const savedCodes = new Set(orgRecord.settings.enabledCurrencies);
-      savedCodes.add(orgRecord.currency || 'USD');
-      setEnabledCurrencies(availablePlatformCurrencies.filter((c) => savedCodes.has(c.code)));
-    } else {
-      const base = availablePlatformCurrencies.filter((c) => c.enabled);
-      const code = orgRecord.currency || 'USD';
-      if (!base.some((c) => c.code === code)) {
-        const extra = availablePlatformCurrencies.find((c) => c.code === code) || currencies.find((c) => c.code === code);
-        if (extra) base.push(extra);
+      const savedCodes = (orgRecord.settings.enabledCurrencies as string[])
+        .map(c => String(c).toUpperCase().trim())
+        .filter((code: string) => allowedTierCodes.has(code));
+      const orgBaseCode = String(orgRecord.currency || 'USD').toUpperCase().trim();
+      if (allowedTierCodes.has(orgBaseCode) && !savedCodes.includes(orgBaseCode)) {
+        savedCodes.unshift(orgBaseCode);
       }
-      setEnabledCurrencies(base);
+      const finalCodes = (savedCodes.length > 0 ? savedCodes : (isFree ? ['USD', 'PKR'] : ['USD', 'PKR'])).slice(0, maxCurrs);
+      setEnabledCurrencies(availablePlatformCurrencies.filter((c) => finalCodes.includes(c.code)));
+    } else {
+      const defaultCodes = isFree ? ['USD', 'PKR'] : ['USD', 'PKR'];
+      const orgBaseCode = String(orgRecord.currency || 'USD').toUpperCase().trim();
+      if (allowedTierCodes.has(orgBaseCode) && !defaultCodes.includes(orgBaseCode)) {
+        defaultCodes.unshift(orgBaseCode);
+      }
+      const finalCodes = defaultCodes.slice(0, maxCurrs);
+      setEnabledCurrencies(availablePlatformCurrencies.filter((c) => finalCodes.includes(c.code)));
     }
-  }, [orgRecord, globalEnabledCurrencies]);
+  }, [orgRecord, globalEnabledCurrencies, currentPlan]);
 
   const resetFromSaved = useCallback(async () => {
     await refetchOrg();
@@ -349,6 +361,19 @@ export function OrgSettings() {
       toast.error('You do not have permission to change organization settings');
       return;
     }
+
+    if (isFreeTier) {
+      const invalid = enabledCurrencies.filter(c => c.code !== 'USD' && c.code !== 'PKR');
+      if (invalid.length > 0) {
+        toast.error('The Free plan only supports USD and PKR. Please remove premium currencies before saving.');
+        return;
+      }
+    }
+    if (enabledCurrencies.length > maxCurrencies) {
+      toast.error(`Your plan allows a maximum of ${maxCurrencies} currencies. Please remove extra currencies before saving.`);
+      return;
+    }
+
     setSavePending(true);
 
     const featuresMap = features.reduce((acc, f) => {
@@ -423,6 +448,8 @@ export function OrgSettings() {
     emailNotifications,
     features,
     enabledCurrencies,
+    isFreeTier,
+    maxCurrencies,
     timezone,
     dateFormat,
     teamRequireApproval,
@@ -457,13 +484,32 @@ export function OrgSettings() {
   };
 
   const addCurrency = (currency: Currency) => {
+    if (isFreeTier && currency.code !== 'USD' && currency.code !== 'PKR') {
+      toast.error(`The Free Tier plan includes USD and PKR only. Upgrade to Professional to unlock ${currency.code}.`);
+      return;
+    }
+    if (enabledCurrencies.length >= maxCurrencies) {
+      toast.error(`Your ${currentPlan?.name || 'Free'} plan allows a maximum of ${maxCurrencies} currencies. Upgrade to enable more currencies.`);
+      return;
+    }
+    if (enabledCurrencies.some(c => c.code === currency.code)) {
+      return;
+    }
     setEnabledCurrencies([...enabledCurrencies, currency]);
     toast.success(`${currency.code} enabled`);
   };
 
   const removeCurrency = (code: string) => {
+    if (enabledCurrencies.length <= 1) {
+      toast.error('At least one currency must remain enabled.');
+      return;
+    }
+    if (code === defaultCurrency) {
+      toast.error('Cannot remove the default reporting currency. Select a different default currency first.');
+      return;
+    }
     setEnabledCurrencies(enabledCurrencies.filter(c => c.code !== code));
-    toast.success('Currency removed');
+    toast.success(`${code} removed`);
   };
 
   // Department Modal State
@@ -1416,7 +1462,16 @@ export function OrgSettings() {
             </div>
 
             <div>
-              <label className="text-sm text-slate-400 block mb-3">Enabled Currencies</label>
+              <div className="flex items-center justify-between mb-3">
+                <label className="text-sm text-slate-400">
+                  Enabled Currencies ({enabledCurrencies.length} / {maxCurrencies})
+                </label>
+                {isFreeTier && (
+                  <span className="text-xs font-mono px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                    Free Tier: PKR & USD Only (Max {maxCurrencies})
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
                 {enabledCurrencies.map((curr) => (
                   <div
@@ -1428,36 +1483,68 @@ export function OrgSettings() {
                       <p className="text-white font-medium">{curr.code}</p>
                       <p className="text-xs text-slate-400">{curr.name}</p>
                     </div>
-                    <motion.button
-                      whileHover={{ scale: 1.1 }}
-                      whileTap={{ scale: 0.9 }}
-                      onClick={() => removeCurrency(curr.code)}
-                      className="text-red-400"
-                    >
-                      <X className="size-4" />
-                    </motion.button>
+                    {enabledCurrencies.length > 1 && curr.code !== defaultCurrency && (
+                      <motion.button
+                        whileHover={{ scale: 1.1 }}
+                        whileTap={{ scale: 0.9 }}
+                        onClick={() => removeCurrency(curr.code)}
+                        className="text-red-400 hover:text-red-300 transition-colors cursor-pointer"
+                        title={`Remove ${curr.code}`}
+                      >
+                        <X className="size-4" />
+                      </motion.button>
+                    )}
                   </div>
                 ))}
               </div>
 
               <div className="mt-4">
-                <label className="text-sm text-slate-400 block mb-3">
-                  Available Global Currencies (Managed by Platform Settings)
-                </label>
+                <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+                  <label className="text-sm text-slate-400 block">
+                    Available Global Currencies (Managed by Platform Settings)
+                  </label>
+                  {isFreeTier && (
+                    <span className="text-xs text-cyan-400 font-mono">
+                      Upgrade to Professional for EUR, GBP, AED, CAD, AUD, SGD
+                    </span>
+                  )}
+                </div>
                 <div className="flex flex-wrap gap-2">
-                  {availablePlatformCurrencies.filter(c => !enabledCurrencies.find(ec => ec.code === c.code)).map((curr) => (
-                    <motion.button
-                      key={curr.code}
-                      whileHover={{ scale: 1.05 }}
-                      whileTap={{ scale: 0.95 }}
-                      onClick={() => addCurrency(curr)}
-                      className="px-3 py-2 rounded-lg text-sm flex items-center gap-2"
-                      style={AXIOM.buttons.secondary}
-                    >
-                      <Plus className="size-3" />
-                      {curr.code} ({curr.symbol})
-                    </motion.button>
-                  ))}
+                  {availablePlatformCurrencies.filter(c => !enabledCurrencies.find(ec => ec.code === c.code)).map((curr) => {
+                    const isLocked = isFreeTier && curr.code !== 'USD' && curr.code !== 'PKR';
+                    const isQuotaFull = enabledCurrencies.length >= maxCurrencies;
+                    return (
+                      <motion.button
+                        key={curr.code}
+                        whileHover={!isLocked && !isQuotaFull ? { scale: 1.05 } : {}}
+                        whileTap={!isLocked && !isQuotaFull ? { scale: 0.95 } : {}}
+                        onClick={() => addCurrency(curr)}
+                        className={`px-3 py-2 rounded-lg text-sm flex items-center gap-2 transition-all ${
+                          isLocked || isQuotaFull ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:border-cyan-500/50'
+                        }`}
+                        style={AXIOM.buttons.secondary}
+                        title={
+                          isLocked
+                            ? `Upgrade to Professional to unlock ${curr.code}`
+                            : isQuotaFull
+                            ? `Currency limit reached (${maxCurrencies}/${maxCurrencies})`
+                            : `Enable ${curr.code}`
+                        }
+                      >
+                        {isLocked ? (
+                          <Shield className="size-3 text-amber-400" />
+                        ) : (
+                          <Plus className="size-3" />
+                        )}
+                        <span>{curr.code} ({curr.symbol})</span>
+                        {isLocked && (
+                          <span className="text-[10px] uppercase font-mono px-1 rounded bg-amber-500/20 text-amber-300">
+                            Pro
+                          </span>
+                        )}
+                      </motion.button>
+                    );
+                  })}
                 </div>
               </div>
             </div>

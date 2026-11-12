@@ -563,8 +563,56 @@ export function createCostingRouter(): Router {
   // 4. §14 QUOTE SIMULATOR, PRICING & VERSIONING ENGINE
   // ══════════════════════════════════════════════════════════════════════════
 
-  // In-memory persistent cache per organization if table not present in Supabase
+  // In-memory cache synced with Supabase organizations.settings.saved_quotes
   const orgQuotesCache = new Map<string, any[]>();
+
+  async function loadOrgQuotes(sb: any, orgId: string): Promise<any[]> {
+    if (orgQuotesCache.has(orgId)) {
+      return orgQuotesCache.get(orgId) || [];
+    }
+    if (sb) {
+      try {
+        const { data: orgData } = await sb
+          .from('organizations')
+          .select('settings')
+          .eq('id', orgId)
+          .maybeSingle();
+        if (orgData?.settings?.saved_quotes && Array.isArray(orgData.settings.saved_quotes)) {
+          orgQuotesCache.set(orgId, orgData.settings.saved_quotes);
+          return orgData.settings.saved_quotes;
+        }
+      } catch (err) {
+        console.warn('[costing.quotes] Error loading saved_quotes from DB:', err);
+      }
+    }
+    orgQuotesCache.set(orgId, []);
+    return [];
+  }
+
+  async function persistOrgQuotes(sb: any, orgId: string, quotes: any[]): Promise<void> {
+    orgQuotesCache.set(orgId, quotes);
+    if (sb) {
+      try {
+        const { data: orgData } = await sb
+          .from('organizations')
+          .select('settings')
+          .eq('id', orgId)
+          .maybeSingle();
+        const currentSettings = (orgData?.settings && typeof orgData.settings === 'object') ? orgData.settings : {};
+        await sb
+          .from('organizations')
+          .update({
+            settings: {
+              ...currentSettings,
+              saved_quotes: quotes,
+            },
+          })
+          .eq('id', orgId);
+      } catch (err) {
+        console.warn('[costing.quotes] Error saving quotes to DB:', err);
+      }
+    }
+  }
 
   function calculateQuoteFormulas(body: any) {
     const roleEstimates: any[] = Array.isArray(body.roleEstimates) ? body.roleEstimates : [];
@@ -646,89 +694,23 @@ export function createCostingRouter(): Router {
   // GET /quotes - list all quotes with versions
   r.get(['/quotes', '/costing/quotes'], async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
-    const cached = orgQuotesCache.get(orgId);
-    if (cached) {
-      return ok(res, cached);
-    }
-
-    // Default authoritative seed quotes for §14 demonstration
-    const seedQuotes = [
-      {
-        id: 'quote-001',
-        organizationId: orgId,
-        clientName: 'Client MQ',
-        projectName: 'Finance OS Core Rollout',
-        serviceType: 'Enterprise Cloud Platform',
-        billingModel: 'fixed_price',
-        deliveryHorizonMonths: 3,
-        currency: 'USD',
-        targetMarginPercent: 35,
-        targetMarkupPercent: 53.85,
-        proposedPrice: 120000,
-        roleEstimates: [
-          { id: 'r1', roleName: 'Lead Systems Architect', estimatedHours: 160, costRate: 95, billingRate: 160 },
-          { id: 'r2', roleName: 'Senior Fullstack Engineer', estimatedHours: 320, costRate: 65, billingRate: 115 },
-          { id: 'r3', roleName: 'QA & Financial Golden File Engineer', estimatedHours: 120, costRate: 45, billingRate: 85 },
-        ],
-        directPurchases: [
-          { id: 'dp1', description: 'Dedicated Cloud Database Cluster', category: 'Infrastructure', amount: 3500, currency: 'USD' },
-          { id: 'dp2', description: 'Financial OCR Engine API Subscription', category: 'Software Licenses', amount: 1200, currency: 'USD' },
-        ],
-        overheadAmount: 6500,
-        overheadMethod: 'headcount',
-        contingencyPercent: 10,
-        contingencyAmount: 5260,
-        estimatedDirectLabor: 41400,
-        estimatedTotalCost: 57860,
-        profitAmount: 62140,
-        marginPercent: 51.78,
-        markupPercent: 107.4,
-        requiredPriceForTargetMargin: 89015.38,
-        currentVersion: 'v1.1',
-        versions: [
-          {
-            version: 'v1.0',
-            createdAt: '2026-10-15T10:00:00Z',
-            notes: 'Initial scope quote with 20% margin target',
-            proposedPrice: 85000,
-            estimatedTotalCost: 55000,
-            profitAmount: 30000,
-            marginPercent: 35.29,
-            markupPercent: 54.55,
-          },
-          {
-            version: 'v1.1',
-            createdAt: '2026-10-28T14:30:00Z',
-            notes: 'Expanded QA testing coverage and dedicated cluster infrastructure',
-            proposedPrice: 120000,
-            estimatedTotalCost: 57860,
-            profitAmount: 62140,
-            marginPercent: 51.78,
-            markupPercent: 107.4,
-          },
-        ],
-        status: 'approved',
-        isRevenueRecognized: false,
-        createdAt: '2026-10-15T10:00:00Z',
-        updatedAt: '2026-10-28T14:30:00Z',
-      },
-    ];
-
-    orgQuotesCache.set(orgId, seedQuotes);
-    return ok(res, seedQuotes);
+    const sb = getSupabaseAdminClient();
+    const quotes = await loadOrgQuotes(sb, orgId);
+    return ok(res, quotes);
   });
 
   // POST /quotes - Create quote or new version
   r.post(['/quotes', '/costing/quotes'], async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body;
+    const sb = getSupabaseAdminClient();
 
     if (!body.projectName || !body.projectName.trim()) {
       return fail(res, 400, 'Project / Quote name is required');
     }
 
     const calc = calculateQuoteFormulas(body);
-    const list = orgQuotesCache.get(orgId) || [];
+    const list = [...(await loadOrgQuotes(sb, orgId))];
     
     // Check if updating existing quote with new version
     const existingIndex = body.id ? list.findIndex((q: any) => q.id === body.id) : -1;
@@ -798,7 +780,7 @@ export function createCostingRouter(): Router {
       list.unshift(quote);
     }
 
-    orgQuotesCache.set(orgId, list);
+    await persistOrgQuotes(sb, orgId, list);
     return created(res, quote);
   });
 
@@ -806,9 +788,10 @@ export function createCostingRouter(): Router {
   r.delete(['/quotes/:id', '/costing/quotes/:id'], async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const quoteId = req.params.id;
-    const list = orgQuotesCache.get(orgId) || [];
+    const sb = getSupabaseAdminClient();
+    const list = await loadOrgQuotes(sb, orgId);
     const filtered = list.filter((q: any) => q.id !== quoteId);
-    orgQuotesCache.set(orgId, filtered);
+    await persistOrgQuotes(sb, orgId, filtered);
     return ok(res, null, 'Quote deleted');
   });
 

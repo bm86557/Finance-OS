@@ -23,11 +23,50 @@ type Sb = NonNullable<ReturnType<typeof getSupabaseAdminClient>>;
  * a `public.organization_members` row — a membership that existed only in the in-memory store
  * would produce a member who authenticates fine and is then denied access to every route.
  */
+export function normalizeOrgPlanCurrencies(org: Organization | null): Organization | null {
+  if (!org) return null;
+  const planKey = String((org as any).settings?.plan || (org as any).plan || 'basic').toLowerCase().trim();
+  const isFreeTier = planKey === 'basic' || planKey === 'free';
+  const maxCurrencies = isFreeTier ? 2 : (planKey === 'professional' ? 5 : 10);
+
+  const currentSettings = (org as any).settings || {};
+  let currs = currentSettings.enabledCurrencies;
+
+  if (isFreeTier) {
+    // Free tier is strictly limited to PKR and USD per §3.1 and plan quotas
+    const allowed = ['USD', 'PKR'];
+    if (Array.isArray(currs) && currs.length > 0) {
+      currs = currs
+        .map((c: string) => String(c).toUpperCase().trim())
+        .filter((c: string) => allowed.includes(c))
+        .slice(0, 2);
+    }
+    if (!Array.isArray(currs) || currs.length === 0) {
+      const base = String(org.currency || 'USD').toUpperCase().trim();
+      currs = base === 'PKR' ? ['PKR', 'USD'] : ['USD', 'PKR'];
+    }
+  } else {
+    if (Array.isArray(currs) && currs.length > 0) {
+      currs = currs
+        .map((c: string) => String(c).toUpperCase().trim())
+        .slice(0, maxCurrencies);
+    } else {
+      currs = ['USD', 'PKR'];
+    }
+  }
+
+  (org as any).settings = {
+    ...currentSettings,
+    enabledCurrencies: currs,
+  };
+  return org;
+}
+
 async function sbOrgByIdOrSlug(sb: Sb, idOrSlug: string): Promise<Organization | null> {
   const byId = await sb.from('organizations').select('*').eq('id', idOrSlug).maybeSingle();
-  if (byId.data) return byId.data as unknown as Organization;
+  if (byId.data) return normalizeOrgPlanCurrencies(byId.data as unknown as Organization);
   const bySlug = await sb.from('organizations').select('*').eq('slug', idOrSlug).maybeSingle();
-  return bySlug.data ? (bySlug.data as unknown as Organization) : null;
+  return bySlug.data ? normalizeOrgPlanCurrencies(bySlug.data as unknown as Organization) : null;
 }
 
 function rowToMember(row: Record<string, unknown>): OrganizationMember {
@@ -142,8 +181,30 @@ export function createOrganizationRouter(): Router {
         dbUpdates.settings_version = nextVersion;
         dbUpdates.updated_at = new Date().toISOString();
 
+        const planKey = String(beforeData?.settings?.plan || beforeData?.plan || 'basic').toLowerCase().trim();
+        const isFreeTier = planKey === 'basic' || planKey === 'free';
+        const maxCurrencies = isFreeTier ? 2 : (planKey === 'professional' ? 5 : 10);
+
         if (updates.settings !== undefined) {
-          dbUpdates.settings = updates.settings;
+          const nextSettings = { ...updates.settings };
+          if (Array.isArray(nextSettings.enabledCurrencies)) {
+            if (isFreeTier) {
+              const allowed = ['USD', 'PKR'];
+              nextSettings.enabledCurrencies = nextSettings.enabledCurrencies
+                .map((c: string) => String(c).toUpperCase().trim())
+                .filter((c: string) => allowed.includes(c))
+                .slice(0, 2);
+              if (nextSettings.enabledCurrencies.length === 0) {
+                const base = String(beforeData?.currency || updates.currency || 'USD').toUpperCase().trim();
+                nextSettings.enabledCurrencies = base === 'PKR' ? ['PKR', 'USD'] : ['USD', 'PKR'];
+              }
+            } else {
+              nextSettings.enabledCurrencies = nextSettings.enabledCurrencies
+                .map((c: string) => String(c).toUpperCase().trim())
+                .slice(0, maxCurrencies);
+            }
+          }
+          dbUpdates.settings = nextSettings;
         }
 
         const { data, error } = await sb

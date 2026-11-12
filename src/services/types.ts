@@ -80,6 +80,7 @@ export interface OrganizationMember {
   userId: string;
   organizationId: string;
   role: UserRole;
+  accessRole?: 'org_admin' | 'accountant' | 'team_member' | 'viewer' | string;
   portalType?: 'organization_admin' | 'employee' | 'platform_admin' | 'ai_assistant';
   status?: 'active' | 'pending' | 'rejected';
   /** Team/department label. Mirrors the `organization_members.department` column. */

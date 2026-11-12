@@ -329,6 +329,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       (portal === 'platform_admin' || portal === 'ai_assistant') &&
       (user.role === 'platform_admin' || user.role === 'platform_manager')
     ) {
+      if (portal === 'ai_assistant') {
+        return '/ai-portal';
+      }
       return '/platform';
     }
 

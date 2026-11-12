@@ -614,6 +614,29 @@ export function createTransactionsRouter(): Router {
     if (data.date && !/^\d{4}-\d{2}-\d{2}/.test(data.date)) {
       return fail(res, 400, 'Date must be formatted as YYYY-MM-DD');
     }
+
+    const sb = getSupabaseAdminClient();
+
+    // Invariant (§8, §33 #5): Cannot post or draft to a closed/locked period
+    if (sb && data.date && await isPeriodLocked(sb, orgId, data.date)) {
+      return fail(res, 400, 'PERIOD_CLOSED: Cannot create transactions in a locked or soft-closed accounting period.');
+    }
+
+    // Invariant (§1, §5, §33 #11): Block personal transaction writes if personal world is disabled
+    const isPersonal = data.worldScope === 'personal' || (Array.isArray(data.tags) && data.tags.includes('personal'));
+    if (isPersonal && sb) {
+      const { data: orgRow } = await sb
+        .from('organizations')
+        .select('personal_world_enabled, settings')
+        .eq('id', orgId)
+        .maybeSingle();
+
+      const personalEnabled = orgRow?.personal_world_enabled ?? orgRow?.settings?.personal_world_enabled ?? orgRow?.settings?.features?.personal_finance ?? true;
+      if (personalEnabled === false) {
+        return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization in Org Settings.');
+      }
+    }
+
     if (data.status === 'classified' && !data.categoryId) {
       return fail(res, 400, 'Cannot mark a transaction classified without a category');
     }
@@ -622,7 +645,6 @@ export function createTransactionsRouter(): Router {
       ? 'pending'
       : (data.status || (data.categoryId ? 'classified' : 'pending'));
 
-    const sb = getSupabaseAdminClient();
     let resolvedCounterpartyId = data.counterpartyId;
     const cpName = (data as any).counterpartyName || (data as any).counterparty || (data as any).payee;
 

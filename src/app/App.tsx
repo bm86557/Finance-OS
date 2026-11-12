@@ -23,6 +23,9 @@ import { AuthErrorHandler } from './components/AuthErrorHandler';
 const PlatformDashboard = React.lazy(() =>
   import('./components/platform/PlatformDashboard').then(m => ({ default: m.PlatformDashboard }))
 );
+const AiPortalWorkspace = React.lazy(() =>
+  import('./components/ai-portal/AiPortalWorkspace').then(m => ({ default: m.AiPortalWorkspace }))
+);
 const OrganizationDashboard = React.lazy(() =>
   import('./components/OrganizationDashboardModern').then(m => ({ default: m.OrganizationDashboard }))
 );
@@ -301,6 +304,20 @@ function AppRoutes() {
         element={
           <PlatformRoute>
             <PlatformDashboard />
+          </PlatformRoute>
+        }
+      />
+
+      {/* ============================== */}
+      {/* ============================== */}
+      {/* SEPARATE AI COMMAND PORTAL     */}
+      {/* (PLATFORM ADMIN ACCESS ONLY)   */}
+      {/* ============================== */}
+      <Route
+        path="/ai-portal"
+        element={
+          <PlatformRoute>
+            <AiPortalWorkspace />
           </PlatformRoute>
         }
       />

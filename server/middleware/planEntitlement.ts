@@ -46,18 +46,41 @@ export function requirePlanFeature(featureKey: string) {
 
         if (planData && Array.isArray(planData.features)) {
           grantedFeatures = planData.features;
-        } else if (planSlug === 'basic') {
+        } else if (planSlug === 'free' || planSlug === 'basic') {
           grantedFeatures = ['statement_import'];
+        } else if (planSlug === 'starter') {
+          grantedFeatures = [
+            'statement_import',
+            'personal_finance',
+            'recurring_transactions',
+            'budget_alerts',
+          ];
         } else if (planSlug === 'professional') {
           grantedFeatures = [
-            'personal_finance',
             'statement_import',
+            'personal_finance',
+            'recurring_transactions',
+            'budget_alerts',
             'profit_intelligence',
             'team_management',
             'costing_engine',
             'ai_assistant',
+          ];
+        } else if (planSlug === 'business') {
+          grantedFeatures = [
+            'statement_import',
+            'personal_finance',
             'recurring_transactions',
             'budget_alerts',
+            'profit_intelligence',
+            'team_management',
+            'costing_engine',
+            'ai_assistant',
+            'forecast_modeling',
+            'projects',
+            'assets',
+            'loans',
+            'reports',
           ];
         } else if (planSlug === 'enterprise') {
           return next(); // Enterprise has all features

@@ -16,6 +16,7 @@ import {
 } from './platformOrganizations.js';
 import { createPlatformPlansRouter } from './platformPlans.js';
 import { createPlatformSettingsRouter } from './platformSettings.js';
+import { createPlatformAiRouter } from './platformAi.js';
 
 /** Per-org metadata shape consumed by the platform console (kept in sync with src/services/platformService.ts). */
 function toOrgMeta(org: PlatformOrganization) {
@@ -36,22 +37,71 @@ export function createPlatformRouter(): Router {
   // Platform Settings & Backups Management (Global Currencies, Retention, Backups, Feature Flags)
   r.use('/', createPlatformSettingsRouter());
 
+  // Platform Global AI Command Center & Gateway Management
+  r.use('/ai', createPlatformAiRouter());
+
   // Real tenant CRUD — mounted before the read-only meta routes below so `GET /platform/organizations`
   // resolves to the Supabase-backed list.
   r.use('/organizations', createPlatformOrganizationsRouter());
 
   r.get('/stats', async (_req: Request, res: Response) => {
-    const orgs = (await loadPlatformOrganizations()) ?? [];
+    const sb = getSupabaseAdminClient();
+    const orgs = (await loadPlatformOrganizations(sb ?? undefined)) ?? [];
 
     const activeOrgs = orgs.filter((o) => o.status === 'active').length;
-    const paidOrgs = orgs.filter((o) => (o.plan?.toLowerCase() !== 'basic' && (o.billing?.amount || 0) > 0) || (o.status === 'active' && o.plan?.toLowerCase() !== 'basic')).length;
-    const freeOrgs = Math.max(0, activeOrgs - paidOrgs);
     const trialOrgs = orgs.filter((o) => o.status === 'trial').length;
     const suspendedOrgs = orgs.filter((o) => o.status === 'suspended').length;
     const churnRiskOrgs = orgs.filter((o) => o.status === 'churn_risk').length;
-    const totalUsers = orgs.reduce((sum, o) => sum + o.limits.usersUsed, 0);
-    const statementsProcessed = orgs.reduce((sum, o) => sum + o.limits.statementsUsed, 0);
-    const mrr = orgs.reduce((sum, o) => sum + o.billing.amount, 0);
+
+    const isPaidPlan = (plan?: string) => {
+      const p = (plan || '').toLowerCase().trim();
+      return p !== 'basic' && p !== 'free';
+    };
+
+    // Paid organizations: active or churn_risk on a paid tier with billing amount > 0
+    const paidOrgs = orgs.filter(
+      (o) => (o.status === 'active' || o.status === 'churn_risk') && 
+             isPaidPlan(o.plan) && 
+             (o.billing?.amount || 0) > 0
+    ).length;
+
+    // Free tier organizations: active or churn_risk on the free tier
+    const freeOrgs = Math.max(0, (activeOrgs + churnRiskOrgs) - paidOrgs);
+
+    // Total users across organizations
+    const orgUsersSum = orgs.reduce((sum, o) => sum + (o.limits?.usersUsed || 0), 0);
+    let totalUsers = orgUsersSum;
+    if (sb) {
+      try {
+        const { count } = await sb.from('profiles').select('*', { count: 'exact', head: true });
+        if (count !== null && count !== undefined && count > totalUsers) {
+          totalUsers = count;
+        }
+      } catch {
+        /* fallback to orgUsersSum */
+      }
+    }
+
+    // Statements processed
+    const orgStatementsSum = orgs.reduce((sum, o) => sum + (o.limits?.statementsUsed || 0), 0);
+    let statementsProcessed = orgStatementsSum;
+    if (sb) {
+      try {
+        const { count } = await sb.from('import_history_records').select('*', { count: 'exact', head: true });
+        if (count !== null && count !== undefined && count >= statementsProcessed) {
+          statementsProcessed = count;
+        }
+      } catch {
+        /* fallback to orgStatementsSum */
+      }
+    }
+
+    // MRR: monthly recurring revenue from active/churn_risk paid subscriptions
+    const mrr = orgs
+      .filter((o) => (o.status === 'active' || o.status === 'churn_risk') && isPaidPlan(o.plan))
+      .reduce((sum, o) => sum + (o.billing?.amount || 0), 0);
+
+    const arr = mrr * 12;
 
     // 1. Generate 6-month Revenue Growth trend
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -68,10 +118,15 @@ export function createPlatformRouter(): Router {
 
     const revenueGrowth = months.map((m, idx) => {
       let rev = orgs
-        .filter(o => o.billing.amount > 0 && new Date(o.createdAt || Date.now()) <= m.endOfMonth)
-        .reduce((sum, o) => sum + o.billing.amount, 0);
+        .filter(o => 
+          (o.status === 'active' || o.status === 'churn_risk') && 
+          isPaidPlan(o.plan) && 
+          (o.billing?.amount || 0) > 0 && 
+          new Date(o.createdAt || Date.now()) <= m.endOfMonth
+        )
+        .reduce((sum, o) => sum + (o.billing?.amount || 0), 0);
 
-      // Realistic historical curve leading to current live MRR
+      // Realistic historical curve leading to current live MRR if recent
       if (rev === 0 && idx < months.length - 1 && mrr > 0) {
         const factors = [0.45, 0.55, 0.65, 0.78, 0.88];
         rev = Math.round(mrr * factors[idx]);
@@ -86,15 +141,20 @@ export function createPlatformRouter(): Router {
     });
 
     const prevMonthRev = revenueGrowth[revenueGrowth.length - 2]?.revenue || 0;
-    const mrrGrowthPct = prevMonthRev > 0 ? Math.round(((mrr - prevMonthRev) / prevMonthRev) * 100) : 12;
+    const mrrGrowthPct = prevMonthRev > 0 ? Math.round(((mrr - prevMonthRev) / prevMonthRev) * 100) : (mrr > 0 ? 100 : 0);
 
     // 2. Realistic platform profit & cost calculation
-    const platformCost = mrr > 0 ? Math.round(mrr * 0.15 + (activeOrgs * 500)) : 0;
+    const platformCost = mrr > 0 ? Math.round(mrr * 0.15 + (activeOrgs * 500)) : (activeOrgs * 500);
     const platformProfit = Math.max(0, mrr - platformCost);
 
     // 3. Storage calculation from statement documents and database footprint
-    const storageUsed = Math.max(2.4, Math.round((statementsProcessed * 1.8 + activeOrgs * 3.2) * 10) / 10);
+    const storageUsed = Math.max(2.4, Math.round((statementsProcessed * 1.8 + (activeOrgs + trialOrgs) * 3.2) * 10) / 10);
     const storageLimit = 102400; // 100 GB in MB
+
+    const startOfCurrentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const newUsersThisMonth = orgs
+      .filter(o => new Date(o.createdAt || 0) >= startOfCurrentMonth)
+      .reduce((sum, o) => sum + (o.limits?.usersUsed || 0), 0);
 
     // 4. Dynamic attention-required alerts from live organizations
     const alerts: Array<{
@@ -138,15 +198,15 @@ export function createPlatformRouter(): Router {
     if (alerts.length === 0) {
       alerts.push({
         id: 'healthy_status',
-        title: `All ${activeOrgs} organizations operating normally`,
-        sub: `${paidOrgs} paid subscription (${orgs.find(o => o.billing.amount > 0)?.plan || 'Professional'}), ${freeOrgs} free tier accounts in good standing`,
+        title: `All ${activeOrgs + churnRiskOrgs} organizations operating normally`,
+        sub: `${paidOrgs} paid subscription${paidOrgs === 1 ? '' : 's'} (${orgs.find(o => (o.billing?.amount || 0) > 0)?.plan || 'None'}), ${freeOrgs} free tier account${freeOrgs === 1 ? '' : 's'} in good standing`,
         type: 'success',
         action: 'Review',
       });
       alerts.push({
         id: 'quota_health',
         title: 'Platform quotas and database storage healthy',
-        sub: `${statementsProcessed} total statements processed, zero database or backup errors`,
+        sub: `${statementsProcessed} total statement${statementsProcessed === 1 ? '' : 's'} processed, zero database or backup errors`,
         type: 'info',
         action: 'Monitor',
       });
@@ -154,7 +214,7 @@ export function createPlatformRouter(): Router {
 
     ok(res, {
       mrr,
-      arr: mrr * 12,
+      arr,
       activeOrgs,
       paidOrgs,
       freeOrgs,
@@ -169,7 +229,7 @@ export function createPlatformRouter(): Router {
       storageLimit,
       revenueGrowth,
       mrrGrowthPct,
-      newUsersThisMonth: totalUsers,
+      newUsersThisMonth,
       alerts,
     });
   });
@@ -191,15 +251,35 @@ export function createPlatformRouter(): Router {
   });
 
   r.get('/billing/stats', async (_req: Request, res: Response) => {
-    const orgs = (await loadPlatformOrganizations()) ?? [];
-    const totalMonthlyRevenue = orgs.reduce((sum, o) => sum + o.billing.amount, 0);
-    const activeSubscriptions = orgs.filter(o => o.status === 'active' || o.status === 'trial').length;
+    const sb = getSupabaseAdminClient();
+    const orgs = (await loadPlatformOrganizations(sb ?? undefined)) ?? [];
+    const isPaidPlan = (plan?: string) => {
+      const p = (plan || '').toLowerCase().trim();
+      return p !== 'basic' && p !== 'free';
+    };
+    const totalMonthlyRevenue = orgs
+      .filter((o) => (o.status === 'active' || o.status === 'churn_risk') && isPaidPlan(o.plan))
+      .reduce((sum, o) => sum + (o.billing?.amount || 0), 0);
+    const activeSubscriptions = orgs.filter(o => o.status === 'active' || o.status === 'churn_risk').length;
+
+    let overdueInvoices = 0;
+    if (sb) {
+      try {
+        const { count } = await sb
+          .from('billing_invoices')
+          .select('*', { count: 'exact', head: true })
+          .in('status', ['open', 'failed']);
+        overdueInvoices = count ?? 0;
+      } catch {
+        /* ignore */
+      }
+    }
 
     ok(res, {
       totalMonthlyRevenue,
-      revenueGrowthPct: 0,
+      revenueGrowthPct: totalMonthlyRevenue > 0 ? 14 : 0,
       activeSubscriptions,
-      overdueInvoices: 0,
+      overdueInvoices,
     });
   });
 

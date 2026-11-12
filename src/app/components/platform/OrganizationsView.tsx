@@ -248,10 +248,10 @@ export function OrganizationsView() {
       {/* Summary Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         {[
-          { label: 'Active', count: filteredOrgs.filter(o => o.status === 'active').length, color: 'green', icon: Building2 },
-          { label: 'Trial', count: filteredOrgs.filter(o => o.status === 'trial').length, color: 'blue', icon: Globe },
-          { label: 'Suspended', count: filteredOrgs.filter(o => o.status === 'suspended').length, color: 'red', icon: Settings },
-          { label: 'Churn Risk', count: filteredOrgs.filter(o => o.status === 'churn_risk').length, color: 'amber', icon: Users },
+          { label: 'Active', count: allOrgs.filter(o => o.status === 'active').length, color: 'green', icon: Building2 },
+          { label: 'Trial', count: allOrgs.filter(o => o.status === 'trial').length, color: 'blue', icon: Globe },
+          { label: 'Suspended', count: allOrgs.filter(o => o.status === 'suspended').length, color: 'red', icon: Settings },
+          { label: 'Churn Risk', count: allOrgs.filter(o => o.status === 'churn_risk').length, color: 'amber', icon: Users },
         ].map((item, i) => (
           <motion.div
             key={item.label}

@@ -2,11 +2,61 @@ import { Router, type Request, type Response } from 'express';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { ok, created, fail, notFound } from '../lib/http.js';
 import { stripeService, type PlatformPlan } from '../services/stripeService.js';
+import { requirePlatformRole } from '../middleware/auth.js';
 
 export function createPlatformPlansRouter(): Router {
   const router = Router();
 
   const DEFAULT_SEEDED_PLANS: PlatformPlan[] = [
+    {
+      id: 'plan-free',
+      slug: 'free',
+      name: 'Free/Trial',
+      description: '14-day trial & essential ledger access for small agency exploration',
+      price: 0,
+      currency: 'PKR',
+      billing_interval: 'month',
+      features: ['statement_import'],
+      limits: {
+        users: 2,
+        statements: 50,
+        currencies: 2,
+        storage: 1024,
+        transactions: 500,
+        ai_credits: 50,
+        audit_retention: 14,
+      },
+      is_popular: false,
+      active: true,
+      sort_order: 1,
+    },
+    {
+      id: 'plan-starter',
+      slug: 'starter',
+      name: 'Starter',
+      description: 'Core accounting, narration learning and bank statement import for growing studios',
+      price: 19900,
+      currency: 'PKR',
+      billing_interval: 'month',
+      features: [
+        'statement_import',
+        'personal_finance',
+        'recurring_transactions',
+        'budget_alerts',
+      ],
+      limits: {
+        users: 5,
+        statements: 250,
+        currencies: 5,
+        storage: 5120,
+        transactions: 2500,
+        ai_credits: 250,
+        audit_retention: 60,
+      },
+      is_popular: false,
+      active: true,
+      sort_order: 2,
+    },
     {
       id: 'plan-basic',
       slug: 'basic',
@@ -48,17 +98,53 @@ export function createPlatformPlansRouter(): Router {
         'budget_alerts',
       ],
       limits: {
-        users: 10,
-        statements: 500,
-        currencies: 5,
-        storage: 10240,
-        transactions: 5000,
-        ai_credits: 500,
-        audit_retention: 90,
+        users: 15,
+        statements: 1000,
+        currencies: 15,
+        storage: 20480,
+        transactions: 10000,
+        ai_credits: 1000,
+        audit_retention: 180,
       },
       is_popular: true,
       active: true,
-      sort_order: 2,
+      sort_order: 3,
+    },
+    {
+      id: 'plan-business',
+      slug: 'business',
+      name: 'Business',
+      description: 'Multi-entity support, fixed assets, debt schedules, and predictive cash flow runway',
+      price: 79900,
+      currency: 'PKR',
+      billing_interval: 'month',
+      features: [
+        'personal_finance',
+        'statement_import',
+        'recurring_transactions',
+        'budget_alerts',
+        'profit_intelligence',
+        'team_management',
+        'costing_engine',
+        'ai_assistant',
+        'forecast_modeling',
+        'projects',
+        'assets',
+        'loans',
+        'reports',
+      ],
+      limits: {
+        users: 35,
+        statements: 5000,
+        currencies: 50,
+        storage: 51200,
+        transactions: 50000,
+        ai_credits: 3000,
+        audit_retention: 365,
+      },
+      is_popular: false,
+      active: true,
+      sort_order: 4,
     },
     {
       id: 'plan-enterprise',
@@ -161,7 +247,7 @@ export function createPlatformPlansRouter(): Router {
   });
 
   // POST /api/v1/platform/plans (Create a new plan)
-  router.post('/', async (req: Request, res: Response) => {
+  router.post('/', requirePlatformRole('platform_admin', 'platform_manager'), async (req: Request, res: Response) => {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 'Database unavailable');
 
@@ -234,7 +320,7 @@ export function createPlatformPlansRouter(): Router {
   });
 
   // PATCH /api/v1/platform/plans/:id (Edit an existing plan)
-  router.patch('/:id', async (req: Request, res: Response) => {
+  router.patch('/:id', requirePlatformRole('platform_admin', 'platform_manager'), async (req: Request, res: Response) => {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 'Database unavailable');
 
@@ -348,7 +434,7 @@ export function createPlatformPlansRouter(): Router {
   });
 
   // DELETE /api/v1/platform/plans/:id (Soft-deactivate or delete)
-  router.delete('/:id', async (req: Request, res: Response) => {
+  router.delete('/:id', requirePlatformRole('platform_admin', 'platform_manager'), async (req: Request, res: Response) => {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 'Database unavailable');
 

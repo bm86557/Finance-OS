@@ -19,6 +19,7 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { detectAndIssuePayslipsForTransactions, voidPayslip } from '../lib/aiPayrollDetector.js';
 import { canViewConfidentialPayroll, canWriteFinance } from '../middleware/auth.js';
 import { env } from '../config/env.js';
+import { createEmployeeAIAssistantRouter } from './employeeAIAssistant.js';
 
 /**
  * Every route here is a self-service endpoint for the logged-in employee (mounted under
@@ -626,6 +627,9 @@ export function createEmployeeMeRouter(): Router {
     const p = req.params.organizationId;
     return Array.isArray(p) ? p[0] : (p ?? '');
   }
+
+  // Mount Employee AI Assistant (RAG & contextual guidance for employee dashboard)
+  r.use('/ai-assistant', createEmployeeAIAssistantRouter());
 
   r.get('/expenses', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
@@ -1467,9 +1471,11 @@ export function createEmployeeMeRouter(): Router {
     let memberDepartment = 'Development';
     let memberPosition = 'Senior Developer';
     let fixedSalary = 0;
+    let salaryCurrency: string | null = null;
     let memberAssignedProjects: string[] = [];
     let dbTasks: any[] = [];
     let dbProjNotifs: any[] = [];
+    let orgCurrency = 'USD';
 
     if (sb) {
       try {
@@ -1481,15 +1487,21 @@ export function createEmployeeMeRouter(): Router {
           { data: om },
           { data: fetchedTasks },
           { data: fetchedNotifs },
+          { data: orgRow },
         ] = await Promise.all([
           sb.from('employee_expenses').select('*').eq('organization_id', orgId).eq('user_id', userId),
           sb.from('timesheet_entries').select('*').eq('organization_id', orgId).eq('user_id', userId),
           sb.from('employee_payslips').select('*').eq('organization_id', orgId).eq('user_id', userId).order('issue_date', { ascending: false }),
           sb.from('company_announcements').select('*').eq('organization_id', orgId).order('created_at', { ascending: false }).limit(4),
-          sb.from('organization_members').select('department, role, position, fixed_salary, assigned_projects').eq('organization_id', orgId).eq('user_id', userId).maybeSingle(),
+          sb.from('organization_members').select('department, role, position, fixed_salary, salary_currency, assigned_projects').eq('organization_id', orgId).eq('user_id', userId).maybeSingle(),
           sb.from('project_tasks').select('*').eq('organization_id', orgId),
           sb.from('notifications').select('*').eq('organization_id', orgId).or(`user_id.eq.${userId},user_id.is.null`).order('created_at', { ascending: false }).limit(8),
+          sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
         ]);
+
+        if (orgRow) {
+          orgCurrency = String(orgRow.base_currency || orgRow.currency || 'USD').toUpperCase().trim();
+        }
 
         if (fetchedTasks) {
           dbTasks = fetchedTasks;
@@ -1570,6 +1582,7 @@ export function createEmployeeMeRouter(): Router {
           if (om.position) memberPosition = om.position;
           else if (om.role) memberPosition = om.role;
           if (om.fixed_salary) fixedSalary = Number(om.fixed_salary);
+          if (om.salary_currency) salaryCurrency = String(om.salary_currency).toUpperCase();
           if (om.assigned_projects) {
             if (Array.isArray(om.assigned_projects)) memberAssignedProjects = om.assigned_projects;
             else if (typeof om.assigned_projects === 'string') {
@@ -1645,10 +1658,11 @@ export function createEmployeeMeRouter(): Router {
         : 0;
     }
 
-    // Salary: Latest payslip net, or fallback to contracted fixed salary (§12.1, §17)
+    // Salary: Latest payslip net, or fallback to contracted fixed salary (§12.1, §17, §18)
+    const effectiveSalaryCurrency = salaryCurrency || orgCurrency;
     const fallbackSalary = fixedSalary > 0
-      ? { gross: fixedSalary, net: fixedSalary, currency: 'USD' }
-      : { gross: 0, net: 0, currency: 'USD' };
+      ? { gross: fixedSalary, net: fixedSalary, currency: effectiveSalaryCurrency }
+      : { gross: 0, net: 0, currency: effectiveSalaryCurrency };
     const compensation = latestPay
       ? { gross: latestPay.gross, net: latestPay.net, currency: latestPay.currency }
       : fallbackSalary;

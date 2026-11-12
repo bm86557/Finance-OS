@@ -402,6 +402,9 @@ export function createImportsRouter(): Router {
                   const { classifyBatchWithAI } = await import('../lib/aiClient.js');
                   const { getDefaultAIConfig } = await import('../config/aiConfig.js');
                   const aiConfig = getDefaultAIConfig();
+                  if (aiConfig) {
+                    (aiConfig as any).organizationId = orgId;
+                  }
 
                   if (aiConfig) {
                     try {

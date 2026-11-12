@@ -86,14 +86,19 @@ export function sanitizeConfigForLogging(config: Partial<AIProviderConfig>): Rec
  * Map legacy or deprecated model names to current active Gemini models on v1beta
  */
 export function normalizeGeminiModel(name?: string): string {
-  if (!name) return 'gemini-flash-latest';
-  const clean = name.trim().toLowerCase();
-  if (clean.includes('2.5-flash') || clean.includes('1.5-flash')) return 'gemini-flash-latest';
-  if (clean.includes('pro')) return 'gemini-3-flash-preview';
-  if (clean.includes('flash-latest')) return 'gemini-flash-latest';
+  if (!name) return 'gemini-flash-lite-latest';
+  const clean = name.trim().toLowerCase().replace(/^models\//, '');
+  if (clean === 'gemini-1.5-flash' || clean === 'models/gemini-1.5-flash') return 'gemini-flash-latest';
+  if (clean === 'gemini-2.0-flash' || clean === 'models/gemini-2.0-flash') return 'gemini-flash-latest';
+  if (clean.includes('2.0-flash-lite')) return 'gemini-flash-lite-latest';
+  if (clean.includes('2.0-flash')) return 'gemini-flash-latest';
+  if (clean.includes('2.5-flash')) return 'gemini-flash-latest';
   if (clean.includes('lite')) return 'gemini-flash-lite-latest';
+  if (clean.includes('flash-latest')) return 'gemini-flash-latest';
+  if (clean.includes('pro')) return 'gemini-3-flash-preview';
   if (clean.includes('preview') || clean.includes('3')) return 'gemini-3-flash-preview';
-  return 'gemini-flash-latest';
+  if (clean.includes('1.5-flash')) return 'gemini-flash-latest';
+  return clean || 'gemini-flash-lite-latest';
 }
 
 export const MODERN_GEMINI_FALLBACKS = [

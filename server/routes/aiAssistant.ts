@@ -106,9 +106,14 @@ function buildFinancialSystemPrompt(
   const microRecords = extractQuerySpecificRecords(userMessage, d);
   const adHocMath = evaluateAdHocFinancialMath(userMessage, d);
 
-  return `You are the Chief Financial Officer (CFO) and lead fintech AI advisor for ${d.organizationName} on Finance OS.
-You possess 10+ years of senior fintech engineering and corporate finance experience.
-You reason strictly from the authenticated, double-entry verified organization data provided below.
+  return `You are an elite, highly experienced fractional CFO and financial intelligence advisor for ${d.organizationName} on Finance OS.
+
+CRITICAL CONVERSATIONAL & SCOPE DIRECTIVES:
+1. NEVER start responses with boilerplate, robotic intros such as "As your CFO and Lead Fintech AI Advisor...", "I have analyzed the double-entry ledger...", "As an AI...", or any repetitive greetings. Jump immediately into the direct answer or strategic solution.
+2. UNIVERSAL SCOPE: Answer ANY and ALL user questions thoroughly and intelligently. This includes specific ledger queries, general financial questions, accounting principles, business strategy, what-if scenarios, tax/pricing models, client negotiations, draft communications, and general operational advice.
+3. DATA GROUNDING: When questions relate to the organization's business, finances, or performance, cite the exact figures from the authenticated dossier below (revenue, profits, margins, department costs, projects, runway). When asked broader, conceptual, or external questions, draw upon your full corporate finance, accounting, and fintech expertise.
+4. DETAILED & COMPREHENSIVE FINANCIAL ADVICE: Deliver exhaustive, in-depth executive guidance. Provide comprehensive breakdowns with exact numbers, complete calculations, step-by-step methodologies, and concrete phased execution plans. Never stop halfway, never summarize prematurely, and never leave thoughts incomplete.
+5. CLEAN STRUCTURED FORMATTING: Format with GitHub Markdown using clear headings (###), bold key figures, bullet points, and distinct paragraphs for readability.
 
 ================================================================================
 CANONICAL FINANCIAL DOSSIER (Double-Entry General Ledger & Real-Time Verified)
@@ -325,12 +330,16 @@ export function createAIAssistantRouter(): Router {
         const { text: rawReply, model, source, provider } = await executeAIChat(orgId, {
           systemPrompt,
           messages: allMessages,
-          temperature: 0.3,
+          temperature: 0.65,
+          maxTokens: 4096,
         });
 
         const validation = validateAIResponse(rawReply);
         const replyText = validation.valid ? validation.sanitized : rawReply;
         const suggestions = generateDynamicFollowUpSuggestions(message, dossier);
+
+        const keyBadge = source === 'organization' ? 'ORGANIZATION_OWN_KEY (BYOK)' : 'PLATFORM_SHARED_KEY';
+        console.log(`[AI-Assistant] [SUCCESS] Completed inquiry for Org: "${orgId}" | Key: [${keyBadge}] | Provider: ${provider} | Model: ${model}`);
 
         return ok(res, {
           reply: replyText,
@@ -341,7 +350,7 @@ export function createAIAssistantRouter(): Router {
           remaining: rateLimit.remaining,
         });
       } catch (aiErr: any) {
-        console.error('[ai-assistant] AI provider error during generation:', aiErr?.message || aiErr);
+        console.error(`[AI-Assistant] [FAILED] Query failed for Org: "${orgId}" | Reason: ${aiErr?.message || aiErr}`);
         return fail(res, 502, `AI Provider error: ${aiErr?.message || 'Failed to generate response'}`);
       }
     } catch (err: any) {

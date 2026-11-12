@@ -6,7 +6,6 @@ import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Sparkles, Lock, Mail, ArrowLeft, Zap, Brain } from 'lucide-react';
-import { mockUsers } from '@/data/mockDatabase';
 import { useTheme } from '@/contexts/ThemeContext';
 import type { PortalType } from '@/services/authSessionTypes';
 
@@ -47,7 +46,7 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
 
     try {
       await onLogin(email, password, undefined, 'ai_assistant');
-      navigate('/');
+      navigate('/ai-portal');
     } catch (err: any) {
       setError(err?.message || 'Access denied or authentication failed.');
     } finally {
@@ -57,25 +56,6 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
     }
   };
 
-  const handleDemoLogin = async (demoEmail: string) => {
-    setEmail(demoEmail);
-    setPassword('demo');
-    setIsLoading(true);
-    setScanProgress(0);
-    setError('');
-    setAiStatus('Initializing AI...');
-
-    try {
-      await onLogin(demoEmail, 'demo', undefined, 'ai_assistant');
-      navigate('/');
-    } catch (err: any) {
-      setError(err?.message || 'Login failed.');
-    } finally {
-      setIsLoading(false);
-      setScanProgress(0);
-      setAiStatus('Initializing AI...');
-    }
-  };
 
   return (
     <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 to-slate-100'} flex items-center justify-center p-4 relative overflow-hidden`}>
@@ -190,7 +170,7 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
                     <Mail className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-purple-400" />
                     <Input
                       type="email"
-                      placeholder="admin@financeos.com"
+                      placeholder="admin@yourcompany.com"
                       value={email}
                       onChange={(e) => setEmail(e.target.value)}
                       className={`${theme === 'dark' ? 'bg-slate-950/50 border-purple-500/30 text-white' : 'bg-slate-50 border-purple-400/40 text-slate-900'} pl-10 h-12 focus:border-purple-500/50 font-mono`}
@@ -277,6 +257,15 @@ export function BingLoginPage({ onLogin }: BingLoginPageProps) {
                   </span>
                 </Button>
               </form>
+
+              {/* Security Access Notice */}
+              <div className="pt-3 border-t border-purple-500/20 flex items-center justify-between text-[11px] font-mono text-purple-400/80">
+                <span className="flex items-center gap-1.5">
+                  <Lock className="size-3 text-purple-400" />
+                  RESTRICTED PORTAL
+                </span>
+                <span className="text-slate-400">Platform Admin Credentials Required</span>
+              </div>
             </CardContent>
           </Card>
         </motion.div>

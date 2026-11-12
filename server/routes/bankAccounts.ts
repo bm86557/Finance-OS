@@ -199,6 +199,24 @@ export function createBankAccountsRouter(): Router {
       return fail(res, 400, `Currency ${requestedCurrency} is currently disabled system-wide in Platform Settings`);
     }
 
+    const sb = getSupabaseAdminClient();
+
+    // Enforce Plan Currency Limits (§3.1, §5.1)
+    if (sb) {
+      const { data: orgRow } = await sb.from('organizations').select('plan, settings, currency').eq('id', orgId).maybeSingle();
+      const planKey = String(orgRow?.settings?.plan || orgRow?.plan || 'basic').toLowerCase().trim();
+      const isFreeTier = planKey === 'basic' || planKey === 'free';
+      if (isFreeTier && requestedCurrency !== 'USD' && requestedCurrency !== 'PKR') {
+        return fail(res, 400, `The Free plan only supports USD and PKR currencies. Upgrade to Professional to add accounts in ${requestedCurrency}.`);
+      }
+      const maxCurrs = isFreeTier ? 2 : (planKey === 'professional' ? 5 : 10);
+      const { data: existingAccounts } = await sb.from('bank_accounts').select('currency').eq('organization_id', orgId).eq('is_active', true);
+      const existingCurrs = new Set((existingAccounts || []).map((a: any) => String(a.currency || 'USD').toUpperCase()));
+      if (!existingCurrs.has(requestedCurrency) && existingCurrs.size >= maxCurrs) {
+        return fail(res, 400, `Your ${isFreeTier ? 'Free' : planKey} plan allows a maximum of ${maxCurrs} distinct currencies. Upgrade your plan to add accounts in a new currency.`);
+      }
+    }
+
     // Ensure chart of accounts exist so foreign keys in Supabase public.bank_accounts succeed
     const chartAccounts = await ensureDefaultAccounts(orgId, data.currency || 'USD');
 
@@ -229,7 +247,6 @@ export function createBankAccountsRouter(): Router {
       isActive: data.isActive ?? true,
     };
 
-    const sb = getSupabaseAdminClient();
     if (sb) {
       try {
         const dbRow = mapDomainToDbBankAccount(newBank);

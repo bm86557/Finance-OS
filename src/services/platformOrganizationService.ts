@@ -79,11 +79,14 @@ const EMPTY_LIMITS: PlatformOrgLimits = {
   currenciesUsed: 0,
 };
 
-function normalizePlanKey(value: unknown): string {
+function normalizePlanKey(value: unknown, catalogue: Record<string, any> = PLAN_CATALOGUE): string {
   const key = String(value ?? '').trim().toLowerCase();
+  if (!key) return 'basic';
+  if (key in catalogue) return key;
   if (key.startsWith('prof')) return 'professional';
   if (key.startsWith('ent')) return 'enterprise';
-  return key === 'basic' ? 'basic' : 'basic';
+  if (key.startsWith('basic') || key === 'free') return 'basic';
+  return 'basic';
 }
 
 const PLAN_CATALOGUE: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = {
@@ -100,23 +103,90 @@ async function getAllFromSupabase(): Promise<ServiceResponse<PlatformOrganizatio
   }
 
   try {
-    const { data, error } = await sb
-      .from('organizations')
-      .select('id, slug, name, logo, currency, fiscal_year_start, created_at, settings')
-      .order('created_at', { ascending: false });
+    const [orgsRes, subsRes, membersRes, importsRes, accountsRes, plansRes] = await Promise.all([
+      sb.from('organizations').select('id, slug, name, logo, currency, fiscal_year_start, created_at, settings').order('created_at', { ascending: false }),
+      sb.from('organization_subscriptions').select('organization_id, plan_slug, current_period_end, status'),
+      sb.from('organization_members').select('organization_id, status'),
+      sb.from('import_history_records').select('organization_id'),
+      sb.from('accounts').select('organization_id, currency'),
+      sb.from('platform_plans').select('*').eq('active', true),
+    ]);
 
-    if (error) {
-      return { success: false, data: [], error: error.message };
+    if (orgsRes.error) {
+      return { success: false, data: [], error: orgsRes.error.message };
     }
 
-    const items: PlatformOrganization[] = ((data ?? []) as any[]).map((row) => {
+    const catalogue: Record<string, any> = { ...PLAN_CATALOGUE };
+    if (plansRes.data && plansRes.data.length > 0) {
+      for (const p of plansRes.data) {
+        const key = (p.slug || p.name || '').trim().toLowerCase();
+        catalogue[key] = {
+          name: p.name,
+          price: Number(p.price) || 0,
+          limits: {
+            users: p.limits?.users ?? 5,
+            statements: p.limits?.statements ?? 100,
+            currencies: p.limits?.currencies ?? 2,
+          },
+        };
+      }
+    }
+
+    const subsMap = new Map<string, any>();
+    for (const s of (subsRes.data ?? [])) {
+      if (s.organization_id) subsMap.set(s.organization_id, s);
+    }
+
+    const usersMap = new Map<string, number>();
+    for (const m of (membersRes.data ?? [])) {
+      if (m.status && m.status !== 'active' && m.status !== 'pending') continue;
+      usersMap.set(m.organization_id, (usersMap.get(m.organization_id) ?? 0) + 1);
+    }
+
+    const importsMap = new Map<string, number>();
+    for (const i of (importsRes.data ?? [])) {
+      importsMap.set(i.organization_id, (importsMap.get(i.organization_id) ?? 0) + 1);
+    }
+
+    const currenciesMap = new Map<string, Set<string>>();
+    for (const a of (accountsRes.data ?? [])) {
+      const set = currenciesMap.get(a.organization_id) ?? new Set<string>();
+      if (a.currency) set.add(a.currency);
+      currenciesMap.set(a.organization_id, set);
+    }
+
+    const items: PlatformOrganization[] = ((orgsRes.data ?? []) as any[]).map((row) => {
       const settings = (row.settings ?? {}) as Record<string, unknown>;
-      const plan = PLAN_CATALOGUE[normalizePlanKey(settings.plan)];
-      const status = (String(settings.status ?? '').toLowerCase() as PlatformOrgStatus);
-      const resolvedStatus: PlatformOrgStatus =
-        status === 'active' || status === 'trial' || status === 'suspended' || status === 'churn_risk'
-          ? status
-          : 'active';
+      const sub = subsMap.get(row.id);
+      const rawPlanKey = sub?.plan_slug || settings.plan;
+      const planKey = normalizePlanKey(rawPlanKey, catalogue);
+      const plan = catalogue[planKey] || PLAN_CATALOGUE.basic;
+
+      let resolvedStatus: PlatformOrgStatus = 'active';
+      if (sub?.status === 'canceled') resolvedStatus = 'suspended';
+      else if (sub?.status === 'past_due') resolvedStatus = 'churn_risk';
+      else if (sub?.status === 'trialing') resolvedStatus = 'trial';
+      else {
+        const raw = String(settings.status ?? '').trim().toLowerCase();
+        if (raw === 'active' || raw === 'trial' || raw === 'suspended' || raw === 'churn_risk') {
+          resolvedStatus = raw as PlatformOrgStatus;
+        } else if (settings.suspended === true) {
+          resolvedStatus = 'suspended';
+        } else if (settings.is_trial === true) {
+          resolvedStatus = 'trial';
+        }
+      }
+
+      let nextBillingDate: string | null = null;
+      let daysRemaining: number | null = null;
+      if (sub && sub.current_period_end) {
+        nextBillingDate = sub.current_period_end;
+        const diffMs = new Date(sub.current_period_end).getTime() - Date.now();
+        daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
+      }
+
+      const orgCurrencies = currenciesMap.get(row.id) ?? new Set<string>();
+      if (row.currency) orgCurrencies.add(row.currency);
 
       return {
         id: row.id,
@@ -129,8 +199,19 @@ async function getAllFromSupabase(): Promise<ServiceResponse<PlatformOrganizatio
         settings: settings as Organization['settings'],
         plan: plan.name,
         status: resolvedStatus,
-        limits: { ...EMPTY_LIMITS, ...plan.limits, currenciesUsed: row.currency ? 1 : 0 },
-        billing: { amount: plan.price },
+        limits: {
+          users: plan.limits?.users ?? 5,
+          usersUsed: usersMap.get(row.id) ?? 0,
+          statements: plan.limits?.statements ?? 100,
+          statementsUsed: importsMap.get(row.id) ?? 0,
+          currencies: plan.limits?.currencies ?? 2,
+          currenciesUsed: orgCurrencies.size,
+        },
+        billing: { 
+          amount: plan.price,
+          nextBillingDate,
+          daysRemaining,
+        },
       };
     });
 

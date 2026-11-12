@@ -35,7 +35,7 @@ function getOrgId(req: Request): string {
 /**
  * Get AI config for organization (from DB or env fallback)
  */
-async function getAIConfig(orgId: string): Promise<AIConfig | null> {
+async function getAIConfig(orgId: string): Promise<(AIConfig & { organizationId?: string }) | null> {
   const platformSettings = await getGlobalPlatformSettings();
   if (!platformSettings.feature_flags.ai_category_suggestions) return null;
   try {
@@ -48,12 +48,14 @@ async function getAIConfig(orgId: string): Promise<AIConfig | null> {
         baseUrl: resolved.baseUrl,
         temperature: resolved.temperature,
         maxTokens: resolved.maxTokens,
+        organizationId: orgId,
       };
     }
   } catch (error) {
     console.error('Error resolving AI config:', error);
   }
-  return getDefaultAIConfig();
+  const def = getDefaultAIConfig();
+  return def ? { ...def, organizationId: orgId } : null;
 }
 
 async function _legacyGetAIConfig(orgId: string): Promise<AIConfig | null> {

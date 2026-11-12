@@ -1,8 +1,9 @@
-import { ReactNode } from 'react';
+import { ReactNode, useState } from 'react';
 import { useAuth } from '@/contexts/AuthContext';
 import { Button } from '../ui/button';
 import { NotificationCenter } from '../notifications/NotificationCenter';
 import { AXIOM } from '../../../styles/axiom-tokens';
+import { EmployeeAIAssistantModal } from './EmployeeAIAssistantModal';
 import { 
   LayoutDashboard, 
   Receipt, 
@@ -31,7 +32,8 @@ interface EmployeeLayoutProps {
 }
 
 export function EmployeeLayout({ children, currentView, onViewChange }: EmployeeLayoutProps) {
-  const { user, logout, userRole } = useAuth();
+  const { user, logout, userRole, currentOrganization } = useAuth();
+  const [isAIAssistantOpen, setIsAIAssistantOpen] = useState(false);
 
   const navItems: { id: EmployeeView; label: string; icon: any; section?: string }[] = [
     { id: 'dashboard', label: 'My Dashboard', icon: LayoutDashboard, section: 'OVERVIEW' },
@@ -178,24 +180,61 @@ export function EmployeeLayout({ children, currentView, onViewChange }: Employee
             ))}
           </nav>
 
-          {/* Footer */}
+          {/* Footer - Interactive AI Assistant */}
           <div className="p-4" style={{ borderTop: '1px solid rgba(59, 130, 246, 0.15)' }}>
-            <div className="p-3 rounded-lg" style={{
-              background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.1), rgba(139, 92, 246, 0.1))',
-              border: '1px solid rgba(59, 130, 246, 0.2)',
-            }}>
-              <div className="flex items-center gap-2 mb-2">
-                <Brain className="size-4 text-blue-400" />
-                <span className="text-xs text-blue-400 font-mono">AI ASSISTANT</span>
+            <button
+              type="button"
+              onClick={() => setIsAIAssistantOpen(true)}
+              className="w-full p-3 rounded-lg text-left transition-all duration-200 group cursor-pointer hover:border-blue-400/60"
+              style={{
+                background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(139, 92, 246, 0.12))',
+                border: '1px solid rgba(59, 130, 246, 0.3)',
+                boxShadow: '0 0 15px rgba(59, 130, 246, 0.08)',
+              }}
+            >
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="flex items-center gap-2">
+                  <Brain className="size-4 text-blue-400 group-hover:scale-110 transition-transform" />
+                  <span className="text-xs text-blue-400 font-mono font-bold tracking-wide">AI ASSISTANT</span>
+                </div>
+                <span className="size-2 rounded-full bg-green-400 animate-pulse" />
               </div>
-              <p className="text-xs text-slate-400 font-mono">Ask me anything</p>
-            </div>
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-slate-300 font-mono">Ask me anything</p>
+                <ChevronRight className="size-3.5 text-blue-400 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
+              </div>
+            </button>
           </div>
         </div>
 
         {/* Main Content */}
         <div className="flex-1 overflow-auto relative">
           {children}
+
+          {/* Floating AI Assistant Action Trigger */}
+          <button
+            type="button"
+            onClick={() => setIsAIAssistantOpen(true)}
+            className="fixed bottom-6 right-6 size-12 rounded-full flex items-center justify-center cursor-pointer shadow-2xl transition-all duration-200 hover:scale-105 z-40 group"
+            style={{
+              background: 'linear-gradient(135deg, #7c3aed 0%, #3b82f6 100%)',
+              border: '1px solid rgba(255, 255, 255, 0.2)',
+              boxShadow: '0 10px 30px -5px rgba(124, 58, 237, 0.5)',
+            }}
+            title="Open Employee AI Advisor"
+          >
+            <Brain className="size-6 text-white group-hover:rotate-12 transition-transform" />
+            <span className="absolute -top-1 -right-1 size-3 bg-green-400 rounded-full border-2 border-slate-900" />
+          </button>
+
+          {/* Modal */}
+          <EmployeeAIAssistantModal
+            isOpen={isAIAssistantOpen}
+            onClose={() => setIsAIAssistantOpen(false)}
+            orgId={currentOrganization?.id || ''}
+            userId={user?.id || ''}
+            employeeName={user?.name || 'there'}
+          />
         </div>
       </div>
     </div>

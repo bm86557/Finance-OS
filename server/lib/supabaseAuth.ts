@@ -53,8 +53,19 @@ export type ResolvedAuthUser = {
   sessionId: string | null;
 };
 
+interface CachedAuthUser {
+  resolved: ResolvedAuthUser;
+  expiresAt: number;
+}
+
+const authUserCache = new Map<string, CachedAuthUser>();
+const AUTH_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
 /**
  * Validates a Supabase access token and projects it into the app's `User` shape.
+ *
+ * Implements high-performance in-memory caching to eliminate redundant WAN round-trips
+ * and prevent UND_ERR_CONNECT_TIMEOUT when the frontend issues multiple parallel requests.
  *
  * The platform role is read from `public.profiles` — the column RLS actually governs — rather
  * than from `auth.users.user_metadata`, which is unverified metadata and was the basis of a
@@ -64,11 +75,38 @@ export async function resolveAuthUser(
   sb: SupabaseClient,
   accessToken: string,
 ): Promise<ResolvedAuthUser | null> {
-  const { data, error } = await sb.auth.getUser(accessToken);
-  if (error || !data.user) return null;
+  const now = Date.now();
+  const cached = authUserCache.get(accessToken);
+  if (cached && cached.expiresAt > now) {
+    return cached.resolved;
+  }
 
-  const user = await projectUser(sb, data.user);
-  return { user, sessionId: null };
+  try {
+    const { data, error } = await sb.auth.getUser(accessToken);
+    if (error || !data.user) return null;
+
+    const user = await projectUser(sb, data.user);
+    const resolved: ResolvedAuthUser = { user, sessionId: null };
+
+    authUserCache.set(accessToken, {
+      resolved,
+      expiresAt: now + AUTH_CACHE_TTL_MS,
+    });
+
+    if (authUserCache.size > 2000) {
+      const oldestKey = authUserCache.keys().next().value;
+      if (oldestKey) authUserCache.delete(oldestKey);
+    }
+
+    return resolved;
+  } catch (err: any) {
+    // If Supabase timed out or threw network error, but we have a recently expired cache entry (< 5 mins), use it as fallback
+    if (cached && cached.expiresAt > now - 5 * 60 * 1000) {
+      console.warn('[auth] Supabase network timeout/unreachable, safely serving authenticated user from fallback cache');
+      return cached.resolved;
+    }
+    throw err;
+  }
 }
 
 /** Builds the app-level `User` from an auth user + its `profiles` row. */

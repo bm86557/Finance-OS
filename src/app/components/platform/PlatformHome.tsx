@@ -57,17 +57,21 @@ export function PlatformHome({ onNavigate }: { onNavigate?: (view: string) => vo
     );
   }
 
-  const mrrSubtitle = stats.mrrGrowthPct !== undefined
-    ? `${stats.mrrGrowthPct >= 0 ? '+' : ''}${stats.mrrGrowthPct}% from last month`
-    : '+12% from last month';
+  const mrrSubtitle = stats.mrr === 0
+    ? 'All organizations on free tier'
+    : stats.mrrGrowthPct !== undefined
+      ? `${stats.mrrGrowthPct >= 0 ? '+' : ''}${stats.mrrGrowthPct}% from last month`
+      : 'Active monthly run rate';
 
-  const usersSubtitle = stats.newUsersThisMonth !== undefined
+  const usersSubtitle = stats.newUsersThisMonth !== undefined && stats.newUsersThisMonth > 0
     ? `+${stats.newUsersThisMonth} this month`
-    : `Across ${stats.activeOrgs} organizations`;
+    : `Across ${stats.activeOrgs} organization${stats.activeOrgs === 1 ? '' : 's'}`;
 
   const profitMarginSub = stats.mrr > 0 && stats.platformProfit > 0
     ? `${Math.round((stats.platformProfit / stats.mrr) * 100)}% net margin`
-    : 'Monthly profit';
+    : stats.mrr === 0
+      ? 'No active revenue'
+      : 'Monthly profit';
 
   return (
     <div className="p-8 space-y-8" style={{ background: AXIOM.backgrounds.main, minHeight: '100%' }}>
@@ -195,9 +199,9 @@ export function PlatformHome({ onNavigate }: { onNavigate?: (view: string) => vo
       {/* Stats Grid */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {[
-          { label: 'STATEMENTS PROCESSED', value: stats.statementsProcessed.toLocaleString(), sub: 'Total lifetime', icon: FileText, color: 'amber' },
-          { label: 'PLATFORM PROFIT', value: `Rs ${stats.platformProfit.toLocaleString()}`, sub: profitMarginSub, icon: TrendingUp, color: 'green' },
-          { label: 'STORAGE USED', value: `${((stats.storageUsed / stats.storageLimit) * 100).toFixed(1)}%`, sub: `${stats.storageUsed.toLocaleString()} / ${stats.storageLimit.toLocaleString()} MB`, icon: Database, color: 'blue' },
+          { label: 'STATEMENTS PROCESSED', value: (stats.statementsProcessed || 0).toLocaleString(), sub: 'Total lifetime', icon: FileText, color: 'amber' },
+          { label: 'PLATFORM PROFIT', value: `Rs ${(stats.platformProfit || 0).toLocaleString()}`, sub: profitMarginSub, icon: TrendingUp, color: 'green' },
+          { label: 'STORAGE USED', value: `${(((stats.storageUsed || 0) / (stats.storageLimit || 102400)) * 100).toFixed(1)}%`, sub: `${(stats.storageUsed || 0).toLocaleString()} / ${(stats.storageLimit || 102400).toLocaleString()} MB`, icon: Database, color: 'blue' },
         ].map((item, i) => (
           <motion.div
             key={item.label}

@@ -5,6 +5,7 @@
  */
 
 import type { AIConfig } from '../config/aiConfig.js';
+import { recordAiTelemetryEvent } from './aiGateway.js';
 import { classifyTransaction } from '../../src/lib/classificationEngine.js';
 
 export interface CategorySuggestion {
@@ -322,6 +323,7 @@ async function callGemini(
   let lastError: Error | null = null;
 
   for (const modelName of modelsToTry) {
+    const start = Date.now();
     try {
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
 
@@ -361,6 +363,25 @@ async function callGemini(
 
       const data = await response.json();
       const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const promptTokens = data.usageMetadata?.promptTokenCount || Math.ceil((systemPrompt.length + userPrompt.length) / 4);
+      const completionTokens = data.usageMetadata?.candidatesTokenCount || Math.ceil(raw.length / 4);
+      const totalTokens = data.usageMetadata?.totalTokenCount || (promptTokens + completionTokens);
+
+      void recordAiTelemetryEvent({
+        organizationId: (config as any).organizationId || 'platform_global',
+        portalType: 'organization_admin',
+        featureArea: 'narration_classification',
+        provider: 'gemini',
+        modelName,
+        fallbackTriggered: false,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        costUsd: 0,
+        latencyMs: Date.now() - start,
+        status: 'success',
+      });
+
       return repairJsonIfNeeded(raw);
     } catch (err: any) {
       lastError = err;

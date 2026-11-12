@@ -7,6 +7,9 @@
  * Run with `npm run dev:server` or `npm run dev:full` alongside the Vite app.
  */
 
+import dns from 'node:dns';
+dns.setDefaultResultOrder('ipv4first');
+
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
@@ -14,6 +17,7 @@ import cookieParser from 'cookie-parser';
 import { env } from './config/env.js';
 import { getSupabaseAdminClient } from './lib/supabaseAdmin.js';
 import { createApiV1Router } from './routes/apiV1.js';
+import { startOutboxWorker } from './lib/outboxWorker.js';
 
 const app = express();
 app.use(helmet());
@@ -63,4 +67,5 @@ try {
 
 app.listen(env.port, () => {
   console.log(`[finance-os] API http://localhost:${env.port} — Supabase PostgreSQL exclusive + /api/v1 REST (§1-§19)`);
+  startOutboxWorker();
 });

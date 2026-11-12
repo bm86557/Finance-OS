@@ -59,36 +59,75 @@ export interface PlatformOrganization {
   };
 }
 
-/** Plan catalogue — the platform's own pricing, not tenant data. */
-const PLAN_CATALOGUE: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = {
-  free: { name: 'Free', price: 0, limits: { users: 2, statements: 20, currencies: 1 } },
-  starter: { name: 'Starter', price: 1900, limits: { users: 3, statements: 50, currencies: 1 } },
-  basic: { name: 'Basic', price: 2900, limits: { users: 5, statements: 100, currencies: 2 } },
-  professional: { name: 'Professional', price: 4900, limits: { users: 10, statements: 500, currencies: 5 } },
-  business: { name: 'Business', price: 9900, limits: { users: 25, statements: 1000, currencies: 8 } },
-  enterprise: { name: 'Enterprise', price: 19900, limits: { users: 100, statements: 5000, currencies: 20 } },
+/** Authoritative Plan catalogue default fallback (in PKR) covering all 6 Handoff §3.1 tiers. */
+export const DEFAULT_PLAN_CATALOGUE: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = {
+  free: { name: 'Free', price: 0, limits: { users: 2, statements: 25, currencies: 1 } },
+  starter: { name: 'Starter', price: 19900, limits: { users: 3, statements: 50, currencies: 2 } },
+  basic: { name: 'Basic', price: 29900, limits: { users: 5, statements: 100, currencies: 2 } },
+  professional: { name: 'Professional', price: 49900, limits: { users: 10, statements: 500, currencies: 5 } },
+  business: { name: 'Business', price: 79900, limits: { users: 25, statements: 1000, currencies: 8 } },
+  enterprise: { name: 'Enterprise', price: 99900, limits: { users: 50, statements: 2000, currencies: 10 } },
 };
 
-/** A tenant stays in trial for this long after signup unless a status is stored explicitly. */
-const TRIAL_PERIOD_DAYS = 14;
+let cachedPlansCatalogue: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = { ...DEFAULT_PLAN_CATALOGUE };
+let lastCatalogueFetch = 0;
 
-function normalizePlanKey(value: unknown): string {
-  const key = String(value ?? '').trim().toLowerCase();
-  if (!key) return 'basic';
-  if (key.startsWith('prof')) return 'professional';
-  if (key.startsWith('ent')) return 'enterprise';
-  return key in PLAN_CATALOGUE ? key : 'basic';
+export async function getAuthoritativePlanCatalogue(sb?: Sb): Promise<Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }>> {
+  if (Date.now() - lastCatalogueFetch < 30_000 && Object.keys(cachedPlansCatalogue).length > 0) {
+    return cachedPlansCatalogue;
+  }
+  const client = sb ?? getSupabaseAdminClient();
+  if (!client) return DEFAULT_PLAN_CATALOGUE;
+  try {
+    const { data: plans } = await client.from('platform_plans').select('*').eq('active', true);
+    if (plans && plans.length > 0) {
+      const catalogue: Record<string, any> = { ...DEFAULT_PLAN_CATALOGUE };
+      for (const p of plans) {
+        const key = (p.slug || p.name || '').trim().toLowerCase();
+        catalogue[key] = {
+          name: p.name,
+          price: Number(p.price) || 0,
+          limits: {
+            users: p.limits?.users ?? 5,
+            statements: p.limits?.statements ?? 100,
+            currencies: p.limits?.currencies ?? 2,
+          },
+        };
+      }
+      cachedPlansCatalogue = catalogue;
+      lastCatalogueFetch = Date.now();
+      return catalogue;
+    }
+  } catch (err) {
+    console.warn('[platformOrganizations] Error fetching platform_plans, using defaults:', err);
+  }
+  return DEFAULT_PLAN_CATALOGUE;
 }
 
-function resolveStatus(settings: Record<string, unknown>, createdAt: string): PlatformOrgStatus {
+function normalizePlanKey(value: unknown, catalogue: Record<string, any> = DEFAULT_PLAN_CATALOGUE): string {
+  const key = String(value ?? '').trim().toLowerCase();
+  if (!key) return 'free';
+  if (key in catalogue) return key;
+  if (key === 'free') return 'free';
+  if (key.startsWith('start')) return 'starter';
+  if (key.startsWith('basic')) return 'basic';
+  if (key.startsWith('prof')) return 'professional';
+  if (key.startsWith('bus')) return 'business';
+  if (key.startsWith('ent')) return 'enterprise';
+  return 'free';
+}
+
+function resolveStatus(settings: Record<string, unknown>, createdAt: string, sub?: any): PlatformOrgStatus {
+  if (sub?.status === 'canceled') return 'suspended';
+  if (sub?.status === 'past_due') return 'churn_risk';
+  if (sub?.status === 'trialing') return 'trial';
+  if (sub?.status === 'active') return 'active';
+
   const raw = String(settings.status ?? '').trim().toLowerCase();
-  if (raw === 'active' || raw === 'trial' || raw === 'suspended' || raw === 'churn_risk') return raw;
+  if (raw === 'active' || raw === 'trial' || raw === 'suspended' || raw === 'churn_risk') return raw as PlatformOrgStatus;
   if (settings.suspended === true) return 'suspended';
-  const created = new Date(createdAt).getTime();
-  if (Number.isFinite(created)) {
-    const ageDays = (Date.now() - created) / (1000 * 60 * 60 * 24);
-    if (ageDays <= TRIAL_PERIOD_DAYS) return 'trial';
-  }
+  if (settings.is_trial === true) return 'trial';
+
   return 'active';
 }
 
@@ -137,7 +176,7 @@ async function loadUsageStats(sb: Sb, orgIds: string[]): Promise<UsageStats> {
   ]);
 
   for (const m of (membersRes.data ?? []) as Array<{ organization_id: string; status: string }>) {
-    if (m.status !== 'active') continue;
+    if (m.status && m.status !== 'active' && m.status !== 'pending') continue;
     stats.usersUsed.set(m.organization_id, (stats.usersUsed.get(m.organization_id) ?? 0) + 1);
   }
 
@@ -154,10 +193,16 @@ async function loadUsageStats(sb: Sb, orgIds: string[]): Promise<UsageStats> {
   return stats;
 }
 
-function toPlatformOrganization(row: OrgRow, stats: UsageStats, sub?: any): PlatformOrganization {
+function toPlatformOrganization(
+  row: OrgRow,
+  stats: UsageStats,
+  catalogue: Record<string, any> = DEFAULT_PLAN_CATALOGUE,
+  sub?: any
+): PlatformOrganization {
   const settings = (row.settings ?? {}) as Record<string, unknown>;
-  const planKey = normalizePlanKey(settings.plan);
-  const plan = PLAN_CATALOGUE[planKey];
+  const rawPlanKey = sub?.plan_slug || settings.plan;
+  const planKey = normalizePlanKey(rawPlanKey, catalogue);
+  const plan = catalogue[planKey] || DEFAULT_PLAN_CATALOGUE.basic;
   const currencies = stats.currenciesUsed.get(row.id) ?? new Set<string>();
   if (row.currency) currencies.add(row.currency);
 
@@ -169,6 +214,8 @@ function toPlatformOrganization(row: OrgRow, stats: UsageStats, sub?: any): Plat
     daysRemaining = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
   }
 
+  const status = resolveStatus(settings, row.created_at, sub);
+
   return {
     id: row.id,
     slug: row.slug ?? null,
@@ -179,7 +226,7 @@ function toPlatformOrganization(row: OrgRow, stats: UsageStats, sub?: any): Plat
     createdAt: row.created_at,
     settings,
     plan: plan.name,
-    status: resolveStatus(settings, row.created_at),
+    status,
     limits: {
       users: plan.limits.users,
       usersUsed: stats.usersUsed.get(row.id) ?? 0,
@@ -197,16 +244,17 @@ function toPlatformOrganization(row: OrgRow, stats: UsageStats, sub?: any): Plat
 }
 
 /** Reads every tenant row from Supabase and enriches it with real usage counters and active subscriptions. */
-export async function loadPlatformOrganizations(sb?: Sb): Promise<PlatformOrganization[] | null> {
+export async function loadPlatformOrganizations(sb?: Sb | null): Promise<PlatformOrganization[] | null> {
   const client = sb ?? getSupabaseAdminClient();
   if (!client) return null;
 
-  const [orgsRes, subsRes] = await Promise.all([
+  const [orgsRes, subsRes, catalogue] = await Promise.all([
     client
       .from('organizations')
       .select('id, slug, name, logo, currency, fiscal_year_start, created_at, settings')
       .order('created_at', { ascending: false }),
-    client.from('organization_subscriptions').select('organization_id, current_period_end, status'),
+    client.from('organization_subscriptions').select('organization_id, plan_slug, current_period_end, status'),
+    getAuthoritativePlanCatalogue(client),
   ]);
 
   if (orgsRes.error) {
@@ -221,7 +269,7 @@ export async function loadPlatformOrganizations(sb?: Sb): Promise<PlatformOrgani
 
   const rows = (orgsRes.data ?? []) as unknown as OrgRow[];
   const stats = await loadUsageStats(client, rows.map((r) => r.id));
-  return rows.map((row) => toPlatformOrganization(row, stats, subsMap.get(row.id)));
+  return rows.map((row) => toPlatformOrganization(row, stats, catalogue, subsMap.get(row.id)));
 }
 
 /** Merges a patch into the `settings` jsonb without dropping theme/notifications. */

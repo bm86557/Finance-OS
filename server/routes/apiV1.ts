@@ -39,7 +39,7 @@ import { loginRateLimiter } from '../middleware/rateLimit.js';
 import { getSupabaseAdminClient, isSupabaseAdminConfigured, verifyUserCredentials } from '../lib/supabaseAdmin.js';
 
 import { createOrganizationsListRouter } from './organizationsList.js';
-import { createOrganizationRouter } from './organizations.js';
+import { createOrganizationRouter, normalizeOrgPlanCurrencies } from './organizations.js';
 import platformInvitationsRouter from './platformInvitations.js';
 import { createTransactionsRouter } from './transactions.js';
 import { createAccountsRouter } from './accounts.js';
@@ -71,6 +71,7 @@ import { createCounterpartiesRouter } from './counterparties.js';
 import { createAttachmentsRouter } from './attachments.js';
 import { createBillingRouter } from './billing.js';
 import { createPlatformPlansRouter } from './platformPlans.js';
+import { createInvoicesRouter } from './invoices.js';
 
 /** All membership/org reads below go to Supabase — there is no local membership store any more. */
 async function fetchMembershipsForUser(
@@ -172,7 +173,7 @@ async function fetchOrganizationByIdOrSlug(
     /* non-critical */
   }
 
-  return orgRow;
+  return normalizeOrgPlanCurrencies(orgRow);
 }
 
 /** Selects best primary membership for user based on portal context. */
@@ -986,6 +987,7 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
   r.use('/organizations/:organizationId/notifications', createOrgNotificationsRouter());
   r.use('/organizations/:organizationId/debug-forecast', createDebugForecastRouter());
   r.use('/organizations/:organizationId/billing', createBillingRouter());
+  r.use('/organizations/:organizationId/invoices', createInvoicesRouter());
 
   // Public/shared plans catalogue
   r.use('/plans', createPlatformPlansRouter());
@@ -1019,6 +1021,9 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
     createUserOrgNotificationsRouter(),
   );
   r.use('/notifications', requireAuth, createGlobalNotificationsRouter());
+
+  // Plans catalogue accessible to all authenticated users (required by usePlanEntitlements and Billing)
+  r.use('/platform/plans', requireAuth, createPlatformPlansRouter());
 
   // §2 Platform console — platform staff only.
   r.use('/platform', requireAuth, requirePlatformRole('platform_admin', 'platform_manager'), createPlatformRouter());
