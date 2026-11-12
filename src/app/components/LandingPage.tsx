@@ -74,7 +74,7 @@ export function LandingPage() {
   ];
 
   return (
-    <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 via-blue-50 to-cyan-50'} flex flex-col items-center justify-start md:justify-center py-10 sm:py-16 px-4 relative overflow-x-hidden overflow-y-auto`}>
+    <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 via-blue-50 to-cyan-50'} flex flex-col items-center justify-start md:justify-center py-10 sm:py-16 px-4 relative overflow-x-clip`}>
       {/* Theme Toggle Button */}
       <motion.button
         initial={{ opacity: 0, scale: 0.8 }}
