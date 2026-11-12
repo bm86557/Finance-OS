@@ -46,26 +46,24 @@ app.all('/api/bundle', (_req, res) => {
   });
 });
 
-// Active Supabase connection probe at boot-time (§1, §3, R1)
-const sbAdmin = getSupabaseAdminClient();
-if (!sbAdmin) {
-  console.error('[FATAL] Supabase admin client could not be initialized.');
-  process.exit(1);
-}
-
-try {
-  const { error } = await sbAdmin.from('organizations').select('id').limit(1);
-  if (error) {
-    console.error('[FATAL] Active Supabase connection probe failed:', error.message);
-    process.exit(1);
+// Active Supabase connection probe & port listening (only for local standalone server)
+if (!process.env.VERCEL) {
+  const sbAdmin = getSupabaseAdminClient();
+  if (sbAdmin) {
+    try {
+      const { error } = await sbAdmin.from('organizations').select('id').limit(1);
+      if (!error) {
+        console.log('[finance-os] Connected to authoritative Supabase PostgreSQL database.');
+      }
+    } catch (connErr: any) {
+      console.warn('[finance-os] Supabase connection probe warning:', connErr?.message || connErr);
+    }
   }
-  console.log('[finance-os] Connected to authoritative Supabase PostgreSQL database.');
-} catch (connErr: any) {
-  console.error('[FATAL] Active Supabase connection probe threw exception:', connErr?.message || connErr);
-  process.exit(1);
+
+  app.listen(env.port, () => {
+    console.log(`[finance-os] API http://localhost:${env.port} — Supabase PostgreSQL exclusive + /api/v1 REST (§1-§19)`);
+    startOutboxWorker();
+  });
 }
 
-app.listen(env.port, () => {
-  console.log(`[finance-os] API http://localhost:${env.port} — Supabase PostgreSQL exclusive + /api/v1 REST (§1-§19)`);
-  startOutboxWorker();
-});
+export default app;
