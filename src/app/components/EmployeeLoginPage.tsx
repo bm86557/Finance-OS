@@ -148,7 +148,7 @@ export function EmployeeLoginPage({ onLogin }: EmployeeLoginPageProps) {
   });
 
   return (
-    <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 to-slate-100'} flex items-center justify-center p-4 relative overflow-hidden`}>
+    <div className={`min-h-screen ${theme === 'dark' ? 'bg-black' : 'bg-gradient-to-br from-slate-50 to-slate-100'} flex items-center justify-center p-4 py-10 relative overflow-x-hidden overflow-y-auto`}>
       {/* Animated Grid Background */}
       <div className={`absolute inset-0 ${theme === 'dark' ? 'opacity-20' : 'opacity-10'}`} style={{
         backgroundImage: `

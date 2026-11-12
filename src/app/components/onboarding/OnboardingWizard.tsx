@@ -56,7 +56,7 @@ export function OnboardingWizard() {
   };
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 overflow-y-auto p-4 sm:p-6 md:p-8 flex items-center justify-center">
       <AnimatePresence mode="wait">
         <motion.div
           key={currentStep}
@@ -64,10 +64,10 @@ export function OnboardingWizard() {
           animate={{ opacity: 1, scale: 1 }}
           exit={{ opacity: 0, scale: 0.95 }}
           transition={{ duration: 0.3 }}
-          className="w-full max-w-2xl"
+          className="w-full max-w-2xl my-auto"
         >
-          <Card className="bg-slate-900 border-white/10 shadow-2xl">
-            <CardContent className="p-8">
+          <Card className="bg-slate-900 border-white/10 shadow-2xl max-h-[85vh] flex flex-col">
+            <CardContent className="p-6 sm:p-8 overflow-y-auto">
               {/* Header */}
               <div className="flex items-center justify-between mb-6">
                 <div className="flex items-center gap-3">
