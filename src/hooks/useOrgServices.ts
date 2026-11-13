@@ -464,6 +464,8 @@ export interface ProfitIntelligenceServices {
   getClientProfitability(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof profitIntelligenceService.getClientProfitability>;
   getOverheadSummary(): ReturnType<typeof profitIntelligenceService.getOverheadSummary>;
   getBusinessVsPersonal(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof profitIntelligenceService.getBusinessVsPersonal>;
+  getSpaceProfitability(params?: { from?: string; to?: string }): ReturnType<typeof profitIntelligenceService.getSpaceProfitability>;
+  updateSpaceAllocations(allocations: Array<{ departmentId: string; squareFootage: number }>): ReturnType<typeof profitIntelligenceService.updateSpaceAllocations>;
 }
 
 export interface OverheadAllocationServices {
@@ -743,6 +745,8 @@ export function useOrgServices(): OrgServices {
       getClientProfitability: (params?) => profitIntelligenceService.getClientProfitability(orgId, params),
       getOverheadSummary:     ()        => profitIntelligenceService.getOverheadSummary(orgId),
       getBusinessVsPersonal:  (params?) => profitIntelligenceService.getBusinessVsPersonal(orgId, params),
+      getSpaceProfitability:  (params?) => profitIntelligenceService.getSpaceProfitability(orgId, params),
+      updateSpaceAllocations: (allocations) => profitIntelligenceService.updateSpaceAllocations(orgId, allocations),
     },
 
     // ── Overhead Allocations ─────────────────────────────────────────────────

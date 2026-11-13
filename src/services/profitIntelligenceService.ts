@@ -322,6 +322,28 @@ export const profitIntelligenceService = {
     return { success: true, data: [] };
   },
 
+  async updateSpaceAllocations(
+    organizationId: string,
+    allocations: Array<{ departmentId: string; squareFootage: number }>
+  ): Promise<ServiceResponse<{ updated: number }>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<{ updated: number }>(organizationId);
+      if (err) return err;
+      return apiPostJson<{ allocations: Array<{ departmentId: string; squareFootage: number }> }, { updated: number }>(
+        `${PI(organizationId)}/space-allocations`,
+        { allocations }
+      );
+    }
+
+    await simulateDelay();
+    allocations.forEach((a) => {
+      const dept = dataStore.departments.find((d) => d.id === a.departmentId);
+      if (dept) dept.squareFootage = a.squareFootage;
+    });
+    dataStore.notify('departments');
+    return { success: true, data: { updated: allocations.length } };
+  },
+
   async getSnapshots(
     organizationId: string
   ): Promise<ServiceResponse<ProfitabilitySnapshot[]>> {

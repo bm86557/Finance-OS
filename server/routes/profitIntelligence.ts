@@ -9,6 +9,7 @@ import { Router, type Request, type Response } from 'express';
 import { ok, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import { calculateDepartmentProfitability } from './departments.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -541,50 +542,72 @@ export function createProfitIntelligenceRouter(): Router {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
+    const from = (req.query.from || req.query.dateFrom || req.query.startDate) as string | undefined;
+    const to = (req.query.to || req.query.dateTo || req.query.endDate) as string | undefined;
+
     try {
-      const [{ data: depts }, { data: txns }, { data: allocRows }] = await Promise.all([
-        sb.from('departments').select('*').eq('organization_id', orgId),
-        sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
-      ]);
+      // Reconcile with authoritative §12.2 Department Cost Matrix & §12.3 Overhead Allocations
+      const deptProfitList = await calculateDepartmentProfitability(orgId, from, to);
+      const totalSqft = deptProfitList.reduce((sum: number, d: any) => sum + Math.max(0, Number(d.squareFootage || 0)), 0);
 
-      const activeDepts = (depts || []).filter((d: any) => d.is_active !== false);
-      const totalSqft = activeDepts.reduce((sum: number, d: any) => sum + Math.max(0, Number(d.square_footage || 0)), 0);
-
-      const totalPoolOverhead = (allocRows || []).reduce((sum: number, a: any) => sum + Number(a.amount || 0), 0);
-      const perDeptOverhead = activeDepts.length > 0 ? totalPoolOverhead / activeDepts.length : 0;
-
-      const spaceMetrics = activeDepts.map((d: any) => {
-        const sqft = Number(d.square_footage || 0);
-        const deptTxns = (txns || []).filter((t: any) => (t.department_id || t.departmentId) === d.id);
-        const revenue = deptTxns.filter((t: any) => t.type === 'credit').reduce((s: number, t: any) => s + Number(t.amount || 0), 0);
-        const directCost = deptTxns.filter((t: any) => t.type === 'debit').reduce((s: number, t: any) => s + Math.abs(Number(t.amount || 0)), 0);
-        
-        // Overhead share by square footage if configured, else equal
-        const overheadShare = totalSqft > 0 && sqft > 0 ? (totalPoolOverhead * sqft) / totalSqft : perDeptOverhead;
-        const totalCost = directCost + overheadShare;
-        const profit = revenue - totalCost;
+      const spaceMetrics = deptProfitList.map((d: any) => {
+        const sqft = Number(d.squareFootage || 0);
+        const revenue = Number(d.revenue || 0);
+        const cost = Number(d.fullDepartmentCost != null ? d.fullDepartmentCost : (d.directCosts || 0));
+        const profit = Number(d.netProfit != null ? d.netProfit : (revenue - cost));
 
         return {
-          departmentId: String(d.id),
-          departmentName: String(d.name),
+          departmentId: String(d.departmentId || d.id),
+          departmentName: String(d.departmentName || d.name),
           squareFootage: sqft,
           revenue: Math.round(revenue * 100) / 100,
-          cost: Math.round(totalCost * 100) / 100,
+          cost: Math.round(cost * 100) / 100,
           profit: Math.round(profit * 100) / 100,
           revPerSqft: sqft > 0 ? Math.round((revenue / sqft) * 100) / 100 : 0,
-          costPerSqft: sqft > 0 ? Math.round((totalCost / sqft) * 100) / 100 : 0,
+          costPerSqft: sqft > 0 ? Math.round((cost / sqft) * 100) / 100 : 0,
           profitPerSqft: sqft > 0 ? Math.round((profit / sqft) * 100) / 100 : 0,
           spaceSharePct: totalSqft > 0 ? Math.round((sqft / totalSqft) * 1000) / 10 : 0,
         };
       });
 
       return ok(res, spaceMetrics);
-    } catch (err) {
+    } catch (err: any) {
       console.error('[profitIntelligence.space-profitability] Error:', err);
-      return fail(res, 500, 'Failed to compute space profitability');
+      return fail(res, 500, err?.message || 'Failed to compute space profitability');
     }
   });
+
+  // PATCH & POST /space-allocations - Batch update department square footage (§12.5)
+  const handleSpaceAllocationsUpdate = async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const { allocations } = req.body as { allocations?: Array<{ departmentId: string; squareFootage: number }> };
+    if (!Array.isArray(allocations)) {
+      return fail(res, 400, 'Expected allocations array: [{ departmentId, squareFootage }]');
+    }
+
+    try {
+      const updatePromises = allocations.map((item) => {
+        const sqft = Math.max(0, Number(item.squareFootage || 0));
+        return sb
+          .from('departments')
+          .update({ square_footage: sqft })
+          .eq('id', item.departmentId)
+          .eq('organization_id', orgId);
+      });
+
+      await Promise.all(updatePromises);
+      return ok(res, { updated: allocations.length }, 'Space allocations updated successfully');
+    } catch (err: any) {
+      console.error('[profitIntelligence.space-allocations] Error:', err);
+      return fail(res, 500, err?.message || 'Failed to update space allocations');
+    }
+  };
+
+  r.patch('/space-allocations', handleSpaceAllocationsUpdate);
+  r.post('/space-allocations', handleSpaceAllocationsUpdate);
 
   // GET /worker-labor-costs - Worker loaded labor cost & dual capacity denominators (§12.1)
   r.get('/worker-labor-costs', async (req: Request, res: Response) => {

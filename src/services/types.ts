@@ -792,6 +792,58 @@ export interface ProjectProfitability {
   contributorCount?: number;
 }
 
+export interface DateRange {
+  from?: string;
+  to?: string;
+}
+
+export interface ProfitVelocity {
+  dailyVelocity: number;
+  windowDays: number;
+  totalOperatingProfit: number;
+  unit: string;
+}
+
+export interface ProfitabilitySnapshot {
+  id: string;
+  organizationId: string;
+  periodStart: string;
+  periodEnd: string;
+  totalRevenue: number;
+  totalExpense: number;
+  totalOverhead: number;
+  operatingProfit: number;
+  netProfit: number;
+  policyVersion?: string;
+  createdAt: string;
+  snapshotData?: Record<string, any>;
+}
+
+export interface WorkerLoadedLaborCost {
+  userId: string;
+  userName: string;
+  userEmail: string;
+  departmentId?: string | null;
+  departmentName?: string | null;
+  position?: string | null;
+  baseSalary: number;
+  employerTaxes: number;
+  employerBenefits: number;
+  approvedBonus: number;
+  workforceOverhead: number;
+  loadedLaborCost: number;
+  availableCapacityHours: number;
+  approvedProductiveHours: number | null;
+  capacityHourlyCost: number | null;
+  capacityMinuteCost: number | null;
+  productiveHourlyCost: number | null;
+  productiveMinuteCost: number | null;
+  capacityBasis: 'fte_160h';
+  currency?: string;
+  policyVersion?: string;
+  effectiveDate?: string;
+}
+
 export interface SquareFootProfitability {
   departmentId: string;
   departmentName: string;

@@ -520,6 +520,7 @@ export function OrgSettings() {
   const [deptBudget, setDeptBudget] = useState('');
   const [deptCostCenter, setDeptCostCenter] = useState('MAIN');
   const [deptIsActive, setDeptIsActive] = useState(true);
+  const [deptSquareFootage, setDeptSquareFootage] = useState('');
   const [deptSubmitting, setDeptSubmitting] = useState(false);
 
   // Project Modal State
@@ -543,6 +544,7 @@ export function OrgSettings() {
     setDeptBudget('');
     setDeptCostCenter('MAIN');
     setDeptIsActive(true);
+    setDeptSquareFootage('');
     setIsDeptModalOpen(true);
   };
 
@@ -553,6 +555,7 @@ export function OrgSettings() {
     setDeptBudget(dept.budget !== undefined && dept.budget !== null ? String(dept.budget) : '');
     setDeptCostCenter(dept.costCenter || 'MAIN');
     setDeptIsActive(dept.isActive ?? true);
+    setDeptSquareFootage(dept.squareFootage !== undefined && dept.squareFootage !== null && dept.squareFootage > 0 ? String(dept.squareFootage) : '');
     setIsDeptModalOpen(true);
   };
 
@@ -571,6 +574,7 @@ export function OrgSettings() {
         costCenter: deptCostCenter.trim() || 'MAIN',
         budget: deptBudget ? Number(deptBudget) : undefined,
         isActive: deptIsActive,
+        squareFootage: deptSquareFootage ? Math.max(0, Number(deptSquareFootage)) : 0,
       };
 
       if (editingDept) {
@@ -1078,6 +1082,9 @@ export function OrgSettings() {
                           )}
                           {dept.costCenter && (
                             <span className="text-slate-500 text-[11px]">• {dept.costCenter}</span>
+                          )}
+                          {dept.squareFootage !== undefined && dept.squareFootage > 0 && (
+                            <span className="text-purple-400 text-[11px] font-medium">• {dept.squareFootage.toLocaleString()} sqft</span>
                           )}
                         </div>
                       </div>
@@ -1939,6 +1946,29 @@ export function OrgSettings() {
                     color: AXIOM.inputs.color,
                   }}
                 />
+              </div>
+
+              <div>
+                <label className="text-xs font-semibold text-slate-300 block mb-1.5">
+                  Floor Area / Square Footage (sqft)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="any"
+                  placeholder="e.g. 1500"
+                  value={deptSquareFootage}
+                  onChange={(e) => setDeptSquareFootage(e.target.value)}
+                  className="w-full px-3.5 py-2.5 rounded-xl text-sm"
+                  style={{
+                    background: AXIOM.inputs.background,
+                    border: AXIOM.inputs.border,
+                    color: AXIOM.inputs.color,
+                  }}
+                />
+                <p className="text-[11px] text-slate-400 mt-1">
+                  Used for §12.3 overhead space allocation and §12.5 space efficiency metrics.
+                </p>
               </div>
 
               <div className="flex items-center gap-2 pt-1">

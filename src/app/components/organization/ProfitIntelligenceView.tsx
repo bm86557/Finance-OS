@@ -116,8 +116,10 @@ import {
   Maximize2,
   BarChart3,
   PieChart as PieChartIcon,
-  Clock
+  Clock,
+  Edit2
 } from 'lucide-react';
+import { toast } from 'sonner';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import { motion } from 'motion/react';
 import { AXIOM } from '../../../styles/axiom-tokens';
@@ -136,6 +138,9 @@ export function ProfitIntelligenceView() {
   const [projectPeriod, setProjectPeriod] = useState<'1M' | '3M' | '12M'>('3M');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [isProjectModalOpen, setIsProjectModalOpen] = useState(false);
+  const [isSpaceConfigOpen, setIsSpaceConfigOpen] = useState(false);
+  const [spaceAllocInputs, setSpaceAllocInputs] = useState<Record<string, string>>({});
+  const [isSavingSpace, setIsSavingSpace] = useState(false);
 
   // Calculate date range from period
   const dateRange = useMemo(() => {
@@ -156,6 +161,7 @@ export function ProfitIntelligenceView() {
     data: rawDeptProfit,
     loading: deptProfitLoading,
     error: deptProfitError,
+    refetch: refetchDeptProfit,
   } = useService(
     () => svc.departments.getProfitability({ from: dateRange.from, to: dateRange.to }),
     [svc.orgId, dateRange]
@@ -228,10 +234,46 @@ export function ProfitIntelligenceView() {
   );
 
   // Space profitability and floor efficiency metrics (§12.5)
-  const { data: spaceMetrics = [] } = useService(
+  const {
+    data: spaceMetrics = [],
+    refetch: refetchSpaceMetrics,
+  } = useService(
     () => profitIntelligenceService.getSpaceProfitability(svc.orgId, { from: dateRange.from, to: dateRange.to }),
     [svc.orgId, dateRange]
   );
+
+  const openSpaceConfigModal = () => {
+    const initial: Record<string, string> = {};
+    (spaceMetrics || []).forEach((sm) => {
+      initial[sm.departmentId] = sm.squareFootage > 0 ? String(sm.squareFootage) : '';
+    });
+    setSpaceAllocInputs(initial);
+    setIsSpaceConfigOpen(true);
+  };
+
+  const handleSaveSpaceAllocations = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!svc.orgId) return;
+    setIsSavingSpace(true);
+    try {
+      const allocations = Object.entries(spaceAllocInputs).map(([deptId, sqftStr]) => ({
+        departmentId: deptId,
+        squareFootage: sqftStr ? Math.max(0, Number(sqftStr)) : 0,
+      }));
+      const res = await profitIntelligenceService.updateSpaceAllocations(svc.orgId, allocations);
+      if (res.success) {
+        toast.success('Department space allocations updated successfully');
+        setIsSpaceConfigOpen(false);
+        await Promise.all([refetchSpaceMetrics(), refetchDeptProfit?.()]);
+      } else {
+        toast.error(res.error || 'Failed to update space allocations');
+      }
+    } catch {
+      toast.error('An error occurred while saving space allocations');
+    } finally {
+      setIsSavingSpace(false);
+    }
+  };
 
   const hasLiveDeptData = liveDepartments.length > 0;
 
@@ -1573,20 +1615,56 @@ export function ProfitIntelligenceView() {
               boxShadow: '0 20px 60px -20px rgba(168, 85, 247, 0.5)',
             }}
           >
-            <div className="flex items-center gap-3 mb-6">
-              <div 
-                className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
-                style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
+            <div className="flex items-center justify-between mb-6 flex-wrap gap-4">
+              <div className="flex items-center gap-3">
+                <div 
+                  className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shrink-0"
+                  style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
+                >
+                  <Maximize2 className="w-6 h-6 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-bold text-white">Square-Foot Profitability & Space Efficiency (§12.5)</h3>
+                  <p className="text-sm text-slate-400">
+                    Floor area productivity and operating cost density across departmental office allocations
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={openSpaceConfigModal}
+                className="px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 transition-all shadow-lg shadow-purple-900/30 border border-purple-400/30 cursor-pointer"
               >
-                <Maximize2 className="w-6 h-6 text-white" />
-              </div>
-              <div>
-                <h3 className="text-xl font-bold text-white">Square-Foot Profitability & Space Efficiency (§12.5)</h3>
-                <p className="text-sm text-slate-400">
-                  Floor area productivity and operating cost density across departmental office allocations
-                </p>
-              </div>
+                <Edit2 className="w-4 h-4" />
+                Configure Space
+              </button>
             </div>
+
+            {/* Unconfigured Space Guidance Banner */}
+            {totalSpaceSqft === 0 && (
+              <div className="mb-6 p-4 rounded-2xl bg-purple-950/40 border border-purple-500/30 flex items-center justify-between flex-wrap gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-300 flex items-center justify-center font-bold shrink-0">
+                    ℹ️
+                  </div>
+                  <div>
+                    <p className="text-xs text-purple-200 font-medium">
+                      Department floor areas have not been configured yet.
+                    </p>
+                    <p className="text-[11px] text-purple-400">
+                      Assign square footage to departments to compute revenue density, operating cost density, and space efficiency (§12.5).
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={openSpaceConfigModal}
+                  className="px-3.5 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition-colors cursor-pointer"
+                >
+                  Set Floor Areas
+                </button>
+              </div>
+            )}
 
             {/* Space Metrics KPI Cards */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
@@ -1847,6 +1925,90 @@ export function ProfitIntelligenceView() {
               No data available
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Space Allocation Configuration Modal (§12.5) */}
+      <Dialog open={isSpaceConfigOpen} onOpenChange={setIsSpaceConfigOpen}>
+        <DialogContent className="max-w-lg bg-slate-900 border-slate-700 text-white">
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold flex items-center gap-2">
+              <Maximize2 className="w-5 h-5 text-purple-400" />
+              Configure Department Floor Areas (§12.5)
+            </DialogTitle>
+            <p className="text-xs text-slate-400 mt-1">
+              Specify occupied office area in square feet for each active department. Used for space productivity calculations and spatial overhead allocation (§12.3).
+            </p>
+          </DialogHeader>
+
+          <form onSubmit={handleSaveSpaceAllocations} className="space-y-4 mt-2">
+            <div className="max-h-[50vh] overflow-y-auto space-y-3 pr-1">
+              {spaceMetrics && spaceMetrics.length > 0 ? (
+                spaceMetrics.map((sm) => (
+                  <div
+                    key={sm.departmentId}
+                    className="flex items-center justify-between p-3.5 rounded-xl bg-slate-800/60 border border-slate-700/60 gap-3"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-white truncate">{sm.departmentName}</p>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        Revenue: {currency} {sm.revenue.toLocaleString()} • Cost: {currency} {sm.cost.toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <input
+                        type="number"
+                        min="0"
+                        step="any"
+                        placeholder="0"
+                        value={spaceAllocInputs[sm.departmentId] ?? ''}
+                        onChange={(e) =>
+                          setSpaceAllocInputs((prev) => ({
+                            ...prev,
+                            [sm.departmentId]: e.target.value,
+                          }))
+                        }
+                        className="w-24 px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-right text-sm font-mono focus:border-purple-500 focus:outline-none"
+                      />
+                      <span className="text-xs text-slate-400 font-mono">sqft</span>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="p-6 text-center text-slate-400 text-sm">
+                  No active departments available to configure.
+                </div>
+              )}
+            </div>
+
+            {/* Total Assigned Space Dynamic Counter */}
+            <div className="p-3.5 rounded-xl bg-purple-950/40 border border-purple-800/50 flex items-center justify-between text-xs">
+              <span className="text-purple-300 font-medium">Total Assigned Office Space:</span>
+              <span className="text-white font-bold font-mono text-sm">
+                {Object.values(spaceAllocInputs)
+                  .reduce((sum, val) => sum + Math.max(0, Number(val || 0)), 0)
+                  .toLocaleString()}{' '}
+                sqft
+              </span>
+            </div>
+
+            <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => setIsSpaceConfigOpen(false)}
+                className="px-4 py-2 rounded-xl text-sm font-medium text-slate-300 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isSavingSpace || !spaceMetrics || spaceMetrics.length === 0}
+                className="px-5 py-2 rounded-xl text-sm font-medium text-white bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 transition-all disabled:opacity-50 cursor-pointer shadow-lg shadow-purple-900/30"
+              >
+                {isSavingSpace ? 'Saving...' : 'Save Space Allocations'}
+              </button>
+            </div>
+          </form>
         </DialogContent>
       </Dialog>
     </div>
