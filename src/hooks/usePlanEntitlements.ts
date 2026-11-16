@@ -23,37 +23,115 @@ export interface UsePlanEntitlementsResult {
   subscription: SubscriptionInfo | null;
 }
 
+const ENTITLEMENTS_CACHE_TTL_MS = 30_000;
+
+let cachedPlans: { data: PlatformPlan[]; fetchedAt: number } | null = null;
+let inFlightPlans: { reqId: number; promise: Promise<PlatformPlan[] | null> } | null = null;
+let plansRequestSeq = 0;
+
+const cachedBillingSummaries = new Map<string, { data: BillingSummary; fetchedAt: number }>();
+const inFlightBillingSummaries = new Map<string, { reqId: number; promise: Promise<BillingSummary | null> }>();
+let billingSummarySeq = 0;
+
+function getPlansCached(force = false): Promise<PlatformPlan[] | null> {
+  if (!force && cachedPlans && Date.now() - cachedPlans.fetchedAt < ENTITLEMENTS_CACHE_TTL_MS) {
+    return Promise.resolve(cachedPlans.data);
+  }
+  if (!force && inFlightPlans) {
+    return inFlightPlans.promise;
+  }
+
+  const reqId = ++plansRequestSeq;
+  const promise = (async (): Promise<PlatformPlan[] | null> => {
+    try {
+      const res = await platformService.getPlans();
+      if (res.success && res.data) {
+        cachedPlans = { data: res.data, fetchedAt: Date.now() };
+        return res.data;
+      }
+      return cachedPlans?.data ?? null;
+    } catch {
+      return cachedPlans?.data ?? null;
+    } finally {
+      if (inFlightPlans?.reqId === reqId) {
+        inFlightPlans = null;
+      }
+    }
+  })();
+
+  inFlightPlans = { reqId, promise };
+  return promise;
+}
+
+function getBillingSummaryCached(orgId: string, force = false): Promise<BillingSummary | null> {
+  if (!orgId) return Promise.resolve(null);
+
+  const existing = cachedBillingSummaries.get(orgId);
+  if (!force && existing && Date.now() - existing.fetchedAt < ENTITLEMENTS_CACHE_TTL_MS) {
+    return Promise.resolve(existing.data);
+  }
+  if (!force) {
+    const inFlight = inFlightBillingSummaries.get(orgId);
+    if (inFlight) return inFlight.promise;
+  }
+
+  const reqId = ++billingSummarySeq;
+  const promise = (async (): Promise<BillingSummary | null> => {
+    try {
+      const res = await billingService.getBillingSummary(orgId);
+      if (res.success && res.data) {
+        cachedBillingSummaries.set(orgId, { data: res.data, fetchedAt: Date.now() });
+        return res.data;
+      }
+      return existing?.data ?? null;
+    } catch {
+      return existing?.data ?? null;
+    } finally {
+      if (inFlightBillingSummaries.get(orgId)?.reqId === reqId) {
+        inFlightBillingSummaries.delete(orgId);
+      }
+    }
+  })();
+
+  inFlightBillingSummaries.set(orgId, { reqId, promise });
+  return promise;
+}
+
 export function usePlanEntitlements(): UsePlanEntitlementsResult {
   const { currentOrganization } = useAuth();
+  const orgId = currentOrganization?.id || '';
   const { featureFlags } = usePlatformSettings();
-  const [plans, setPlans] = useState<PlatformPlan[]>([]);
-  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [plans, setPlans] = useState<PlatformPlan[]>(() => cachedPlans?.data ?? []);
+  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(() =>
+    orgId ? (cachedBillingSummaries.get(orgId)?.data ?? null) : null
+  );
+  const [isLoading, setIsLoading] = useState<boolean>(
+    () => !(cachedPlans && (!orgId || cachedBillingSummaries.has(orgId)))
+  );
 
   // Load plans catalogue and authoritative subscription summary
-  const loadEntitlements = useCallback(async () => {
+  const loadEntitlements = useCallback(async (force = false) => {
     try {
-      const orgId = currentOrganization?.id;
-      const [plansRes, summaryRes] = await Promise.all([
-        platformService.getPlans(),
-        orgId ? billingService.getBillingSummary(orgId) : Promise.resolve(null),
+      const [plansData, summaryData] = await Promise.all([
+        getPlansCached(force),
+        orgId ? getBillingSummaryCached(orgId, force) : Promise.resolve(null),
       ]);
-      if (plansRes.success && plansRes.data) {
-        setPlans(plansRes.data);
+      if (plansData) {
+        setPlans(plansData);
       }
-      if (summaryRes && summaryRes.success && summaryRes.data) {
-        setBillingSummary(summaryRes.data);
-      }
+      setBillingSummary(summaryData);
     } catch (err) {
       console.warn('[usePlanEntitlements] Error loading entitlements:', err);
     } finally {
       setIsLoading(false);
     }
-  }, [currentOrganization?.id]);
+  }, [orgId]);
 
   useEffect(() => {
-    loadEntitlements();
+    void loadEntitlements(false);
   }, [loadEntitlements]);
+
+  const refreshPlanEntitlements = useCallback(() => loadEntitlements(true), [loadEntitlements]);
 
   // Resolve current plan (prioritize live authoritative subscription)
   const currentPlan = useMemo<PlatformPlan | null>(() => {
@@ -194,7 +272,7 @@ export function usePlanEntitlements(): UsePlanEntitlementsResult {
     isViewAllowedByPlan,
     getRequiredFeature: getRequiredFeatureForView,
     plans,
-    refreshPlanEntitlements: loadEntitlements,
+    refreshPlanEntitlements,
     billingSummary,
     subscription: billingSummary?.subscription || null,
   };

@@ -352,7 +352,7 @@ export default function App() {
           <ThemeProvider>
             <NotificationProvider>
               <OnboardingProvider>
-                <Suspense fallback={<LoadingScreen />}>
+                <Suspense fallback={null}>
                   <SilentErrorBoundary>
                     <MagneticCursor />
                   </SilentErrorBoundary>
@@ -368,6 +368,8 @@ export default function App() {
                   <SilentErrorBoundary>
                     <AIAssistantChat />
                   </SilentErrorBoundary>
+                </Suspense>
+                <Suspense fallback={<LoadingScreen />}>
                   <ErrorBoundary>
                     <AppRoutes />
                   </ErrorBoundary>

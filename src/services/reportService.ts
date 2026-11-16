@@ -14,7 +14,13 @@ import type {
   CashFlowForecast,
   ServiceResponse
 } from './types';
-import { getSupabaseClient } from '@/lib/supabaseClient';
+import {
+  getSupabaseClient,
+  getActiveSupabaseAccessToken,
+  isSupabaseConfigured,
+  refreshSupabaseAccessToken,
+} from '@/lib/supabaseClient';
+import { getApiBaseUrl } from '@/lib/apiClient';
 
 export interface DateRange {
   from?: string;
@@ -61,7 +67,6 @@ export class ReportService {
   private async authHeaders(): Promise<HeadersInit> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     try {
-      const { getActiveSupabaseAccessToken } = await import('@/lib/supabaseClient');
       const token = await getActiveSupabaseAccessToken();
       if (token) {
         headers['Authorization'] = `Bearer ${token}`;
@@ -79,16 +84,15 @@ export class ReportService {
       new Headers(init.headers).forEach((v, k) => headers.set(k, v));
     }
 
-    let response = await this.authedFetch(url, { ...init, headers, credentials: 'include' });
+    let response = await fetch(url, { ...init, headers, credentials: 'include' });
     if (response.status === 401) {
       try {
-        const { isSupabaseConfigured, refreshSupabaseAccessToken } = await import('@/lib/supabaseClient');
         if (isSupabaseConfigured()) {
           const refreshedToken = await refreshSupabaseAccessToken();
           if (refreshedToken) {
             const retryHeaders = new Headers(headers);
             retryHeaders.set('Authorization', `Bearer ${refreshedToken}`);
-            response = await this.authedFetch(url, { ...init, headers: retryHeaders, credentials: 'include' });
+            response = await fetch(url, { ...init, headers: retryHeaders, credentials: 'include' });
           }
         }
       } catch {
@@ -575,7 +579,7 @@ let reportServiceInstance: ReportService | null = null;
 
 export function getReportService(): ReportService {
   if (!reportServiceInstance) {
-    const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api/v1';
+    const baseUrl = getApiBaseUrl() || '/api/v1';
     reportServiceInstance = new ReportService(baseUrl);
   }
   return reportServiceInstance;

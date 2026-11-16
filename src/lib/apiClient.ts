@@ -6,7 +6,12 @@
 
 import type { ServiceResponse } from '@/services/types';
 import { logApiFailure } from '@/lib/diagnostics';
-import { isSupabaseDataConfigured } from '@/lib/supabaseClient';
+import {
+  isSupabaseDataConfigured,
+  isSupabaseConfigured,
+  getActiveSupabaseAccessToken,
+  refreshSupabaseAccessToken,
+} from '@/lib/supabaseClient';
 
 function normalizeApiBaseUrl(raw: string): string {
   const trimmed = raw.trim().replace(/\/+$/, '');
@@ -88,7 +93,6 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
   let activeToken = token;
   if (!activeToken) {
     try {
-      const { getActiveSupabaseAccessToken } = await import('@/lib/supabaseClient');
       activeToken = await getActiveSupabaseAccessToken();
     } catch {
       /* ignore */
@@ -127,7 +131,6 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
 
     if (res.status === 401 && !requestInit.signal?.aborted) {
       try {
-        const { isSupabaseConfigured, refreshSupabaseAccessToken } = await import('@/lib/supabaseClient');
         if (isSupabaseConfigured()) {
           const refreshedToken = await refreshSupabaseAccessToken();
           if (refreshedToken && refreshedToken !== activeToken) {
