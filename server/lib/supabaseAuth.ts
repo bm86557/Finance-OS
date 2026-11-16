@@ -71,6 +71,17 @@ const AUTH_CACHE_TTL_MS = 60 * 1000; // 60 seconds
  * than from `auth.users.user_metadata`, which is unverified metadata and was the basis of a
  * privilege-escalation path in the old dual-auth flow.
  */
+function isTransientSupabaseAuthError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { name?: string; status?: number; message?: string };
+  if (e.name === 'AuthRetryableFetchError') return true;
+  if (typeof e.status === 'number' && (e.status === 0 || e.status === 429 || e.status >= 500)) {
+    return true;
+  }
+  const msg = typeof e.message === 'string' ? e.message : '';
+  return /timeout|fetch failed|ECONNRESET|ETIMEDOUT|UND_ERR|network/i.test(msg);
+}
+
 export async function resolveAuthUser(
   sb: SupabaseClient,
   accessToken: string,
@@ -83,7 +94,21 @@ export async function resolveAuthUser(
 
   try {
     const { data, error } = await sb.auth.getUser(accessToken);
-    if (error || !data.user) return null;
+    if (error) {
+      if (isTransientSupabaseAuthError(error)) {
+        if (cached && cached.expiresAt > now - 5 * 60 * 1000) {
+          console.warn('[auth] Supabase transient error, serving authenticated user from fallback cache:', error.message);
+          return cached.resolved;
+        }
+        throw error;
+      }
+      authUserCache.delete(accessToken);
+      return null;
+    }
+    if (!data.user) {
+      authUserCache.delete(accessToken);
+      return null;
+    }
 
     const user = await projectUser(sb, data.user);
     const resolved: ResolvedAuthUser = { user, sessionId: null };

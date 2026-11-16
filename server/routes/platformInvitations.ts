@@ -9,6 +9,7 @@ import { getSupabaseAdminClient, isSupabaseAdminConfigured } from '../lib/supaba
 import { findAuthUserByEmail } from '../lib/supabaseAuth.js';
 import nodemailer from 'nodemailer';
 import { env } from '../config/env.js';
+import { resolveClientOrigin } from '../lib/requestOrigin.js';
 
 const router = Router();
 
@@ -317,7 +318,7 @@ router.post('/', async (req: Request, res: Response) => {
     }
 
     // Generate invitation URL
-    const clientOrigin = req.headers.origin || `http://localhost:${env.port || 5173}`;
+    const clientOrigin = resolveClientOrigin(req);
     const invitationUrl = `${clientOrigin}/accept-org-invite/${invitation.token}`;
 
     // Send email via nodemailer (like team invitations)
@@ -404,7 +405,7 @@ router.post('/:id/resend', async (req: Request, res: Response) => {
     }
 
     // Generate invitation URL
-    const clientOrigin = req.headers.origin || `http://localhost:${env.port || 5173}`;
+    const clientOrigin = resolveClientOrigin(req);
     const invitationUrl = `${clientOrigin}/accept-org-invite/${invitation.token}`;
 
     // Send email
@@ -471,6 +472,228 @@ router.post('/sync-profile', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[platformInvitations.syncProfile] Error:', err);
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/v1/platform/invitations/accept
+ * Accept an organization invitation, create/confirm the admin user,
+ * create the organization with its assigned plan, membership, and subscription.
+ */
+router.post('/accept', async (req: Request, res: Response) => {
+  try {
+    const { token, password } = req.body ?? {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ success: false, error: 'Invitation token is required' });
+    }
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
+    }
+
+    const sb = getSupabaseAdminClient();
+    if (!sb || !isSupabaseAdminConfigured()) {
+      return res.status(500).json({ success: false, error: 'Database not configured' });
+    }
+
+    const { data: invitation, error: invErr } = await sb
+      .from('organization_invitations')
+      .select('*')
+      .eq('token', token.trim())
+      .eq('status', 'pending')
+      .gt('expires_at', new Date().toISOString())
+      .maybeSingle();
+
+    if (invErr || !invitation) {
+      return res.status(400).json({ success: false, error: 'Invalid or expired invitation' });
+    }
+
+    const adminEmail = String(invitation.admin_email).trim().toLowerCase();
+    const resolvedName = String(invitation.admin_name || adminEmail.split('@')[0]).trim();
+
+    // Prevent an existing org owner from being hijacked via invite
+    const existingAuthUser = await findAuthUserByEmail(sb, adminEmail);
+    let userId: string;
+    let createdNewAuthUser = false;
+
+    if (existingAuthUser) {
+      const { data: ownedOrgs } = await sb
+        .from('organization_members')
+        .select('id')
+        .eq('user_id', existingAuthUser.id)
+        .eq('role', 'owner')
+        .limit(1);
+
+      if (ownedOrgs && ownedOrgs.length > 0) {
+        return res.status(400).json({ success: false, error: 'This email already owns an organization' });
+      }
+
+      const { error: updateErr } = await sb.auth.admin.updateUserById(existingAuthUser.id, {
+        password,
+        email_confirm: true,
+        user_metadata: {
+          ...(existingAuthUser.user_metadata || {}),
+          full_name: resolvedName,
+          is_org_admin: true,
+          platform_role: 'organization_user',
+          organization_name: invitation.organization_name,
+          email: adminEmail,
+        },
+      });
+      if (updateErr) {
+        return res.status(500).json({ success: false, error: updateErr.message });
+      }
+      userId = existingAuthUser.id;
+    } else {
+      const { data: created, error: createUserErr } = await sb.auth.admin.createUser({
+        email: adminEmail,
+        password,
+        email_confirm: true,
+        user_metadata: {
+          full_name: resolvedName,
+          is_org_admin: true,
+          platform_role: 'organization_user',
+          organization_name: invitation.organization_name,
+          email: adminEmail,
+        },
+      });
+      if (createUserErr || !created.user) {
+        return res.status(400).json({
+          success: false,
+          error: createUserErr?.message || 'Failed to create user account',
+        });
+      }
+      userId = created.user.id;
+      createdNewAuthUser = true;
+    }
+
+    const cleanupNewUser = async () => {
+      if (createdNewAuthUser) {
+        try {
+          await sb.auth.admin.deleteUser(userId);
+        } catch {
+          /* ignore cleanup failure */
+        }
+      }
+    };
+
+    try {
+      // Deduplicate slug so repeated/similar org names never fail with unique constraint error
+      const baseSlug = String(invitation.organization_slug || invitation.organization_name || 'org')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '') || 'org';
+      let finalSlug = baseSlug;
+      const { data: slugMatch } = await sb
+        .from('organizations')
+        .select('id')
+        .eq('slug', finalSlug)
+        .maybeSingle();
+      if (slugMatch) {
+        finalSlug = `${baseSlug}-${Date.now().toString(36).slice(-4)}`;
+      }
+
+      // Resolve plan details from invitation.plan + platform_plans
+      const rawPlan = String(invitation.plan || 'basic').trim().toLowerCase();
+      const planSlug = rawPlan.replace(/^plan-/, '') || 'basic';
+      let planRow: { id?: string; slug?: string; features?: string[] } | null = null;
+      try {
+        const { data: pRow } = await sb
+          .from('platform_plans')
+          .select('id, slug, features')
+          .or(`slug.eq.${planSlug},id.eq.${rawPlan}`)
+          .maybeSingle();
+        planRow = pRow;
+      } catch {
+        /* non-critical */
+      }
+
+      const orgId = `org-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const orgSettings: Record<string, any> = {
+        theme: 'dark',
+        notifications: true,
+        plan: planRow?.slug || planSlug,
+      };
+      if (planRow?.id) orgSettings.planId = planRow.id;
+      if (Array.isArray(planRow?.features)) orgSettings.planFeatures = planRow.features;
+
+      const { error: orgErr } = await sb.from('organizations').insert({
+        id: orgId,
+        name: invitation.organization_name,
+        slug: finalSlug,
+        currency: 'USD',
+        fiscal_year_start: '01-01',
+        settings: orgSettings,
+      });
+
+      if (orgErr) {
+        await cleanupNewUser();
+        return res.status(500).json({ success: false, error: orgErr.message });
+      }
+
+      // Best-effort subscription record so plan sync in apiV1 picks up the assigned plan
+      try {
+        await sb.from('organization_subscriptions').insert({
+          organization_id: orgId,
+          plan_id: planRow?.id || `plan-${planSlug}`,
+          plan_slug: planRow?.slug || planSlug,
+          status: 'active',
+        });
+      } catch {
+        /* non-critical if table/schema differs */
+      }
+
+      const { error: memberErr } = await sb.from('organization_members').insert({
+        user_id: userId,
+        organization_id: orgId,
+        role: 'owner',
+        portal_type: 'organization_admin',
+        status: 'active',
+        email: adminEmail,
+        joined_at: new Date().toISOString(),
+      });
+
+      if (memberErr) {
+        await sb.from('organizations').delete().eq('id', orgId);
+        await cleanupNewUser();
+        return res.status(500).json({ success: false, error: memberErr.message });
+      }
+
+      await sb.from('profiles').upsert({
+        id: userId,
+        email: adminEmail,
+        full_name: resolvedName,
+        platform_role: 'organization_user',
+      }, { onConflict: 'id' });
+
+      await sb
+        .from('organization_invitations')
+        .update({
+          status: 'accepted',
+          accepted_at: new Date().toISOString(),
+          created_organization_id: orgId,
+          created_user_id: userId,
+        })
+        .eq('id', invitation.id);
+
+      return res.json({
+        success: true,
+        data: {
+          organizationId: orgId,
+          userId,
+          email: adminEmail,
+          plan: orgSettings.plan,
+        },
+      });
+    } catch (innerErr: any) {
+      await cleanupNewUser();
+      throw innerErr;
+    }
+  } catch (err: any) {
+    console.error('[platformInvitations.accept] Error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Failed to accept invitation',
+    });
   }
 });
 

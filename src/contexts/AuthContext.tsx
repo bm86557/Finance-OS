@@ -5,7 +5,7 @@ import { authService, organizationService } from '@/services';
 import type { AuthSession } from '@/services';
 import type { PortalType } from '@/services/authSessionTypes';
 import { logUnexpectedError } from '@/lib/diagnostics';
-import { isSupabaseConfigured } from '@/lib/supabaseClient';
+import { isSupabaseConfigured, getSupabaseClient } from '@/lib/supabaseClient';
 import { isHttpBackendConfigured } from '@/lib/apiClient';
 import { hydrateDataStoreFromSupabase } from '@/services/dataStore';
 import { setupSupabaseRealtimeSync, teardownSupabaseRealtimeSync } from '@/services/realtimeSync';
@@ -178,6 +178,30 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       }
     };
     restoreSession();
+
+    if (!isSupabaseConfigured()) return;
+    const sb = getSupabaseClient();
+    if (!sb) return;
+
+    const { data: { subscription } } = sb.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') {
+        localStorage.removeItem(TOKEN_KEY);
+        try {
+          localStorage.removeItem('finance_os_portal');
+        } catch {}
+        setActivePortal(null);
+        setUser(null);
+        setCurrentOrganization(null);
+        setUserRole(null);
+        setMembership(null);
+        setOrganizations([]);
+        teardownSupabaseRealtimeSync();
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -214,7 +238,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     }
   };
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     // Wait for the service call to complete to ensure Supabase session is properly cleared
     await authService.logout();
     localStorage.removeItem(TOKEN_KEY);
@@ -231,7 +255,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     // Small delay to ensure Supabase has fully processed the logout
     await new Promise(resolve => setTimeout(resolve, 100));
     teardownSupabaseRealtimeSync();
-  };
+  }, []);
 
   const acceptInvite = async (organizationId?: string, userId?: string) => {
     const oId = organizationId || membership?.organizationId || currentOrganization?.id;

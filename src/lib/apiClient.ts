@@ -57,6 +57,7 @@ function withTimeoutSignal(
  * JSON-oriented `fetch` that returns `ServiceResponse<T>`.
  * - Sends cookies (`credentials: 'include'`) for session-style auth.
  * - Auto-attaches Supabase Bearer token if available and token option is omitted.
+ * - Proactively refreshes near-expiry tokens and retries once on HTTP 401.
  * - 2xx: prefers body shaped like `{ success, data, ... }`; otherwise wraps raw JSON as `{ success: true, data }`.
  * - Non-OK HTTP: maps body `error` / `message` or status to `success: false`.
  */
@@ -78,11 +79,8 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
   let activeToken = token;
   if (!activeToken) {
     try {
-      const sb = (await import('@/lib/supabaseClient')).getSupabaseClient();
-      if (sb) {
-        const sess = await sb.auth.getSession();
-        activeToken = sess.data.session?.access_token;
-      }
+      const { getActiveSupabaseAccessToken } = await import('@/lib/supabaseClient');
+      activeToken = await getActiveSupabaseAccessToken();
     } catch {
       /* ignore */
     }
@@ -97,19 +95,42 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     headers.set('Content-Type', 'application/json');
   }
 
-  const { signal: timeoutSignal, clear: clearTimeoutSignal } = withTimeoutSignal(
-    DEFAULT_FETCH_TIMEOUT_MS,
-    requestInit.signal,
-  );
+  const executeFetch = async (authHeaders: Headers): Promise<Response> => {
+    const { signal: timeoutSignal, clear: clearTimeoutSignal } = withTimeoutSignal(
+      DEFAULT_FETCH_TIMEOUT_MS,
+      requestInit.signal,
+    );
+    try {
+      return await fetch(url, {
+        ...requestInit,
+        headers: authHeaders,
+        credentials: 'include',
+        cache: 'no-store',
+        signal: timeoutSignal,
+      });
+    } finally {
+      clearTimeoutSignal();
+    }
+  };
 
   try {
-    const res = await fetch(url, {
-      ...requestInit,
-      headers,
-      credentials: 'include',
-      cache: 'no-store',
-      signal: timeoutSignal,
-    });
+    let res = await executeFetch(headers);
+
+    if (res.status === 401 && !requestInit.signal?.aborted) {
+      try {
+        const { isSupabaseConfigured, refreshSupabaseAccessToken } = await import('@/lib/supabaseClient');
+        if (isSupabaseConfigured()) {
+          const refreshedToken = await refreshSupabaseAccessToken();
+          if (refreshedToken && refreshedToken !== activeToken) {
+            const retryHeaders = new Headers(headers);
+            retryHeaders.set('Authorization', `Bearer ${refreshedToken}`);
+            res = await executeFetch(retryHeaders);
+          }
+        }
+      } catch {
+        /* fall through with original 401 response */
+      }
+    }
 
     const text = await res.text();
     let parsed: unknown = undefined;
@@ -143,8 +164,6 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
           : 'Network error';
     logApiFailure({ method, path, message: msg });
     return { success: false, data: null as unknown as T, error: msg };
-  } finally {
-    clearTimeoutSignal();
   }
 }
 

@@ -11,6 +11,7 @@ import { findAuthUserIdByLegacyId, getSupabaseAdminClient, isSupabaseAdminConfig
 import { findAuthUserByEmail } from '../lib/supabaseAuth.js';
 import { sendInviteEmail } from '../lib/emailService.js';
 import { env } from '../config/env.js';
+import { resolveClientOrigin } from '../lib/requestOrigin.js';
 import { encryptSecret, decryptSecret, maskApiKey, extractLast4, fingerprintKey } from '../lib/secretBox.js';
 import { resolveOrgAIConfig, testAIConnection, invalidateOrgAICache, type AIProvider } from '../lib/aiGateway.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
@@ -908,7 +909,7 @@ export function createOrganizationRouter(): Router {
 
     if (isSupabaseAdminConfigured() && sb) {
       try {
-        const clientRedirectUrl = `${env.corsOrigin || 'http://localhost:5173'}/accept-invite`;
+        const clientRedirectUrl = `${resolveClientOrigin(req)}/accept-invite`;
         const orgKey = org.id || orgId;
 
         // Resolve real department_id so headcount for overhead allocation is automatically linked
@@ -1165,7 +1166,7 @@ export function createOrganizationRouter(): Router {
       return { email: trimmedEmail, success: false, error: 'Failed to create user in database' };
     }
 
-    const clientOrigin = env.corsOrigin || 'http://localhost:5173';
+    const clientOrigin = resolveClientOrigin(req);
     // The login page is sign-in only. First-time invitees activate their password via
     // `acceptInviteUrl`, so the portal link is just the everyday sign-in entry point.
     const portalUrl = `${clientOrigin}/login/employee?email=${encodeURIComponent(trimmedEmail)}&org=${encodeURIComponent(org!.slug || orgId)}`;
@@ -1411,7 +1412,7 @@ export function createOrganizationRouter(): Router {
     }
     const orgName = org?.name || 'Organization';
 
-    const clientOrigin = env.corsOrigin || 'http://localhost:5173';
+    const clientOrigin = resolveClientOrigin(req);
     const clientRedirectUrl = `${clientOrigin}/accept-invite`;
     let actionLink: string | undefined = undefined;
 

@@ -107,6 +107,59 @@ export function clearSupabaseConfigFromStorage(): void {
 export function invalidateSupabaseClient(): void {
   client = null;
   clientFingerprint = '';
+  inFlightRefresh = null;
+}
+
+let inFlightRefresh: Promise<string | undefined> | null = null;
+
+/**
+ * Refreshes the active Supabase session using a single shared in-flight promise so concurrent
+ * requests never race on refresh-token rotation.
+ */
+export async function refreshSupabaseAccessToken(): Promise<string | undefined> {
+  const sb = getSupabaseClient();
+  if (!sb) return undefined;
+
+  if (!inFlightRefresh) {
+    inFlightRefresh = (async () => {
+      try {
+        const { data, error } = await sb.auth.refreshSession();
+        if (error) return undefined;
+        return data.session?.access_token;
+      } catch {
+        return undefined;
+      } finally {
+        inFlightRefresh = null;
+      }
+    })();
+  }
+
+  return inFlightRefresh;
+}
+
+/**
+ * Returns a valid Supabase access token, proactively refreshing if the stored token is expired
+ * or within 60 seconds of expiring (handles browser tab throttling and clock skew).
+ */
+export async function getActiveSupabaseAccessToken(): Promise<string | undefined> {
+  const sb = getSupabaseClient();
+  if (!sb) return undefined;
+
+  try {
+    const { data } = await sb.auth.getSession();
+    const session = data.session;
+    if (!session) return undefined;
+
+    const expiresAtMs = typeof session.expires_at === 'number' ? session.expires_at * 1000 : 0;
+    if (expiresAtMs > 0 && expiresAtMs - Date.now() < 60_000) {
+      const refreshed = await refreshSupabaseAccessToken();
+      if (refreshed) return refreshed;
+    }
+
+    return session.access_token;
+  } catch {
+    return undefined;
+  }
 }
 
 export function getSupabaseClient(): SupabaseClient | null {

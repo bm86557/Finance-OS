@@ -64,6 +64,7 @@ export interface User {
   id: string;
   email: string;
   name: string;
+  phone?: string;
   avatar?: string;
   role: PlatformRole; // Platform-level role
   createdAt: string;

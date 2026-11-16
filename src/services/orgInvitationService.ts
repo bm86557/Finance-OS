@@ -357,55 +357,19 @@ export const orgInvitationService = {
         return { success: false, data: null as any, error: validation.error || 'Invalid invitation' };
       }
 
-      const { adminEmail, organizationName, adminName } = validation.invitation;
-      const normalizedEmail = adminEmail.trim().toLowerCase();
-      const resolvedName = adminName || normalizedEmail.split('@')[0];
+      const normalizedEmail = validation.invitation.adminEmail.trim().toLowerCase();
 
-      // Create user account
-      const { data: authData, error: authError } = await sb.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: {
-          data: {
-            full_name: resolvedName,
-            is_org_admin: true,
-            platform_role: 'organization_user',
-            organization_name: organizationName,
-            email: normalizedEmail,
-          },
-          emailRedirectTo: `${window.location.origin}/dashboard`,
-        },
+      // Accept via backend admin endpoint so user confirmation, organization creation,
+      // assigned plan, subscription, membership, and profile sync happen atomically.
+      const response = await fetch(`${window.location.origin}/api/v1/platform/invitations/accept`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ token, password }),
       });
 
-      if (authError) {
-        console.error('[orgInvitationService.acceptInvitation] Auth error:', authError);
-        return { success: false, data: null as any, error: authError.message };
-      }
-
-      if (!authData.user) {
-        return { success: false, data: null as any, error: 'Failed to create user account' };
-      }
-
-      const userId = authData.user.id;
-
-      // Call RPC function to create organization and membership
-      const { data: result, error: rpcError } = await sb.rpc('accept_org_invitation', {
-        p_token: token,
-        p_user_id: userId,
-      });
-
-      if (rpcError) {
-        console.error('[orgInvitationService.acceptInvitation] RPC error:', rpcError);
-        // Try to clean up user account
-        try {
-          await sb.auth.admin.deleteUser(userId);
-        } catch {
-          // Ignore cleanup errors
-        }
-        return { success: false, data: null as any, error: rpcError.message };
-      }
-
-      if (!result || !result.success) {
+      const result = await response.json().catch(() => null);
+      if (!response.ok || !result?.success || !result?.data) {
         return {
           success: false,
           data: null as any,
@@ -413,40 +377,20 @@ export const orgInvitationService = {
         };
       }
 
-      // Ensure public.profiles has email and full_name populated
-      try {
-        await sb
-          .from('profiles')
-          .upsert({
-            id: userId,
-            email: normalizedEmail,
-            full_name: resolvedName,
-            platform_role: 'organization_user',
-          }, { onConflict: 'id' });
-      } catch (profileErr) {
-        console.warn('[orgInvitationService.acceptInvitation] Profile direct upsert warning:', profileErr);
-      }
-
-      // Also trigger backend service-role sync endpoint if available
-      try {
-        await fetch(`${window.location.origin}/api/v1/platform/invitations/sync-profile`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId,
-            email: normalizedEmail,
-            fullName: resolvedName,
-          }),
-        });
-      } catch {
-        /* Non-blocking safeguard */
+      // Sign in immediately so /dashboard has an authenticated Supabase session
+      const { error: signInErr } = await sb.auth.signInWithPassword({
+        email: result.data.email || normalizedEmail,
+        password,
+      });
+      if (signInErr) {
+        console.warn('[orgInvitationService.acceptInvitation] Auto sign-in warning:', signInErr.message);
       }
 
       return {
         success: true,
         data: {
-          organizationId: result.organization_id,
-          userId,
+          organizationId: result.data.organizationId,
+          userId: result.data.userId,
         },
       };
     } catch (error) {

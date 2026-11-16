@@ -61,17 +61,41 @@ export class ReportService {
   private async authHeaders(): Promise<HeadersInit> {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     try {
-      const sb = getSupabaseClient();
-      if (sb) {
-        const { data: { session } } = await sb.auth.getSession();
-        if (session?.access_token) {
-          headers['Authorization'] = `Bearer ${session.access_token}`;
-        }
+      const { getActiveSupabaseAccessToken } = await import('@/lib/supabaseClient');
+      const token = await getActiveSupabaseAccessToken();
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
       }
     } catch {
       /* ignore — request proceeds without a token */
     }
     return headers;
+  }
+
+  /** Performs a fetch with Supabase bearer auth and retries once on 401 after refreshing the session. */
+  private async authedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const headers = new Headers(await this.authHeaders());
+    if (init.headers) {
+      new Headers(init.headers).forEach((v, k) => headers.set(k, v));
+    }
+
+    let response = await this.authedFetch(url, { ...init, headers, credentials: 'include' });
+    if (response.status === 401) {
+      try {
+        const { isSupabaseConfigured, refreshSupabaseAccessToken } = await import('@/lib/supabaseClient');
+        if (isSupabaseConfigured()) {
+          const refreshedToken = await refreshSupabaseAccessToken();
+          if (refreshedToken) {
+            const retryHeaders = new Headers(headers);
+            retryHeaders.set('Authorization', `Bearer ${refreshedToken}`);
+            response = await this.authedFetch(url, { ...init, headers: retryHeaders, credentials: 'include' });
+          }
+        }
+      } catch {
+        /* fall through with original 401 response */
+      }
+    }
+    return response;
   }
 
   private async unwrap<T>(response: Response): Promise<T> {
@@ -123,9 +147,8 @@ export class ReportService {
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/profit-loss?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/profit-loss?${params}`
     );
 
     const data = await this.unwrap<ProfitLossReport>(response);
@@ -148,9 +171,8 @@ export class ReportService {
     const params = new URLSearchParams();
     if (asOfDate) params.set('asOfDate', asOfDate);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/balance-sheet?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/balance-sheet?${params}`
     );
 
     const data = await this.unwrap<BalanceSheetReport>(response);
@@ -176,9 +198,8 @@ export class ReportService {
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/cash-flow?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/cash-flow?${params}`
     );
 
     const data = await this.unwrap<CashFlowReport[]>(response);
@@ -202,9 +223,8 @@ export class ReportService {
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/department-profitability?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/department-profitability?${params}`
     );
 
     const data = await this.unwrap<DepartmentProfitability[]>(response);
@@ -228,9 +248,8 @@ export class ReportService {
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/expense-breakdown?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/expense-breakdown?${params}`
     );
 
     const data = await this.unwrap<ExpenseBreakdown[]>(response);
@@ -254,9 +273,8 @@ export class ReportService {
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/revenue-breakdown?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/revenue-breakdown?${params}`
     );
 
     const data = await this.unwrap<RevenueBreakdown[]>(response);
@@ -277,9 +295,8 @@ export class ReportService {
     if (cached) return { success: true, data: cached };
 
     try {
-      const response = await fetch(
-        `${this.baseUrl}/organizations/${organizationId}/reports/dashboard${options?.world ? `?world=${options.world}` : ''}`,
-        { headers: await this.authHeaders() }
+      const response = await this.authedFetch(
+        `${this.baseUrl}/organizations/${organizationId}/reports/dashboard${options?.world ? `?world=${options.world}` : ''}`
       );
 
       const data = await this.unwrap<DashboardSummary>(response);
@@ -305,9 +322,8 @@ export class ReportService {
     params.set('horizonDays', String(horizonDays));
     params.set('scenario', 'realistic');
 
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/forecast?${params}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast?${params}`
     );
 
     return this.unwrap(response);
@@ -438,9 +454,8 @@ export class ReportService {
    * Get Reconciliation Summary & Equations status (§15)
    */
   async getReconciliationSummary(organizationId: string): Promise<any> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/reconciliation-summary`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/reconciliation-summary`
     );
     return this.unwrap(response);
   }
@@ -449,9 +464,8 @@ export class ReportService {
    * Get Client Profitability Rollup
    */
   async getClientProfitability(organizationId: string): Promise<any[]> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/profitability/clients`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/profitability/clients`
     );
     return this.unwrap(response);
   }
@@ -464,9 +478,8 @@ export class ReportService {
     scenario = 'realistic',
     horizonMonths = 6
   ): Promise<any> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/profit?scenario=${scenario}&horizonMonths=${horizonMonths}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/profit?scenario=${scenario}&horizonMonths=${horizonMonths}`
     );
     return this.unwrap(response);
   }
@@ -479,9 +492,8 @@ export class ReportService {
     scenario = 'realistic',
     horizonMonths = 6
   ): Promise<any> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/capacity?scenario=${scenario}&horizonMonths=${horizonMonths}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/capacity?scenario=${scenario}&horizonMonths=${horizonMonths}`
     );
     return this.unwrap(response);
   }
@@ -494,9 +506,8 @@ export class ReportService {
     scenario = 'realistic',
     horizonMonths = 6
   ): Promise<any> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/combined?scenario=${scenario}&horizonMonths=${horizonMonths}`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/forecast/combined?scenario=${scenario}&horizonMonths=${horizonMonths}`
     );
     return this.unwrap(response);
   }
@@ -506,7 +517,7 @@ export class ReportService {
    */
   async getSnapshots(organizationId: string, reportType?: string): Promise<any[]> {
     const url = `${this.baseUrl}/organizations/${organizationId}/reports/snapshots${reportType ? `?reportType=${reportType}` : ''}`;
-    const response = await fetch(url, { headers: await this.authHeaders() });
+    const response = await this.authedFetch(url);
     return this.unwrap(response);
   }
 
@@ -521,11 +532,10 @@ export class ReportService {
     accountingBasis?: 'cash' | 'accrual';
     snapshotData: any;
   }): Promise<any> {
-    const response = await fetch(
+    const response = await this.authedFetch(
       `${this.baseUrl}/organizations/${organizationId}/reports/snapshots`,
       {
         method: 'POST',
-        headers: await this.authHeaders(),
         body: JSON.stringify(snapshotInput),
       }
     );
@@ -536,9 +546,8 @@ export class ReportService {
    * Get Governance Audit & Classification Accuracy Metrics
    */
   async getGovernanceAuditHistory(organizationId: string): Promise<any> {
-    const response = await fetch(
-      `${this.baseUrl}/organizations/${organizationId}/reports/governance/audit-history`,
-      { headers: await this.authHeaders() }
+    const response = await this.authedFetch(
+      `${this.baseUrl}/organizations/${organizationId}/reports/governance/audit-history`
     );
     return this.unwrap(response);
   }
