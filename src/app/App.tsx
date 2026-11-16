@@ -140,6 +140,7 @@ function LoadingScreen() {
 // Protected Route
 function ProtectedRoute({ children, allowedRoles }: { children: React.ReactNode; allowedRoles?: string[] }) {
   const { user, userRole, isLoading, getRedirectPath } = useAuth();
+  const location = useLocation();
 
   if (isLoading) {
     return <LoadingScreen />;
@@ -150,7 +151,10 @@ function ProtectedRoute({ children, allowedRoles }: { children: React.ReactNode;
   }
 
   if (allowedRoles && userRole && !allowedRoles.includes(userRole)) {
-    return <Navigate to={getRedirectPath()} replace />;
+    const target = getRedirectPath();
+    if (target !== location.pathname) {
+      return <Navigate to={target} replace />;
+    }
   }
 
   return <>{children}</>;
@@ -245,7 +249,7 @@ function AppRoutes() {
       <Route
         path="/dashboard"
         element={
-          <ProtectedRoute allowedRoles={['owner', 'admin', 'viewer', 'employee']}>
+          <ProtectedRoute allowedRoles={['owner', 'admin', 'accountant', 'manager', 'viewer', 'employee', 'member']}>
             <OrganizationWorkspace />
           </ProtectedRoute>
         }
