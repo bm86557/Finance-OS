@@ -8,13 +8,22 @@ import type { ServiceResponse } from '@/services/types';
 import { logApiFailure } from '@/lib/diagnostics';
 import { isSupabaseDataConfigured } from '@/lib/supabaseClient';
 
+function normalizeApiBaseUrl(raw: string): string {
+  const trimmed = raw.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
+  if (trimmed.endsWith('/api/v1') || trimmed.endsWith('/api')) {
+    return trimmed;
+  }
+  return `${trimmed}/api/v1`;
+}
+
 /** Primary env: set in `.env.local`. Returns empty string when no backend is configured. */
 export function getApiBaseUrl(): string {
   const metaEnv = typeof import.meta !== 'undefined' && (import.meta as any)?.env ? (import.meta as any).env : {};
   const procEnv = typeof process !== 'undefined' && process?.env ? process.env : {};
   const primary = (metaEnv.VITE_API_BASE_URL || procEnv.VITE_API_BASE_URL || '')?.trim?.() ?? '';
   const legacy = (metaEnv.VITE_LOCAL_API_BASE || procEnv.VITE_LOCAL_API_BASE || '')?.trim?.() ?? '';
-  return primary || legacy;
+  return normalizeApiBaseUrl(primary || legacy);
 }
 
 /**
@@ -132,6 +141,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
       }
     }
 
+    const contentType = res.headers.get('content-type') || '';
     const text = await res.text();
     let parsed: unknown = undefined;
     if (text) {
@@ -144,6 +154,12 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
 
     if (!res.ok) {
       const errMsg = extractErrorMessage(parsed, res);
+      logApiFailure({ method, path, status: res.status, message: errMsg });
+      return { success: false, data: null as unknown as T, error: errMsg };
+    }
+
+    if (parsed === undefined && (contentType.includes('text/html') || text.trimStart().startsWith('<!'))) {
+      const errMsg = `API route ${path} returned HTML instead of JSON`;
       logApiFailure({ method, path, status: res.status, message: errMsg });
       return { success: false, data: null as unknown as T, error: errMsg };
     }
