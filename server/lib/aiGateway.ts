@@ -2270,6 +2270,8 @@ export async function executeAIChat(
       // Dual-Ledger Cost Calculation: Commercial Equivalent at model rates + Actual Billed Spend
       const isFreeZeroBilled = await isNodeFreeTierZeroBilled(node, nodeKey);
       const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+        provider: node.provider,
+        modelName: node.modelName,
         promptTokens: result.promptTokens,
         completionTokens: result.completionTokens,
         costPer1MInput: node.costPer1MInput,
@@ -2526,6 +2528,8 @@ export async function executeAIJSON<T>(
 
       const isFreeZeroBilled = await isNodeFreeTierZeroBilled(node, nodeKey);
       const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+        provider: node.provider,
+        modelName: node.modelName,
         promptTokens: res.promptTokens,
         completionTokens: res.completionTokens,
         costPer1MInput: node.costPer1MInput,

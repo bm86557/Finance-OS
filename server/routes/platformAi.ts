@@ -377,7 +377,7 @@ export function createPlatformAiRouter(): Router {
       try {
         const orgs = await loadPlatformOrganizations();
         const planPricesPkr: Record<string, number> = { basic: 0, professional: 49900, enterprise: 149900 };
-        for (const o of orgs) {
+        for (const o of orgs || []) {
           const pk = String(o.plan || 'basic').toLowerCase().replace(/^plan-/, '');
           totalMonthlyPlanRevenuePkr += planPricesPkr[pk] ?? 0;
         }

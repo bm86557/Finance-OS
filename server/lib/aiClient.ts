@@ -216,6 +216,8 @@ async function recordClientTelemetry(params: {
       ? { inRate: 0.075, outRate: 0.30 }
       : { inRate: 0.15, outRate: 0.60 };
   const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+    provider,
+    modelName,
     promptTokens,
     completionTokens,
     costPer1MInput: defaults.inRate,

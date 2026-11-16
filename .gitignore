@@ -55,3 +55,4 @@ supabase/*
 !supabase/schema.sql
 *.sql
 !supabase/schema.sql
+server/__tests__/
