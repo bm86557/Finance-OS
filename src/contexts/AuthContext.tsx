@@ -7,7 +7,6 @@ import type { PortalType } from '@/services/authSessionTypes';
 import { logUnexpectedError } from '@/lib/diagnostics';
 import { isSupabaseConfigured, getSupabaseClient } from '@/lib/supabaseClient';
 import { isHttpBackendConfigured } from '@/lib/apiClient';
-import { hydrateDataStoreFromSupabase } from '@/services/dataStore';
 import { setupSupabaseRealtimeSync, teardownSupabaseRealtimeSync } from '@/services/realtimeSync';
 
 // Mock-mode-only token storage key. When talking to the real HTTP backend, the session lives in
@@ -101,7 +100,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
   };
 
   /**
-   * Apply a full AuthSession to component state.
+   * Apply a full AuthSession to component state without blocking on secondary org list fetches.
    */
   const applySession = async (session: AuthSession) => {
     setUser(session.user);
@@ -109,6 +108,9 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
     const resolvedRole = deriveUserRole(session);
     setUserRole(resolvedRole);
     setMembership(session.membership ?? null);
+    if (session.organization) {
+      setOrganizations((prev) => (prev.length > 0 ? prev : [session.organization!]));
+    }
 
     setActivePortal((prev) => {
       if (prev) return prev;
@@ -120,17 +122,27 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       return 'organization_admin';
     });
 
-    const orgs = await loadOrganizations(session.user);
-    setOrganizations(orgs);
-
     if (session.organization?.id) {
       setupSupabaseRealtimeSync(session.organization.id);
     }
+
+    // Load full organizations list in the background so login/restore never blocks on it
+    void loadOrganizations(session.user)
+      .then((orgs) => {
+        if (orgs && orgs.length > 0) {
+          setOrganizations(orgs);
+        }
+      })
+      .catch(() => {});
   };
 
   // ── Session restore on mount ───────────────────────────────────
   useEffect(() => {
     const restoreSession = async () => {
+      const safetyTimer = setTimeout(() => {
+        setIsLoading(false);
+      }, 8000);
+
       // Real backend (Supabase or the local HTTP API): the session lives server-side (Supabase
       // session / httpOnly cookie), so restore is just "ask the server who I am" — no token to
       // manage client-side at all.
@@ -139,18 +151,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
           const response = await authService.getSession('');
           if (response.success && response.data) {
             await applySession(response.data);
-            // Fresh login hydrates dataStore from the Supabase bundle (see `login` below) — a
-            // page refresh restores the session the same way but skipped this until now, so every
-            // Supabase-backed service (dataStore branch) saw only the unsynced local seed data.
-            if (import.meta.env.VITE_USE_SUPABASE_DATA === 'true') {
-              if (import.meta.env.VITE_USE_SUPABASE_DATA === 'true') {
-        await hydrateDataStoreFromSupabase();
-      }
-            }
           }
         } catch (e) {
           logUnexpectedError('AuthContext.restoreSession', e);
         } finally {
+          clearTimeout(safetyTimer);
           setIsLoading(false);
         }
         return;
@@ -160,6 +165,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       // to remember "who was logged in" across a page refresh in the browser-only demo.
       const token = localStorage.getItem(TOKEN_KEY);
       if (!token) {
+        clearTimeout(safetyTimer);
         setIsLoading(false);
         return;
       }
@@ -174,6 +180,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         logUnexpectedError('AuthContext.restoreSession', e);
         localStorage.removeItem(TOKEN_KEY);
       } finally {
+        clearTimeout(safetyTimer);
         setIsLoading(false);
       }
     };
@@ -232,7 +239,6 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         localStorage.setItem(TOKEN_KEY, response.data.token);
       }
       await applySession(response.data);
-      await hydrateDataStoreFromSupabase();
     } finally {
       setIsLoading(false);
     }

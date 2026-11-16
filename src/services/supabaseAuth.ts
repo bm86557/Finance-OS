@@ -183,21 +183,6 @@ async function fetchMembershipAndOrg(
     }
 
     if (!rows.length) {
-      // Fallback: If browser client session is unauthenticated (causing RLS to return 0 rows),
-      // fetch membership via server API which queries Supabase using admin role safely
-      if (isHttpBackendConfigured()) {
-        try {
-          const sRes = await apiGet<AuthSession | null>('/auth/session');
-          if (sRes.success && sRes.data?.membership && sRes.data?.organization) {
-            return {
-              organization: sRes.data.organization,
-              membership: sRes.data.membership,
-            };
-          }
-        } catch {
-          /* fallback */
-        }
-      }
       return { organization: null, membership: null };
     }
 
@@ -305,17 +290,41 @@ async function fetchMembershipAndOrg(
   }
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    promise
+      .then((val) => {
+        clearTimeout(timer);
+        resolve(val);
+      })
+      .catch(() => {
+        clearTimeout(timer);
+        resolve(fallback);
+      });
+  });
+}
+
 export async function buildAuthSessionFromSupabase(
   session: Session,
   orgSlug?: string,
   portalType?: string,
 ): Promise<AuthSession> {
-  const user = mapSupabaseUser(session.user, await fetchProfilePlatformRole(session.user.id, session.user.email));
+  const [platformRole, membershipAndOrg] = await Promise.all([
+    withTimeout(fetchProfilePlatformRole(session.user.id, session.user.email), 6000, undefined),
+    withTimeout(
+      fetchMembershipAndOrg(session.user.id, orgSlug, 0, portalType),
+      6000,
+      { organization: null, membership: null },
+    ),
+  ]);
+
+  const user = mapSupabaseUser(session.user, platformRole);
   const isPlatform = user.role === 'platform_admin' || user.role === 'platform_manager';
   const slugNorm = orgSlug?.trim();
 
   if (slugNorm && isPlatform) {
-    const org = await fetchOrgBySlug(slugNorm);
+    const org = await withTimeout(fetchOrgBySlug(slugNorm), 5000, null);
     if (org) {
       return {
         user,
@@ -326,14 +335,18 @@ export async function buildAuthSessionFromSupabase(
     }
   }
 
-  let { organization, membership } = await fetchMembershipAndOrg(session.user.id, orgSlug, 0, portalType);
+  let { organization, membership } = membershipAndOrg;
 
   // If no membership found, return session with null org/membership
   // This allows login to succeed, and the UI can show "setup required" or redirect to onboarding
   if (!membership) {
     if (isHttpBackendConfigured()) {
       try {
-        const sRes = await apiGet<AuthSession | null>('/auth/session');
+        const sRes = await withTimeout(
+          apiGet<AuthSession | null>('/auth/session', { token: session.access_token }),
+          6000,
+          { success: false, data: null },
+        );
         if (sRes.success && sRes.data?.organization && sRes.data?.membership) {
           return {
             user,
@@ -776,9 +789,15 @@ export async function supabaseLogin(credentials: LoginCredentials): Promise<Serv
   if (!session.membership && !session.organization && credentials.portalType !== 'platform_admin') {
     try {
       console.log('[supabaseLogin] No membership found, attempting auto-fix...');
-      const { data: fixResult, error: fixError } = await sb.rpc('ensure_user_has_organization', {
-        p_user_id: data.session.user.id
-      });
+      const { data: fixResult, error: fixError } = await withTimeout(
+        Promise.resolve(
+          sb.rpc('ensure_user_has_organization', {
+            p_user_id: data.session.user.id,
+          }),
+        ),
+        5000,
+        { data: null, error: new Error('Timed out') } as any,
+      );
       
       if (!fixError && fixResult?.success) {
         console.log('[supabaseLogin] Auto-fix successful, rebuilding session...');

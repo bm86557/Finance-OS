@@ -75,14 +75,12 @@ export function isSupabaseConfigured(): boolean {
 }
 
 /**
- * True when Supabase is configured AND selected as the active data-sync backend
- * (`VITE_USE_SUPABASE_DATA=true`) — i.e. `dataStore`'s single-row `finance_os_app_bundle`
- * sync (see `services/dataStore.ts` / `services/supabaseBundle.ts`) is the source of truth.
- * Services check this to skip the local HTTP API and use the (Supabase-synced) `dataStore`
- * instead, since the two backends keep independent sessions and can't be mixed per-request.
+ * Legacy single-row `finance_os_app_bundle` dataStore sync is decommissioned.
+ * Always returns `false` so all services use real Supabase PostgreSQL tables and `/api/v1` routes
+ * rather than the in-memory `dataStore` bundle, even if `VITE_USE_SUPABASE_DATA=true` is set in env.
  */
 export function isSupabaseDataConfigured(): boolean {
-  return import.meta.env.VITE_USE_SUPABASE_DATA === 'true' && isSupabaseConfigured();
+  return false;
 }
 
 /** Persist URL + anon key in the browser (used when env vars are not set). */
@@ -152,78 +150,72 @@ export async function getActiveSupabaseAccessToken(): Promise<string | undefined
   }
 }
 
-/**
- * Normalizes `expires_at` in stored Supabase sessions when the user's local system clock
- * (`Date.now()`) is skewed ahead of Supabase's UTC server clock (e.g. PC date set to future).
- * Without this, `@supabase/auth-js` sees `session.expires_at * 1000 < Date.now()` immediately
- * on login, causing continuous refresh storms on every `getSession()` / `sb.from()` call and
- * premature session eviction every 5-10 minutes.
- */
-function repairClockSkewedStoredSessions(): void {
-  if (typeof localStorage === 'undefined') return;
+function normalizeSessionJsonClockSkew(raw: string | null, isWrite: boolean): string | null {
+  if (!raw) return raw;
   try {
-    const nowSec = Math.round(Date.now() / 1000);
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (!k || !/^sb-.*-auth-token$/.test(k)) continue;
-      const raw = localStorage.getItem(k);
-      if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (
-        parsed &&
-        typeof parsed === 'object' &&
-        typeof parsed.access_token === 'string' &&
-        typeof parsed.expires_at === 'number'
-      ) {
-        const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0 ? parsed.expires_in : 3600;
-        // If expires_at is in the past or more than 2x expiresIn away due to local PC clock skew,
-        // re-anchor it relative to local Date.now() so GoTrueClient doesn't loop-refresh.
-        if (parsed.expires_at <= nowSec + 90 || parsed.expires_at > nowSec + expiresIn * 2) {
-          parsed.expires_at = nowSec + expiresIn;
-          localStorage.setItem(k, JSON.stringify(parsed));
-        }
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.access_token === 'string' &&
+      typeof parsed.expires_at === 'number'
+    ) {
+      const nowSec = Math.round(Date.now() / 1000);
+      const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0 ? parsed.expires_in : 3600;
+      if (isWrite) {
+        // On write (fresh sign-in or token refresh), anchor expires_at to browser clock + expires_in
+        parsed.expires_at = nowSec + expiresIn;
+        return JSON.stringify(parsed);
+      }
+      // On read, if local PC clock is skewed more than 10 minutes ahead of stored server expires_at,
+      // re-anchor so GoTrueClient does not treat a valid session as expired on every read.
+      if (parsed.expires_at < nowSec - 600 || parsed.expires_at > nowSec + expiresIn * 2) {
+        parsed.expires_at = nowSec + expiresIn;
+        return JSON.stringify(parsed);
       }
     }
   } catch {
-    /* ignore storage errors */
+    /* ignore non-JSON storage values */
   }
+  return raw;
 }
 
-/**
- * Wraps `fetch` for Supabase Auth endpoints so `expires_at` in `/auth/v1/token` responses is
- * always anchored to the browser's `Date.now() + expires_in` rather than the server's clock.
- */
-const clockSkewSafeFetch: typeof fetch = async (input, init) => {
-  const res = await fetch(input, init);
-  try {
-    const urlStr = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    if (res.ok && urlStr.includes('/auth/v1/') && (urlStr.includes('/token') || urlStr.includes('/verify') || urlStr.includes('/signup'))) {
-      const clone = res.clone();
-      const data = await clone.json();
-      if (data && typeof data === 'object') {
-        const nowSec = Math.round(Date.now() / 1000);
-        let modified = false;
-        if (typeof data.access_token === 'string' && typeof data.expires_in === 'number') {
-          data.expires_at = nowSec + data.expires_in;
-          modified = true;
-        }
-        if (data.session && typeof data.session === 'object' && typeof data.session.expires_in === 'number') {
-          data.session.expires_at = nowSec + data.session.expires_in;
-          modified = true;
-        }
-        if (modified) {
-          return new Response(JSON.stringify(data), {
-            status: res.status,
-            statusText: res.statusText,
-            headers: res.headers,
-          });
+const clockSkewSafeStorage = {
+  getItem(key: string): string | null {
+    if (typeof localStorage === 'undefined') return null;
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw && /^sb-.*-auth-token$/.test(key)) {
+        const normalized = normalizeSessionJsonClockSkew(raw, false);
+        if (normalized && normalized !== raw) {
+          localStorage.setItem(key, normalized);
+          return normalized;
         }
       }
+      return raw;
+    } catch {
+      return null;
     }
-  } catch {
-    /* fall through with original response */
-  }
-  return res;
+  },
+  setItem(key: string, value: string): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const toStore = /^sb-.*-auth-token$/.test(key)
+        ? (normalizeSessionJsonClockSkew(value, true) ?? value)
+        : value;
+      localStorage.setItem(key, toStore);
+    } catch {
+      /* ignore storage errors */
+    }
+  },
+  removeItem(key: string): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      /* ignore storage errors */
+    }
+  },
 };
 
 export function getSupabaseClient(): SupabaseClient | null {
@@ -234,12 +226,9 @@ export function getSupabaseClient(): SupabaseClient | null {
   const fp = `${url}|${key}`;
 
   if (!client || clientFingerprint !== fp) {
-    repairClockSkewedStoredSessions();
     client = createClient(url, key, {
-      global: {
-        fetch: clockSkewSafeFetch,
-      },
       auth: {
+        storage: clockSkewSafeStorage,
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: true,
