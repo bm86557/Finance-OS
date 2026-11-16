@@ -88,6 +88,9 @@ export interface OrganizationMember {
   status?: 'active' | 'pending' | 'rejected';
   /** Team/department label. Mirrors the `organization_members.department` column. */
   department?: string;
+  position?: string;
+  fixedSalary?: number;
+  assignedProjects?: string[];
   joinedAt: string;
 }
 

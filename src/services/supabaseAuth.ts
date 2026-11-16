@@ -148,7 +148,7 @@ async function fetchMembershipAndOrg(
       // Fallback query if status/department columns don't exist yet in the database schema
       const { data: fallbackData, error: fallbackErr } = await sb
         .from('organization_members')
-        .select('role, access_role, portal_type, organization_id, joined_at')
+        .select('*')
         .eq('user_id', userId)
         .limit(10);
 

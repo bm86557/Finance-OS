@@ -80,7 +80,7 @@ async function fetchMembershipsForUser(
 ): Promise<OrganizationMember[]> {
   const { data, error } = await sb
     .from('organization_members')
-    .select('user_id, organization_id, role, portal_type, status, department, position, joined_at, assigned_projects, fixed_salary, access_role')
+    .select('*')
     .eq('user_id', userId);
   if (error) {
     console.error('[auth] membership list error:', error.message);
