@@ -834,7 +834,7 @@ export function createOrganizationRouter(): Router {
     message?: string;
   }
 
-  async function executeInvite(orgId: string, item: SingleInviteInput): Promise<InviteResult> {
+  async function executeInvite(orgId: string, item: SingleInviteInput, req: Request): Promise<InviteResult> {
     const trimmedEmail = item.email?.trim().toLowerCase();
     if (!trimmedEmail) {
       return { email: '', success: false, error: 'Email is required' };
@@ -1229,7 +1229,7 @@ export function createOrganizationRouter(): Router {
     const { email, name, role, department, position } = req.body as SingleInviteInput;
     if (!email?.trim()) return fail(res, 400, 'Email is required');
 
-    const result = await executeInvite(orgId, { email, name, role, department, position });
+    const result = await executeInvite(orgId, { email, name, role, department, position }, req);
     if (!result.success) {
       return fail(res, 400, result.error || 'Failed to invite member');
     }
@@ -1249,7 +1249,7 @@ export function createOrganizationRouter(): Router {
     const results: InviteResult[] = [];
     for (const item of invites) {
       if (!item.email?.trim()) continue;
-      const resItem = await executeInvite(orgId, item);
+      const resItem = await executeInvite(orgId, item, req);
       results.push(resItem);
     }
 
