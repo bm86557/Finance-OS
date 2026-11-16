@@ -691,6 +691,7 @@ export async function addGatewayProviderDb(params: {
     if (params.rateLimitTpm !== undefined) existing.rateLimitTpm = params.rateLimitTpm;
     if (params.timeoutMs !== undefined) existing.timeoutMs = params.timeoutMs;
     if (params.maxTokensPerReq !== undefined) existing.maxTokensPerReq = params.maxTokensPerReq;
+    if (params.billingTier !== undefined) existing.billingTier = params.billingTier;
   } else {
     existing = {
       id: `custom-${Date.now()}`,
@@ -706,6 +707,7 @@ export async function addGatewayProviderDb(params: {
       lastLatencyMs: 0,
       costPer1MInput: params.costPer1MInput ?? 0.15,
       costPer1MOutput: params.costPer1MOutput ?? 0.60,
+      billingTier,
       status: 'standby',
       baseUrl: params.baseUrl,
       hasApiKey: Boolean(params.apiKey),

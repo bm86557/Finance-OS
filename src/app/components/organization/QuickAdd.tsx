@@ -294,18 +294,19 @@ export function QuickAdd({
     });
   }, [selectableAccounts]);
 
-  // Auto-initialize source and destination transfer accounts
+  // Auto-initialize source and destination transfer accounts (never allow same account)
   useEffect(() => {
     if (bankAccounts && bankAccounts.length > 0) {
+      const effectiveFrom = transferFromAccount || bankAccounts[0].id;
       if (!transferFromAccount) {
-        setTransferFromAccount(bankAccounts[0].id);
+        setTransferFromAccount(effectiveFrom);
         if (bankAccounts[0].currency) {
           setTransferCurrency(bankAccounts[0].currency);
         }
       }
-      if (!transferToAccount) {
-        const diffAcc = bankAccounts.find((a) => a.id !== (transferFromAccount || bankAccounts[0].id));
-        setTransferToAccount(diffAcc ? diffAcc.id : (bankAccounts[1]?.id ?? ''));
+      if (!transferToAccount || transferToAccount === effectiveFrom) {
+        const diffAcc = bankAccounts.find((a) => a.id !== effectiveFrom);
+        setTransferToAccount(diffAcc ? diffAcc.id : '');
       }
     }
   }, [bankAccounts, transferFromAccount, transferToAccount]);
@@ -347,7 +348,13 @@ export function QuickAdd({
         setTransferFromAccount(bankAcc.id);
         if (bankAcc.currency) setTransferCurrency(bankAcc.currency);
       }
-      if (cashAcc) setTransferToAccount(cashAcc.id);
+      const nextFromId = bankAcc?.id ?? transferFromAccount;
+      if (cashAcc && cashAcc.id !== nextFromId) {
+        setTransferToAccount(cashAcc.id);
+      } else if (nextFromId && transferToAccount === nextFromId) {
+        const diffAcc = bankAccounts.find((a) => a.id !== nextFromId);
+        setTransferToAccount(diffAcc ? diffAcc.id : '');
+      }
     } else if (tType === 'cash_deposit') {
       setTransferDescription('Cash Deposit to Bank Account');
       const cashAcc = bankAccounts.find((a) => a.accountType === 'cash');
@@ -356,7 +363,13 @@ export function QuickAdd({
         setTransferFromAccount(cashAcc.id);
         if (cashAcc.currency) setTransferCurrency(cashAcc.currency);
       }
-      if (bankAcc) setTransferToAccount(bankAcc.id);
+      const nextFromId = cashAcc?.id ?? transferFromAccount;
+      if (bankAcc && bankAcc.id !== nextFromId) {
+        setTransferToAccount(bankAcc.id);
+      } else if (nextFromId && transferToAccount === nextFromId) {
+        const diffAcc = bankAccounts.find((a) => a.id !== nextFromId);
+        setTransferToAccount(diffAcc ? diffAcc.id : '');
+      }
     } else if (tType === 'wallet_transfer') {
       setTransferDescription('Online Wallet Transfer');
     } else {
@@ -1294,6 +1307,10 @@ export function QuickAdd({
                           if (acc?.currency) {
                             setTransferCurrency(acc.currency);
                           }
+                          if (newId && newId === transferToAccount) {
+                            const nextDest = bankAccounts.find((a) => a.id !== newId);
+                            setTransferToAccount(nextDest ? nextDest.id : '');
+                          }
                         }}
                         className="w-full h-12 px-4 rounded-xl text-sm"
                         style={{
@@ -1337,12 +1354,18 @@ export function QuickAdd({
                           color: AXIOM.inputs.color,
                         }}
                       >
-                        <option value="">Select destination account…</option>
-                        {bankAccounts.map((acc) => (
-                          <option key={acc.id} value={acc.id}>
-                            {acc.bankName} · {acc.accountNumber?.slice(-4) ?? '----'} ({acc.currency}) [{acc.accountType}]
-                          </option>
-                        ))}
+                        <option value="">
+                          {bankAccounts.filter((acc) => acc.id !== transferFromAccount).length === 0
+                            ? 'No other accounts available…'
+                            : 'Select destination account…'}
+                        </option>
+                        {bankAccounts
+                          .filter((acc) => acc.id !== transferFromAccount)
+                          .map((acc) => (
+                            <option key={acc.id} value={acc.id}>
+                              {acc.bankName} · {acc.accountNumber?.slice(-4) ?? '----'} ({acc.currency}) [{acc.accountType}]
+                            </option>
+                          ))}
                       </select>
                       <p className="text-xs text-slate-500">Account to which funds will be credited.</p>
                     </div>

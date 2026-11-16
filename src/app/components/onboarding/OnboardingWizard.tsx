@@ -80,7 +80,12 @@ export function OnboardingWizard() {
                     <Icon className="w-6 h-6 text-white" />
                   </div>
                   <div>
-                    <p className="text-xs text-slate-400">Step {currentStep + 1} of {steps.length}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="text-xs text-slate-400">Step {currentStep + 1} of {steps.length}</p>
+                      <span className="px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider rounded-full bg-white/10 text-slate-300 border border-white/10">
+                        Guide Only
+                      </span>
+                    </div>
                     <h2 className="text-xl font-bold text-white">{step.title}</h2>
                   </div>
                 </div>
@@ -270,18 +275,30 @@ function ConnectBankStep() {
 function ImportStatementsStep() {
   return (
     <div className="space-y-4">
-      <p className="text-slate-300 text-lg mb-6">Upload your first bank statement or CSV file to get started.</p>
+      <p className="text-slate-300 text-lg mb-6">
+        Once you sign in, you can upload your bank statements or CSV files from the Import Statements section:
+      </p>
       
-      <div className="border-2 border-dashed border-white/20 rounded-lg p-12 text-center bg-white/5 hover:bg-white/10 transition-colors cursor-pointer">
+      <div
+        aria-hidden="true"
+        className="relative border-2 border-dashed border-white/15 rounded-lg p-10 text-center bg-white/5 pointer-events-none select-none opacity-90"
+      >
+        <span className="absolute top-3 right-3 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider rounded bg-slate-800/90 text-slate-400 border border-white/10">
+          Preview
+        </span>
         <Upload className="w-12 h-12 text-emerald-400 mx-auto mb-4" />
         <h4 className="text-white font-medium mb-2">Drag & Drop Your Statement</h4>
         <p className="text-sm text-slate-400 mb-4">
           Supports CSV, Excel, PDF, and most bank formats
         </p>
-        <Button className="bg-gradient-to-r from-emerald-500 to-green-500 hover:opacity-90 text-white">
+        <div className="inline-flex items-center justify-center rounded-md text-sm font-medium px-4 py-2 bg-emerald-500/25 border border-emerald-400/30 text-emerald-200">
           Choose File
-        </Button>
+        </div>
       </div>
+
+      <p className="text-xs text-slate-400 text-center">
+        Guide preview only — actual file upload is available inside your dashboard.
+      </p>
 
       <div className="grid grid-cols-3 gap-3 mt-6">
         <div className="text-center p-3 bg-white/5 rounded-lg">
@@ -306,7 +323,7 @@ function ReviewCategoriesStep() {
     <div className="space-y-4">
       <p className="text-slate-300 text-lg mb-6">Our AI has automatically categorized your transactions. Review and teach it your preferences.</p>
       
-      <div className="space-y-3">
+      <div className="space-y-3 pointer-events-none select-none" aria-hidden="true">
         {/* Sample transactions */}
         <div className="bg-white/5 border border-white/10 rounded-lg p-4">
           <div className="flex items-center justify-between mb-2">
@@ -355,11 +372,9 @@ function ReviewCategoriesStep() {
           <div className="flex items-center gap-2">
             <Brain className="w-4 h-4 text-amber-400" />
             <span className="text-xs text-slate-400">Need your help:</span>
-            <select className="text-xs px-2 py-1 bg-slate-800 text-white rounded border border-white/10">
-              <option>Office Expenses</option>
-              <option>Equipment</option>
-              <option>Supplies</option>
-            </select>
+            <span className="text-xs px-2 py-1 bg-slate-800 text-slate-300 rounded border border-white/10">
+              Office Expenses ▾
+            </span>
           </div>
         </div>
       </div>
@@ -382,45 +397,33 @@ function ExploreInsightsStep() {
         <div className="bg-gradient-to-br from-purple-500/10 to-pink-500/10 border border-purple-500/20 rounded-lg p-4">
           <TrendingUp className="w-8 h-8 text-purple-400 mb-3" />
           <h4 className="text-white font-medium mb-2">Profit Intelligence</h4>
-          <p className="text-xs text-slate-400 mb-3">
+          <p className="text-xs text-slate-400">
             See department profitability, client analysis, and project margins
           </p>
-          <Button size="sm" className="bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 text-xs">
-            Explore →
-          </Button>
         </div>
 
         <div className="bg-gradient-to-br from-cyan-500/10 to-blue-500/10 border border-cyan-500/20 rounded-lg p-4">
           <TrendingUp className="w-8 h-8 text-cyan-400 mb-3" />
           <h4 className="text-white font-medium mb-2">Cash Flow Forecast</h4>
-          <p className="text-xs text-slate-400 mb-3">
+          <p className="text-xs text-slate-400">
             Predict your cash position for the next 90 days
           </p>
-          <Button size="sm" className="bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 text-xs">
-            Explore →
-          </Button>
         </div>
 
         <div className="bg-gradient-to-br from-amber-500/10 to-orange-500/10 border border-amber-500/20 rounded-lg p-4">
           <TrendingUp className="w-8 h-8 text-amber-400 mb-3" />
           <h4 className="text-white font-medium mb-2">What-If Simulator</h4>
-          <p className="text-xs text-slate-400 mb-3">
+          <p className="text-xs text-slate-400">
             Model different scenarios and see financial impact
           </p>
-          <Button size="sm" className="bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs">
-            Explore →
-          </Button>
         </div>
 
         <div className="bg-gradient-to-br from-green-500/10 to-emerald-500/10 border border-green-500/20 rounded-lg p-4">
           <Brain className="w-8 h-8 text-green-400 mb-3" />
           <h4 className="text-white font-medium mb-2">AI Assistant</h4>
-          <p className="text-xs text-slate-400 mb-3">
+          <p className="text-xs text-slate-400">
             Ask questions and get instant financial insights
           </p>
-          <Button size="sm" className="bg-green-500/20 hover:bg-green-500/30 text-green-300 text-xs">
-            Chat Now →
-          </Button>
         </div>
       </div>
 
