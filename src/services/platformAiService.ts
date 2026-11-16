@@ -39,11 +39,44 @@ export interface KeyTierInfo {
   throttleCount: number;
 }
 
+export interface ApiKeyLedgerEntry {
+  keyFingerprint: string;
+  keyLast4: string;
+  provider: string;
+  modelName: string;
+  keySource: 'platform' | 'custom_byok';
+  billingMode: string;
+  calls: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  actualCostUsd: number;
+  commercialCostUsd: number;
+  savingsUsd: number;
+  lastUsedAt: string | null;
+}
+
+export interface PlatformMarginEconomics {
+  monthlyRevenuePkr: number;
+  monthlyRevenueUsd: number;
+  actualAiSpendUsd: number;
+  commercialAiShadowUsd: number;
+  freeTierSavingsUsd: number;
+  netMarginPkr: number;
+  netMarginUsd: number;
+  marginPercent: number;
+}
+
 export interface PlatformAiStats {
   keyTier?: KeyTierInfo;
   billingTier: 'free' | 'paid' | 'unverified' | 'gemini_free_tier' | 'commercial';
   actualSpendUsd: number;
   commercialEquivalentUsd: number;
+  freeTierSavingsUsd?: number;
+  byokCommercialUsd?: number;
+  apiKeyBreakdown?: ApiKeyLedgerEntry[];
+  platformMarginEconomics?: PlatformMarginEconomics;
+  globalAiKillSwitch?: boolean;
   totalTokens: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
@@ -138,6 +171,12 @@ export interface GatewayNodeStatus {
   timeoutMs?: number;
   maxTokensPerReq?: number;
   lastUsedAt?: string;
+  billingTier?: 'auto' | 'free' | 'paid';
+  tokensUsed?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  actualCostUsd?: number;
+  commercialCostUsd?: number;
 }
 
 export interface CreateGatewayProviderInput {
@@ -153,6 +192,7 @@ export interface CreateGatewayProviderInput {
   rateLimitTpm?: number;
   timeoutMs?: number;
   maxTokensPerReq?: number;
+  billingTier?: 'auto' | 'free' | 'paid';
 }
 
 export interface UpdateGatewayProviderInput {
@@ -169,6 +209,7 @@ export interface UpdateGatewayProviderInput {
   maxTokensPerReq?: number;
   circuitOpen?: boolean;
   isActive?: boolean;
+  billingTier?: 'auto' | 'free' | 'paid';
 }
 
 export interface ClassificationQualityMetrics {
@@ -383,6 +424,20 @@ export const platformAiService = {
   async getSecurityStatus(): Promise<ServiceResponse<PlatformAiSecurityStatus>> {
     if (isHttpBackendConfigured()) {
       return apiGet<PlatformAiSecurityStatus>('/platform/ai/security-status');
+    }
+    return {
+      success: false,
+      data: null as any,
+      error: 'Backend API is offline or unreachable.',
+    };
+  },
+
+  /**
+   * Toggle Global AI Kill Switch (§33)
+   */
+  async toggleKillSwitch(enabled: boolean): Promise<ServiceResponse<{ globalAiKillSwitch: boolean }>> {
+    if (isHttpBackendConfigured()) {
+      return apiPostJson<{ enabled: boolean }, { globalAiKillSwitch: boolean }>('/platform/ai/security-status/kill-switch', { enabled });
     }
     return {
       success: false,

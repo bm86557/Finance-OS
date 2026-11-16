@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { AddProviderModal } from './AddProviderModal';
+import { toast } from 'sonner';
 
 export function AiPortalWorkspace() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -317,19 +318,21 @@ export function AiPortalWorkspace() {
                 </span>
               </div>
               <CardTitle className="text-2xl font-bold font-mono text-white">
-                ${stats?.actualSpendUsd?.toFixed(2) ?? '0.00'}{' '}
+                ${stats?.actualSpendUsd?.toFixed(4) ?? '0.0000'}{' '}
                 <span className="text-xs text-emerald-400">USD</span>
               </CardTitle>
             </CardHeader>
             <CardContent className="pt-0 space-y-1">
               <p className="text-[11px] text-slate-400 font-mono">
-                Commercial Equivalent:{' '}
+                Commercial Value:{' '}
                 <span className="text-pink-300 font-bold">
                   ${stats?.commercialEquivalentUsd ? stats.commercialEquivalentUsd.toFixed(4) : '0.0000'} USD
                 </span>
               </p>
               <p className="text-[10px] text-emerald-400 font-mono">
-                100% Platform Margin Retained
+                {stats?.freeTierSavingsUsd && stats.freeTierSavingsUsd > 0
+                  ? `Saved $${stats.freeTierSavingsUsd.toFixed(4)} via Free Tier`
+                  : `${stats?.platformMarginEconomics?.marginPercent ?? 100}% Platform Margin Retained`}
               </p>
             </CardContent>
           </Card>
@@ -498,7 +501,7 @@ export function AiPortalWorkspace() {
                 </CardContent>
               </Card>
 
-              {/* Free Tier Economics Card */}
+              {/* Platform Margin Economics Card (Dual-Ledger) */}
               <Card className="bg-slate-900/50 border-pink-500/20 backdrop-blur-xl">
                 <CardHeader>
                   <CardTitle className="text-lg font-bold font-mono text-white flex items-center gap-2">
@@ -506,7 +509,7 @@ export function AiPortalWorkspace() {
                     Platform Margin Economics
                   </CardTitle>
                   <CardDescription className="font-mono text-xs text-slate-400">
-                    SaaS Subscription Revenue vs Zero Gemini Free Tier Cost
+                    SaaS Subscription Revenue vs Real AI Key Spend & Commercial Shadow
                   </CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-4 font-mono text-xs">
@@ -514,34 +517,120 @@ export function AiPortalWorkspace() {
                     <div className="flex justify-between">
                       <span className="text-slate-400">SaaS Plan Revenue:</span>
                       <span className="text-white font-bold">
-                        {totalPlanRevenuePkr > 0 ? `${totalPlanRevenuePkr.toLocaleString()} PKR` : '$0.00 USD'}
+                        {(stats?.platformMarginEconomics?.monthlyRevenuePkr ?? totalPlanRevenuePkr) > 0
+                          ? `${(stats?.platformMarginEconomics?.monthlyRevenuePkr ?? totalPlanRevenuePkr).toLocaleString()} PKR`
+                          : '$0.00 USD'}
                         <span className="text-[10px] text-amber-400 font-mono ml-2">(Stripe Sandbox)</span>
                       </span>
                     </div>
-                    {totalPlanRevenueUsd > 0 && (
+                    {(stats?.platformMarginEconomics?.monthlyRevenueUsd ?? totalPlanRevenueUsd) > 0 && (
                       <div className="flex justify-between text-[11px] text-slate-400">
                         <span>USD Equivalent (FX 0.0036):</span>
-                        <span className="text-slate-300 font-mono">${totalPlanRevenueUsd.toFixed(2)} / mo</span>
+                        <span className="text-slate-300 font-mono">
+                          ${(stats?.platformMarginEconomics?.monthlyRevenueUsd ?? totalPlanRevenueUsd).toFixed(2)} / mo
+                        </span>
                       </div>
                     )}
                     <div className="flex justify-between">
                       <span className="text-slate-400">Actual Out-of-Pocket Spend:</span>
-                      <span className="text-emerald-400 font-bold">$0.00 USD (Free Tier)</span>
+                      <span className="text-emerald-400 font-bold">
+                        ${(stats?.platformMarginEconomics?.actualAiSpendUsd ?? stats?.actualSpendUsd ?? 0).toFixed(4)} USD
+                      </span>
+                    </div>
+                    <div className="flex justify-between text-[11px]">
+                      <span className="text-slate-400">Commercial Shadow Valuation:</span>
+                      <span className="text-pink-300 font-bold">
+                        ${(stats?.platformMarginEconomics?.commercialAiShadowUsd ?? stats?.commercialEquivalentUsd ?? 0).toFixed(4)} USD
+                      </span>
                     </div>
                     <div className="pt-2 border-t border-purple-500/20 flex justify-between text-sm">
                       <span className="text-emerald-300 font-bold">Net Platform Margin:</span>
                       <span className="text-emerald-400 font-bold">
-                        {totalPlanRevenuePkr > 0 ? `${totalPlanRevenuePkr.toLocaleString()} PKR (100%)` : '100% Retained'}
+                        {(stats?.platformMarginEconomics?.netMarginPkr ?? totalPlanRevenuePkr) > 0
+                          ? `${(stats?.platformMarginEconomics?.netMarginPkr ?? totalPlanRevenuePkr).toLocaleString()} PKR (${stats?.platformMarginEconomics?.marginPercent ?? 100}%)`
+                          : `${stats?.platformMarginEconomics?.marginPercent ?? 100}% Retained`}
                       </span>
                     </div>
                   </div>
 
                   <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-xs">
-                    ✓ Authoritative calculation: Customer subscriptions operate in Stripe Sandbox mode without direct AI metering charges. The platform absorbs AI inferences as operating COGS via the shared Gemini Free Tier.
+                    ✓ Dual-Ledger COGS: Free-tier platform keys record $0.00 actual spend while Commercial Shadow tracks list-rate token value. Paid platform keys deduct real billed USD from margin.
                   </div>
                 </CardContent>
               </Card>
             </div>
+
+            {/* Per-API-Key Token & Cost Ledger */}
+            <Card className="bg-slate-900/50 border-pink-500/20 backdrop-blur-xl">
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle className="text-lg font-bold font-mono text-white flex items-center gap-2">
+                      <KeyRound className="size-5 text-pink-400" />
+                      Per-API-Key Token & Cost Ledger
+                    </CardTitle>
+                    <CardDescription className="font-mono text-xs text-slate-400">
+                      Real-time token volume, billed spend, and commercial rate valuation grouped by API key fingerprint
+                    </CardDescription>
+                  </div>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {stats?.apiKeyBreakdown?.length ?? 0} tracked keys
+                  </span>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse font-mono text-xs">
+                    <thead>
+                      <tr className="border-b border-pink-500/20 text-slate-400">
+                        <th className="py-2.5 px-3">API Key</th>
+                        <th className="py-2.5 px-3">Provider / Model</th>
+                        <th className="py-2.5 px-3">Scope & Tier</th>
+                        <th className="py-2.5 px-3 text-right">Calls</th>
+                        <th className="py-2.5 px-3 text-right">Total Tokens</th>
+                        <th className="py-2.5 px-3 text-right">Actual Billed</th>
+                        <th className="py-2.5 px-3 text-right">Commercial Value</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-pink-500/10">
+                      {(stats?.apiKeyBreakdown || []).map((entry) => (
+                        <tr key={entry.keyFingerprint} className="hover:bg-slate-800/30">
+                          <td className="py-2.5 px-3 text-white font-bold">
+                            ••••{entry.keyLast4}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className="text-slate-200 capitalize">{entry.provider}</span>{' '}
+                            <span className="text-slate-500 text-[10px]">({entry.modelName})</span>
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span className={`px-2 py-0.5 rounded text-[10px] border ${
+                              entry.keySource === 'custom_byok'
+                                ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                                : entry.billingMode === 'paid'
+                                ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            }`}>
+                              {entry.keySource === 'custom_byok' ? 'TENANT BYOK' : entry.billingMode === 'paid' ? 'PLATFORM PAID' : 'PLATFORM FREE'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-right text-slate-300">{entry.calls.toLocaleString()}</td>
+                          <td className="py-2.5 px-3 text-right text-white font-bold">{entry.totalTokens.toLocaleString()}</td>
+                          <td className="py-2.5 px-3 text-right text-emerald-400 font-bold">${entry.actualCostUsd.toFixed(4)}</td>
+                          <td className="py-2.5 px-3 text-right text-pink-300">${entry.commercialCostUsd.toFixed(4)}</td>
+                        </tr>
+                      ))}
+                      {(!stats?.apiKeyBreakdown || stats.apiKeyBreakdown.length === 0) && (
+                        <tr>
+                          <td colSpan={7} className="py-6 text-center text-slate-500">
+                            No API key telemetry recorded yet. Run an AI inference or ping the gateway to populate per-key cost tracking.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
           </div>
         )}
 
@@ -940,8 +1029,17 @@ export function AiPortalWorkspace() {
                         <span className="text-white">${node.costPer1MInput} / ${node.costPer1MOutput}</span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Invocations:</span>
-                        <span className="text-pink-300">{node.callCount} calls</span>
+                        <span>Invocations / Tokens:</span>
+                        <span className="text-pink-300">
+                          {node.callCount} calls · {(node.tokensUsed ?? 0).toLocaleString()} tok
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-slate-400">
+                        <span>Billed / Commercial:</span>
+                        <span className="text-emerald-400">
+                          ${(node.actualCostUsd ?? 0).toFixed(4)}{' '}
+                          <span className="text-slate-500">/ ${(node.commercialCostUsd ?? 0).toFixed(4)}</span>
+                        </span>
                       </div>
                     </div>
 
@@ -1153,6 +1251,45 @@ export function AiPortalWorkspace() {
                     Tenant custom BYOK keys are encrypted at rest with organization-scoped initialization vectors and never returned in plaintext to the browser ({security?.customKeyTenants ?? 0} BYOK tenants active).
                   </p>
                 </div>
+              </div>
+
+              {/* Global AI Kill Switch (§33) */}
+              <div className={`p-4 rounded-xl border flex flex-wrap items-center justify-between gap-4 ${
+                security?.globalAiKillSwitch
+                  ? 'bg-red-950/30 border-red-500/40'
+                  : 'bg-slate-950/60 border-slate-800'
+              }`}>
+                <div>
+                  <div className="text-sm font-bold text-white flex items-center gap-2">
+                    <AlertTriangle className={`size-4 ${security?.globalAiKillSwitch ? 'text-red-400' : 'text-amber-400'}`} />
+                    <span>Global Platform AI Kill Switch (§33)</span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">
+                    {security?.globalAiKillSwitch
+                      ? 'ACTIVE: All platform shared AI gateway calls are currently halted.'
+                      : 'Emergency control to immediately halt all platform shared LLM calls across the SaaS.'}
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  onClick={async () => {
+                    const nextState = !(security?.globalAiKillSwitch ?? false);
+                    const res = await platformAiService.toggleKillSwitch(nextState);
+                    if (res.success && res.data) {
+                      setSecurity((prev) => prev ? { ...prev, globalAiKillSwitch: res.data.globalAiKillSwitch } : prev);
+                      toast[res.data.globalAiKillSwitch ? 'warning' : 'success'](
+                        res.data.globalAiKillSwitch ? 'Global AI Kill Switch ACTIVATED' : 'Global AI Kill Switch DEACTIVATED'
+                      );
+                    } else {
+                      toast.error(res.error || 'Failed to toggle Kill Switch');
+                    }
+                  }}
+                  className={security?.globalAiKillSwitch
+                    ? 'bg-emerald-600 hover:bg-emerald-700 text-white font-mono text-xs'
+                    : 'bg-red-600 hover:bg-red-700 text-white font-mono text-xs'}
+                >
+                  {security?.globalAiKillSwitch ? 'Resume Platform AI' : 'Activate Kill Switch'}
+                </Button>
               </div>
             </CardContent>
           </Card>

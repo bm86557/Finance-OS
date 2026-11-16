@@ -147,6 +147,7 @@ export function AddProviderModal({
   const [costPer1MOutput, setCostPer1MOutput] = useState<number>(0.60);
   const [timeoutMs, setTimeoutMs] = useState<number>(10000);
   const [maxTokensPerReq, setMaxTokensPerReq] = useState<number>(4096);
+  const [billingTier, setBillingTier] = useState<'auto' | 'free' | 'paid'>('auto');
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -176,6 +177,7 @@ export function AddProviderModal({
       setCostPer1MOutput(providerToEdit.costPer1MOutput ?? 0.60);
       setTimeoutMs(providerToEdit.timeoutMs || 10000);
       setMaxTokensPerReq(providerToEdit.maxTokensPerReq || 4096);
+      setBillingTier(providerToEdit.billingTier || 'auto');
     } else {
       // Add mode - default to DeepSeek or custom preset
       const preset = PRESETS.deepseek;
@@ -192,6 +194,7 @@ export function AddProviderModal({
       setCostPer1MOutput(preset.costOut);
       setTimeoutMs(10000);
       setMaxTokensPerReq(4096);
+      setBillingTier('auto');
     }
     setTestResult(null);
   }, [isOpen, providerToEdit, existingCount]);
@@ -307,6 +310,7 @@ export function AddProviderModal({
           costPer1MOutput: Number(costPer1MOutput),
           timeoutMs: Number(timeoutMs),
           maxTokensPerReq: Number(maxTokensPerReq),
+          billingTier,
         };
         if (apiKey.trim()) {
           payload.apiKey = apiKey.trim();
@@ -335,6 +339,7 @@ export function AddProviderModal({
           costPer1MOutput: Number(costPer1MOutput),
           timeoutMs: Number(timeoutMs),
           maxTokensPerReq: Number(maxTokensPerReq),
+          billingTier,
         };
 
         const res = await platformAiService.addGatewayProvider(payload);
@@ -595,6 +600,29 @@ export function AddProviderModal({
                   onChange={(e) => setMaxTokensPerReq(Number(e.target.value))}
                   className="bg-slate-900 border-slate-800 text-white font-mono text-xs"
                 />
+              </div>
+            </div>
+
+            {/* Billing Tier Mode (Dual-Ledger Cost Accounting) */}
+            <div className="p-3 rounded-xl border border-slate-800 bg-slate-900/60">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <label className="block text-[11px] font-mono text-slate-300 font-semibold">
+                    Key Billing Tier Mode
+                  </label>
+                  <p className="text-[10px] font-mono text-slate-500 mt-0.5">
+                    Auto detects Gemini Free Tier via quota telemetry; force Paid for billed keys or Free for $0.00 actual spend + Commercial Shadow tracking.
+                  </p>
+                </div>
+                <select
+                  value={billingTier}
+                  onChange={(e) => setBillingTier(e.target.value as 'auto' | 'free' | 'paid')}
+                  className="bg-slate-950 border border-slate-700 text-white font-mono text-xs rounded-lg px-2.5 py-1.5 shrink-0"
+                >
+                  <option value="auto">Auto Detect</option>
+                  <option value="free">Free Tier ($0 Billed)</option>
+                  <option value="paid">Paid Tier (Commercial)</option>
+                </select>
               </div>
             </div>
 

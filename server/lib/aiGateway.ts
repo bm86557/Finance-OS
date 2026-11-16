@@ -13,10 +13,58 @@
 import { getSupabaseAdminClient } from './supabaseAdmin.js';
 import { encryptSecret, decryptSecret, extractLast4, maskApiKey } from './secretBox.js';
 import { getDefaultAIConfig, normalizeGeminiModel, MODERN_GEMINI_FALLBACKS, type AIConfig } from '../config/aiConfig.js';
-import { recordSuccessfulCall, recordQuotaError, resolveKeyTier, getCurrentRollingRpm, verifyGeminiKeyLive } from './aiKeyTier.js';
+import { recordSuccessfulCall, recordQuotaError, resolveKeyTier, getCurrentRollingRpm, verifyGeminiKeyLive, fingerprintApiKey } from './aiKeyTier.js';
+export { fingerprintApiKey };
 
 export type AIProvider = 'gemini' | 'openai' | 'anthropic' | 'custom';
 export type AISource = 'organization' | 'platform' | 'none';
+export type BillingTierMode = 'auto' | 'free' | 'paid';
+
+// ── Global AI Kill Switch (Super Admin Privacy & Security Control §20) ──────
+let globalAiKillSwitch = false;
+
+export function isGlobalAiKillSwitchActive(): boolean {
+  return globalAiKillSwitch;
+}
+
+export async function setGlobalAiKillSwitch(enabled: boolean): Promise<boolean> {
+  globalAiKillSwitch = Boolean(enabled);
+  const sb = getSupabaseAdminClient();
+  if (sb) {
+    try {
+      await sb.from('platform_settings').upsert(
+        {
+          key: 'global_ai_kill_switch',
+          value: { enabled: globalAiKillSwitch, updatedAt: new Date().toISOString() },
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'key' }
+      );
+    } catch {
+      // non-blocking if platform_settings table differs
+    }
+  }
+  return globalAiKillSwitch;
+}
+
+export async function syncGlobalAiKillSwitchFromDb(): Promise<boolean> {
+  const sb = getSupabaseAdminClient();
+  if (sb) {
+    try {
+      const { data } = await sb
+        .from('platform_settings')
+        .select('value')
+        .eq('key', 'global_ai_kill_switch')
+        .maybeSingle();
+      if (data?.value && typeof data.value.enabled === 'boolean') {
+        globalAiKillSwitch = data.value.enabled;
+      }
+    } catch {
+      // non-blocking
+    }
+  }
+  return globalAiKillSwitch;
+}
 
 export interface ResolvedAIConfig {
   source: AISource;
@@ -46,17 +94,21 @@ export interface TelemetryEventParams {
   organizationId: string;
   portalType?: string; // 'ai_assistant' | 'organization_admin' | 'employee'
   featureArea?: string; // 'copilot_chat' | 'copilot_analysis' | 'employee_rag' | 'narration_classification' | 'statement_import_batch'
-  provider: string; // 'gemini' | 'openai' | 'anthropic'
+  provider: string; // 'gemini' | 'openai' | 'anthropic' | 'custom'
   modelName: string;
   fallbackTriggered?: boolean;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   costUsd?: number;
+  commercialCostUsd?: number;
   latencyMs: number;
   status?: 'success' | 'rate_limited' | 'timeout' | 'error';
   timestamp?: string;
   keySource?: 'platform' | 'custom_byok';
+  keyLast4?: string;
+  keyFingerprint?: string;
+  gatewayProviderId?: string;
   persisted?: boolean;
 }
 
@@ -80,6 +132,12 @@ export interface GatewayModelState {
   lastUsedAt?: string;
   costPer1MInput: number;
   costPer1MOutput: number;
+  billingTier?: BillingTierMode;
+  tokensUsed?: number;
+  promptTokens?: number;
+  completionTokens?: number;
+  actualCostUsd?: number;
+  commercialCostUsd?: number;
   status: 'online' | 'standby' | 'error' | 'tripped' | 'not_configured';
   baseUrl?: string;
   hasApiKey?: boolean;
@@ -317,17 +375,140 @@ export function setGatewayPrimaryModel(modelName: string): void {
 }
 
 /**
+ * Authoritative Dual-Ledger Token Cost Calculator
+ * Always computes commercialCostUsd from actual model rates, and computes actualCostUsd
+ * ($0.00 for Free Tier keys, real commercial dollar cost for Paid Tier / BYOK keys).
+ */
+export function calculateTokenCost(params: {
+  provider: string;
+  modelName: string;
+  promptTokens: number;
+  completionTokens: number;
+  costPer1MInput?: number;
+  costPer1MOutput?: number;
+  isFreeTierZeroBilled?: boolean;
+}): { actualCostUsd: number; commercialCostUsd: number; rateIn1M: number; rateOut1M: number } {
+  const p = (params.provider || '').toLowerCase();
+  const m = (params.modelName || '').toLowerCase();
+
+  const matchedNode = runtimeGatewayModels.find(
+    (node) =>
+      node.modelName.toLowerCase() === m ||
+      (node.provider.toLowerCase() === p && p !== 'custom')
+  );
+
+  let rateIn1M = params.costPer1MInput ?? matchedNode?.costPer1MInput;
+  let rateOut1M = params.costPer1MOutput ?? matchedNode?.costPer1MOutput;
+
+  if (rateIn1M === undefined || rateOut1M === undefined) {
+    if (p === 'gemini') {
+      rateIn1M = m.includes('pro') ? 1.25 : 0.075;
+      rateOut1M = m.includes('pro') ? 5.0 : 0.30;
+    } else if (p === 'anthropic') {
+      rateIn1M = m.includes('sonnet') ? 3.0 : 0.80;
+      rateOut1M = m.includes('sonnet') ? 15.0 : 4.00;
+    } else if (m.includes('deepseek')) {
+      rateIn1M = 0.14;
+      rateOut1M = 0.28;
+    } else {
+      rateIn1M = 0.15;
+      rateOut1M = 0.60;
+    }
+  }
+
+  const pt = Math.max(0, Number(params.promptTokens) || 0);
+  const ct = Math.max(0, Number(params.completionTokens) || 0);
+  const commercialCostUsd = Number(((pt / 1_000_000) * rateIn1M + (ct / 1_000_000) * rateOut1M).toFixed(6));
+  const actualCostUsd = params.isFreeTierZeroBilled ? 0 : commercialCostUsd;
+
+  return { actualCostUsd, commercialCostUsd, rateIn1M, rateOut1M };
+}
+
+export function isNodeFreeTierZeroBilled(node: GatewayModelState, apiKey: string): boolean {
+  if (node.billingTier === 'free') return true;
+  if (node.billingTier === 'paid') return false;
+  if ((node.provider || '').toLowerCase() === 'gemini') {
+    return resolveKeyTier(apiKey, 'platform').isBilledAsZero;
+  }
+  return false;
+}
+
+/**
  * Synchronize runtime gateway models with authoritative Supabase platform_ai_gateway_providers table
+ * and hydrate per-node token, latency, and cost counters from platform_ai_usage_events.
  */
 export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]> {
   const sb = getSupabaseAdminClient();
   if (!sb) return getGatewayRuntimeModels();
 
   try {
-    const { data: dbProviders, error } = await sb
-      .from('platform_ai_gateway_providers')
-      .select('*')
-      .order('priority', { ascending: true });
+    const [{ data: dbProviders, error }, { data: usageRows }] = await Promise.all([
+      sb.from('platform_ai_gateway_providers').select('*').order('priority', { ascending: true }),
+      sb.from('platform_ai_usage_events')
+        .select('provider, model_name, key_source, prompt_tokens, completion_tokens, total_tokens, cost_usd, commercial_cost_usd, latency_ms, status, created_at')
+        .order('created_at', { ascending: false })
+        .limit(3000),
+    ]);
+
+    // Aggregate persisted usage per (provider, model_name) for platform calls
+    const nodeUsageMap = new Map<string, {
+      calls: number;
+      failures: number;
+      latencySum: number;
+      lastLatencyMs: number;
+      lastUsedAt?: string;
+      promptTokens: number;
+      completionTokens: number;
+      tokensUsed: number;
+      actualCostUsd: number;
+      commercialCostUsd: number;
+    }>();
+
+    if (Array.isArray(usageRows)) {
+      for (const ev of usageRows) {
+        if ((ev as any).key_source === 'custom_byok') continue;
+        const key = `${String(ev.provider || '').toLowerCase()}::${String(ev.model_name || '').toLowerCase()}`;
+        const cur = nodeUsageMap.get(key) || {
+          calls: 0,
+          failures: 0,
+          latencySum: 0,
+          lastLatencyMs: 0,
+          lastUsedAt: undefined,
+          promptTokens: 0,
+          completionTokens: 0,
+          tokensUsed: 0,
+          actualCostUsd: 0,
+          commercialCostUsd: 0,
+        };
+        cur.calls += 1;
+        if (ev.status === 'error' || ev.status === 'rate_limited') cur.failures += 1;
+        const lat = Number(ev.latency_ms) || 0;
+        cur.latencySum += lat;
+        if (!cur.lastLatencyMs && lat > 0) cur.lastLatencyMs = lat;
+        if (!cur.lastUsedAt && ev.created_at) cur.lastUsedAt = ev.created_at;
+        const pt = Number(ev.prompt_tokens) || 0;
+        const ct = Number(ev.completion_tokens) || 0;
+        const tt = Number(ev.total_tokens) || (pt + ct);
+        cur.promptTokens += pt;
+        cur.completionTokens += ct;
+        cur.tokensUsed += tt;
+        const actCost = Number(ev.cost_usd) || 0;
+        cur.actualCostUsd += actCost;
+        const commCost = Number((ev as any).commercial_cost_usd);
+        if (!isNaN(commCost) && commCost > 0) {
+          cur.commercialCostUsd += commCost;
+        } else {
+          cur.commercialCostUsd += calculateTokenCost({
+            provider: ev.provider,
+            modelName: ev.model_name,
+            promptTokens: pt,
+            completionTokens: ct,
+            isFreeTierZeroBilled: actCost === 0,
+          }).commercialCostUsd;
+        }
+        nodeUsageMap.set(key, cur);
+      }
+    }
 
     if (!error && dbProviders && dbProviders.length > 0) {
       const updatedModels: GatewayModelState[] = dbProviders.map((row: any) => {
@@ -379,10 +560,13 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
           }
         }
 
-        const callCount = existing?.callCount || 0;
-        const failureCount = existing?.failureCount || row.consecutive_failures || 0;
-        const avgLatencyMs = existing?.avgLatencyMs || 0;
-        const lastLatencyMs = existing?.lastLatencyMs || 0;
+        const dbStats = nodeUsageMap.get(`${String(row.provider || '').toLowerCase()}::${normalizedModelName.toLowerCase()}`);
+        const callCount = Math.max(existing?.callCount || 0, dbStats?.calls || 0);
+        const failureCount = Math.max(existing?.failureCount || 0, dbStats?.failures || row.consecutive_failures || 0);
+        const avgLatencyMs = dbStats && dbStats.calls > 0
+          ? Math.round(dbStats.latencySum / dbStats.calls)
+          : (existing?.avgLatencyMs || 0);
+        const lastLatencyMs = existing?.lastLatencyMs || dbStats?.lastLatencyMs || 0;
 
         return {
           id: row.id,
@@ -396,8 +580,15 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
           failureCount,
           avgLatencyMs,
           lastLatencyMs,
+          lastUsedAt: existing?.lastUsedAt || dbStats?.lastUsedAt,
           costPer1MInput: Number(row.cost_per_1m_input_tokens || 0.15),
           costPer1MOutput: Number(row.cost_per_1m_output_tokens || 0.60),
+          billingTier: (row.billing_tier as BillingTierMode) || existing?.billingTier || 'auto',
+          tokensUsed: Math.max(existing?.tokensUsed || 0, dbStats?.tokensUsed || 0),
+          promptTokens: Math.max(existing?.promptTokens || 0, dbStats?.promptTokens || 0),
+          completionTokens: Math.max(existing?.completionTokens || 0, dbStats?.completionTokens || 0),
+          actualCostUsd: Number((dbStats ? dbStats.actualCostUsd : (existing?.actualCostUsd || 0)).toFixed(6)),
+          commercialCostUsd: Number((dbStats ? dbStats.commercialCostUsd : (existing?.commercialCostUsd || 0)).toFixed(6)),
           status: Boolean(row.circuit_open)
             ? 'tripped'
             : !hasApiKey
@@ -444,10 +635,12 @@ export async function addGatewayProviderDb(params: {
   rateLimitTpm?: number;
   timeoutMs?: number;
   maxTokensPerReq?: number;
+  billingTier?: BillingTierMode;
 }): Promise<GatewayModelState> {
   const sb = getSupabaseAdminClient();
   const encryptedKey = params.apiKey ? encryptSecret(params.apiKey, 'platform_global') : undefined;
   const priority = params.priority ?? (runtimeGatewayModels.length + 1);
+  const billingTier: BillingTierMode = params.billingTier || 'auto';
 
   if (sb) {
     try {
@@ -462,12 +655,17 @@ export async function addGatewayProviderDb(params: {
         rate_limit_tpm: params.rateLimitTpm ?? 1000000,
         timeout_ms: params.timeoutMs ?? 10000,
         max_tokens_per_req: params.maxTokensPerReq ?? 4096,
+        billing_tier: billingTier,
         updated_at: new Date().toISOString(),
       };
       if (encryptedKey) payload.api_key_encrypted = encryptedKey;
       if (params.baseUrl) payload.base_url = params.baseUrl;
 
-      await sb.from('platform_ai_gateway_providers').upsert(payload, { onConflict: 'provider, model_name' });
+      const { error: upsertErr } = await sb.from('platform_ai_gateway_providers').upsert(payload, { onConflict: 'provider, model_name' });
+      if (upsertErr && String(upsertErr.message || '').includes('billing_tier')) {
+        delete payload.billing_tier;
+        await sb.from('platform_ai_gateway_providers').upsert(payload, { onConflict: 'provider, model_name' });
+      }
       await syncGatewayProvidersFromDb();
     } catch (e) {
       console.warn('[aiGateway] Could not upsert provider to DB, keeping in-memory fallback:', e);
@@ -544,6 +742,7 @@ export async function updateGatewayProviderDb(
     maxTokensPerReq?: number;
     circuitOpen?: boolean;
     isActive?: boolean;
+    billingTier?: BillingTierMode;
   }
 ): Promise<GatewayModelState | null> {
   const sb = getSupabaseAdminClient();
@@ -563,8 +762,13 @@ export async function updateGatewayProviderDb(
       if (params.maxTokensPerReq !== undefined) payload.max_tokens_per_req = params.maxTokensPerReq;
       if (params.circuitOpen !== undefined) payload.circuit_open = params.circuitOpen;
       if (params.isActive !== undefined) payload.is_active = params.isActive;
+      if (params.billingTier !== undefined) payload.billing_tier = params.billingTier;
 
-      await sb.from('platform_ai_gateway_providers').update(payload).eq('id', id);
+      const { error: updateErr } = await sb.from('platform_ai_gateway_providers').update(payload).eq('id', id);
+      if (updateErr && String(updateErr.message || '').includes('billing_tier')) {
+        delete payload.billing_tier;
+        await sb.from('platform_ai_gateway_providers').update(payload).eq('id', id);
+      }
       await syncGatewayProvidersFromDb();
     } catch (e) {
       console.warn('[aiGateway] Could not update provider in DB:', e);
@@ -590,6 +794,7 @@ export async function updateGatewayProviderDb(
     if (params.maxTokensPerReq !== undefined) existing.maxTokensPerReq = params.maxTokensPerReq;
     if (params.circuitOpen !== undefined) existing.circuitOpen = params.circuitOpen;
     if (params.isActive !== undefined) existing.isActive = params.isActive;
+    if (params.billingTier !== undefined) existing.billingTier = params.billingTier;
     runtimeGatewayModels.sort((a, b) => a.priority - b.priority);
   }
   return existing || null;
@@ -794,8 +999,10 @@ export async function recordAiTelemetryEvent(params: TelemetryEventParams): Prom
   }
 
   // 2. Update model runtime metrics
-  const modelMatch = runtimeGatewayModels.find((m) => m.modelName === params.modelName || m.provider === params.provider);
-  if (modelMatch) {
+  const modelMatch = runtimeGatewayModels.find(
+    (m) => (params.gatewayProviderId && m.id === params.gatewayProviderId) || m.modelName === params.modelName || m.provider === params.provider
+  );
+  if (modelMatch && params.keySource !== 'custom_byok') {
     modelMatch.callCount++;
     if (params.status === 'error' || params.status === 'rate_limited') {
       modelMatch.failureCount++;
@@ -803,13 +1010,18 @@ export async function recordAiTelemetryEvent(params: TelemetryEventParams): Prom
     modelMatch.lastLatencyMs = params.latencyMs;
     modelMatch.avgLatencyMs = Math.round((modelMatch.avgLatencyMs * (modelMatch.callCount - 1) + params.latencyMs) / modelMatch.callCount);
     modelMatch.lastUsedAt = timestamp;
+    modelMatch.tokensUsed = (modelMatch.tokensUsed || 0) + (params.totalTokens || 0);
+    modelMatch.promptTokens = (modelMatch.promptTokens || 0) + (params.promptTokens || 0);
+    modelMatch.completionTokens = (modelMatch.completionTokens || 0) + (params.completionTokens || 0);
+    modelMatch.actualCostUsd = Number(((modelMatch.actualCostUsd || 0) + (params.costUsd || 0)).toFixed(6));
+    modelMatch.commercialCostUsd = Number(((modelMatch.commercialCostUsd || 0) + (params.commercialCostUsd ?? params.costUsd ?? 0)).toFixed(6));
   }
 
   // 3. Write to Supabase platform_ai_usage_events & update org_ai_status asynchronously
   const sb = getSupabaseAdminClient();
   if (sb) {
     try {
-      await sb.from('platform_ai_usage_events').insert({
+      const baseRow: Record<string, any> = {
         organization_id: params.organizationId,
         portal_type: params.portalType || 'ai_assistant',
         feature_area: params.featureArea || 'copilot_query',
@@ -823,29 +1035,48 @@ export async function recordAiTelemetryEvent(params: TelemetryEventParams): Prom
         latency_ms: params.latencyMs,
         status: params.status || 'success',
         created_at: timestamp,
-      });
-      event.persisted = true;
+      };
+      const extendedRow: Record<string, any> = {
+        ...baseRow,
+        key_source: params.keySource || 'platform',
+        key_last4: params.keyLast4 || null,
+        key_fingerprint: params.keyFingerprint || null,
+        gateway_provider_id: params.gatewayProviderId || null,
+        commercial_cost_usd: params.commercialCostUsd ?? params.costUsd ?? 0,
+      };
 
-      // Also increment org_ai_status counters
-      const colToIncrement = params.provider === 'gemini' && params.costUsd === 0 ? 'platform_requests_this_month' : 'org_requests_this_month';
-      const { data: current } = await sb.from('org_ai_status').select('*').eq('organization_id', params.organizationId).maybeSingle();
-      if (!current) {
-        await sb.from('org_ai_status').insert({
-          organization_id: params.organizationId,
-          active_source: 'platform',
-          org_requests_this_month: 0,
-          platform_requests_this_month: 1,
-          last_used_at: timestamp,
-        });
-      } else {
-        await sb
-          .from('org_ai_status')
-          .update({
-            [colToIncrement]: (current[colToIncrement] || 0) + 1,
+      let { error: insertErr } = await sb.from('platform_ai_usage_events').insert(extendedRow);
+      if (insertErr) {
+        // Fallback if migration 0040 columns are not yet applied in remote Supabase
+        const retry = await sb.from('platform_ai_usage_events').insert(baseRow);
+        insertErr = retry.error;
+      }
+      if (!insertErr) {
+        event.persisted = true;
+      }
+
+      // Also increment org_ai_status counters only for real customer organizations
+      if (params.organizationId && params.organizationId !== 'platform_global') {
+        const colToIncrement = params.keySource === 'custom_byok' ? 'org_requests_this_month' : 'platform_requests_this_month';
+        const { data: current } = await sb.from('org_ai_status').select('*').eq('organization_id', params.organizationId).maybeSingle();
+        if (!current) {
+          await sb.from('org_ai_status').insert({
+            organization_id: params.organizationId,
+            active_source: params.keySource === 'custom_byok' ? 'organization' : 'platform',
+            org_requests_this_month: params.keySource === 'custom_byok' ? 1 : 0,
+            platform_requests_this_month: params.keySource === 'custom_byok' ? 0 : 1,
             last_used_at: timestamp,
-            updated_at: timestamp,
-          })
-          .eq('organization_id', params.organizationId);
+          });
+        } else {
+          await sb
+            .from('org_ai_status')
+            .update({
+              [colToIncrement]: (current[colToIncrement] || 0) + 1,
+              last_used_at: timestamp,
+              updated_at: timestamp,
+            })
+            .eq('organization_id', params.organizationId);
+        }
       }
     } catch {
       // Non-blocking: table might not exist yet or connection blip
@@ -1956,6 +2187,9 @@ export async function executeAIChat(
   // ──────────────────────────────────────────────────────────────────────────
   // CASE B: SaaS Platform Shared Key - Universal Cross-Provider Cascade Radar
   // ──────────────────────────────────────────────────────────────────────────
+  if (isGlobalAiKillSwitchActive()) {
+    throw new Error('Global AI Kill Switch is active. All platform AI inference calls are temporarily halted by the Super Admin.');
+  }
 
   // Enforce monthly AI Credits limit for platform pooled key (§32)
   const quotaCheck = await checkOrgAiCreditsLimit(orgId);
@@ -2033,17 +2267,17 @@ export async function executeAIChat(
         });
       }
 
-      // Zero billed cost for platform Gemini Free Tier key
-      const actualCostUsd = (node.provider === 'gemini' && !node.apiKeyEncrypted)
-        ? 0
-        : Number(((result.promptTokens / 1_000_000) * node.costPer1MInput + (result.completionTokens / 1_000_000) * node.costPer1MOutput).toFixed(6));
-
-      node.callCount++;
-      node.lastLatencyMs = result.latencyMs;
-      node.avgLatencyMs = node.callCount > 1
-        ? Math.round((node.avgLatencyMs * (node.callCount - 1) + result.latencyMs) / node.callCount)
-        : result.latencyMs;
-      node.lastUsedAt = new Date().toISOString();
+      // Dual-Ledger Cost Calculation: Commercial Equivalent at model rates + Actual Billed Spend
+      const isFreeZeroBilled = await isNodeFreeTierZeroBilled(node, nodeKey);
+      const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+        promptTokens: result.promptTokens,
+        completionTokens: result.completionTokens,
+        costPer1MInput: node.costPer1MInput,
+        costPer1MOutput: node.costPer1MOutput,
+        isFreeTierZeroBilled: isFreeZeroBilled,
+      });
+      const maskedLast4 = nodeKey.slice(-4);
+      const keyFingerprint = fingerprintApiKey(nodeKey);
 
       await recordAiTelemetryEvent({
         organizationId: orgId,
@@ -2056,9 +2290,13 @@ export async function executeAIChat(
         completionTokens: result.completionTokens,
         totalTokens: result.totalTokens,
         costUsd: actualCostUsd,
+        commercialCostUsd,
         latencyMs: result.latencyMs,
         status: 'success',
         keySource: 'platform',
+        keyLast4: maskedLast4,
+        keyFingerprint,
+        gatewayProviderId: node.id,
       });
 
       const maskedKey = `••••${nodeKey.slice(-4)}`;
@@ -2224,6 +2462,10 @@ export async function executeAIJSON<T>(
   // ──────────────────────────────────────────────────────────────────────────
   // CASE B: SaaS Platform Shared Key - Universal Failover Cascade for JSON
   // ──────────────────────────────────────────────────────────────────────────
+  if (isGlobalAiKillSwitchActive()) {
+    throw new Error('Global AI Kill Switch is active. All platform AI inference calls are temporarily halted by the Super Admin.');
+  }
+
   let cascade = runtimeGatewayModels
     .filter((m) => m.isActive !== false && !m.circuitOpen)
     .sort((a, b) => a.priority - b.priority);
@@ -2282,16 +2524,16 @@ export async function executeAIJSON<T>(
         });
       }
 
-      const actualCostUsd = (node.provider === 'gemini' && !node.apiKeyEncrypted)
-        ? 0
-        : Number(((res.promptTokens / 1_000_000) * node.costPer1MInput + (res.completionTokens / 1_000_000) * node.costPer1MOutput).toFixed(6));
-
-      node.callCount++;
-      node.lastLatencyMs = res.latencyMs;
-      node.avgLatencyMs = node.callCount > 1
-        ? Math.round((node.avgLatencyMs * (node.callCount - 1) + res.latencyMs) / node.callCount)
-        : res.latencyMs;
-      node.lastUsedAt = new Date().toISOString();
+      const isFreeZeroBilled = await isNodeFreeTierZeroBilled(node, nodeKey);
+      const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+        promptTokens: res.promptTokens,
+        completionTokens: res.completionTokens,
+        costPer1MInput: node.costPer1MInput,
+        costPer1MOutput: node.costPer1MOutput,
+        isFreeTierZeroBilled: isFreeZeroBilled,
+      });
+      const maskedLast4 = nodeKey.slice(-4);
+      const keyFingerprint = fingerprintApiKey(nodeKey);
 
       await recordAiTelemetryEvent({
         organizationId: orgId,
@@ -2304,9 +2546,13 @@ export async function executeAIJSON<T>(
         completionTokens: res.completionTokens,
         totalTokens: res.totalTokens,
         costUsd: actualCostUsd,
+        commercialCostUsd,
         latencyMs: res.latencyMs,
         status: 'success',
         keySource: 'platform',
+        keyLast4: maskedLast4,
+        keyFingerprint,
+        gatewayProviderId: node.id,
       });
 
       return {

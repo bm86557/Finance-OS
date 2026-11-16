@@ -92,6 +92,10 @@ import {
   testGatewayNodeDirect,
   resolveNodeApiKey,
   testAIConnection,
+  calculateTokenCost,
+  fingerprintApiKey,
+  isGlobalAiKillSwitchActive,
+  setGlobalAiKillSwitch,
 } from '../lib/aiGateway.js';
 import { decryptSecret, encryptSecret } from '../lib/secretBox.js';
 
@@ -285,5 +289,43 @@ describe('Dynamic Model Gateway & Failover Tests (SaaS Scope)', () => {
     });
     expect(missingOpenAiResult.success).toBe(false);
     expect(missingOpenAiResult.error).toContain('API key is missing or empty');
+  });
+
+  it('11. Computes Dual-Ledger costs accurately for Free Tier vs Paid Platform keys', () => {
+    const freeTierLedger = calculateTokenCost({
+      promptTokens: 1_000_000,
+      completionTokens: 1_000_000,
+      costPer1MInput: 0.075,
+      costPer1MOutput: 0.30,
+      isFreeTierZeroBilled: true,
+    });
+    expect(freeTierLedger.actualCostUsd).toBe(0);
+    expect(freeTierLedger.commercialCostUsd).toBe(0.375);
+
+    const paidTierLedger = calculateTokenCost({
+      promptTokens: 1_000_000,
+      completionTokens: 1_000_000,
+      costPer1MInput: 0.15,
+      costPer1MOutput: 0.60,
+      isFreeTierZeroBilled: false,
+    });
+    expect(paidTierLedger.actualCostUsd).toBe(0.75);
+    expect(paidTierLedger.commercialCostUsd).toBe(0.75);
+
+    const fp1 = fingerprintApiKey('AIzaSyKeyOne1234');
+    const fp2 = fingerprintApiKey('AIzaSyKeyTwo5678');
+    expect(fp1).toBe(fingerprintApiKey('AIzaSyKeyOne1234'));
+    expect(fp1).not.toBe(fp2);
+  });
+
+  it('12. Toggles Global AI Kill Switch state (§33) cleanly', async () => {
+    const initial = isGlobalAiKillSwitchActive();
+    const enabled = await setGlobalAiKillSwitch(true);
+    expect(enabled).toBe(true);
+    expect(isGlobalAiKillSwitchActive()).toBe(true);
+
+    const restored = await setGlobalAiKillSwitch(initial);
+    expect(restored).toBe(initial);
+    expect(isGlobalAiKillSwitchActive()).toBe(initial);
   });
 });

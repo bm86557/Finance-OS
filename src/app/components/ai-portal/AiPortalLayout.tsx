@@ -77,16 +77,16 @@ export function AiPortalLayout({ children, currentView, onViewChange }: AiPortal
             </div>
           </div>
         </div>
-        
+
         <div className="flex items-center gap-4">
           {/* Quick link to General Platform Console */}
-          <Button
+          {/* <Button
             onClick={() => navigate('/platform')}
             className="bg-slate-900/60 hover:bg-slate-800 text-slate-300 border border-slate-700/60 text-xs font-mono flex items-center gap-2"
           >
             <ArrowLeft className="size-3.5" />
             <span>Platform Console</span>
-          </Button>
+          </Button> */}
 
           {/* User Profile Badge */}
           <div className="flex items-center gap-3 px-4 py-2 backdrop-blur-xl rounded-xl" style={{

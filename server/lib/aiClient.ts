@@ -5,7 +5,7 @@
  */
 
 import type { AIConfig } from '../config/aiConfig.js';
-import { recordAiTelemetryEvent } from './aiGateway.js';
+import { calculateTokenCost, fingerprintApiKey, recordAiTelemetryEvent } from './aiGateway.js';
 import { classifyTransaction } from '../../src/lib/classificationEngine.js';
 
 export interface CategorySuggestion {
@@ -199,6 +199,50 @@ function buildUserPrompt(input: TransactionClassificationInput): string {
 Return JSON with your classification.`;
 }
 
+async function recordClientTelemetry(params: {
+  config: AIConfig;
+  provider: string;
+  modelName: string;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  isFreeTierZeroBilled: boolean;
+}) {
+  const { config, provider, modelName, promptTokens, completionTokens, totalTokens, latencyMs, isFreeTierZeroBilled } = params;
+  const defaults = provider === 'anthropic'
+    ? { inRate: 0.80, outRate: 4.00 }
+    : provider === 'gemini'
+      ? { inRate: 0.075, outRate: 0.30 }
+      : { inRate: 0.15, outRate: 0.60 };
+  const { actualCostUsd, commercialCostUsd } = calculateTokenCost({
+    promptTokens,
+    completionTokens,
+    costPer1MInput: defaults.inRate,
+    costPer1MOutput: defaults.outRate,
+    isFreeTierZeroBilled,
+  });
+  const keySource = (config as any).keySource === 'custom_byok' ? 'custom_byok' : 'platform';
+  void recordAiTelemetryEvent({
+    organizationId: (config as any).organizationId || 'platform_global',
+    portalType: 'organization_admin',
+    featureArea: 'narration_classification',
+    provider,
+    modelName,
+    fallbackTriggered: false,
+    promptTokens,
+    completionTokens,
+    totalTokens,
+    costUsd: actualCostUsd,
+    commercialCostUsd,
+    latencyMs,
+    status: 'success',
+    keySource,
+    keyLast4: config.apiKey ? config.apiKey.slice(-4) : undefined,
+    keyFingerprint: config.apiKey ? fingerprintApiKey(config.apiKey) : undefined,
+  });
+}
+
 /**
  * Call OpenAI-compatible API
  */
@@ -207,6 +251,7 @@ async function callOpenAICompatible(
   systemPrompt: string,
   userPrompt: string
 ): Promise<string> {
+  const start = Date.now();
   const baseUrl = config.baseUrl || 'https://api.openai.com/v1';
   const endpoint = `${baseUrl}/chat/completions`;
 
@@ -234,7 +279,20 @@ async function callOpenAICompatible(
   }
 
   const data = await response.json();
-  return data.choices[0]?.message?.content || '{}';
+  const content = data.choices[0]?.message?.content || '{}';
+  const promptTokens = data.usage?.prompt_tokens || Math.ceil((systemPrompt.length + userPrompt.length) / 4);
+  const completionTokens = data.usage?.completion_tokens || Math.ceil(content.length / 4);
+  recordClientTelemetry({
+    config,
+    provider: config.provider || 'openai',
+    modelName: config.modelName,
+    promptTokens,
+    completionTokens,
+    totalTokens: data.usage?.total_tokens || (promptTokens + completionTokens),
+    latencyMs: Date.now() - start,
+    isFreeTierZeroBilled: false,
+  });
+  return content;
 }
 
 /**
@@ -245,6 +303,7 @@ async function callAnthropic(
   systemPrompt: string,
   userPrompt: string
 ): Promise<string> {
+  const start = Date.now();
   const endpoint = 'https://api.anthropic.com/v1/messages';
 
   const response = await fetch(endpoint, {
@@ -271,7 +330,20 @@ async function callAnthropic(
   }
 
   const data = await response.json();
-  return data.content[0]?.text || '{}';
+  const content = data.content[0]?.text || '{}';
+  const promptTokens = data.usage?.input_tokens || Math.ceil((systemPrompt.length + userPrompt.length) / 4);
+  const completionTokens = data.usage?.output_tokens || Math.ceil(content.length / 4);
+  recordClientTelemetry({
+    config,
+    provider: 'anthropic',
+    modelName: config.modelName,
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    latencyMs: Date.now() - start,
+    isFreeTierZeroBilled: false,
+  });
+  return content;
 }
 
 function repairJsonIfNeeded(rawText: string): string {
@@ -367,19 +439,15 @@ async function callGemini(
       const completionTokens = data.usageMetadata?.candidatesTokenCount || Math.ceil(raw.length / 4);
       const totalTokens = data.usageMetadata?.totalTokenCount || (promptTokens + completionTokens);
 
-      void recordAiTelemetryEvent({
-        organizationId: (config as any).organizationId || 'platform_global',
-        portalType: 'organization_admin',
-        featureArea: 'narration_classification',
+      recordClientTelemetry({
+        config,
         provider: 'gemini',
         modelName,
-        fallbackTriggered: false,
         promptTokens,
         completionTokens,
         totalTokens,
-        costUsd: 0,
         latencyMs: Date.now() - start,
-        status: 'success',
+        isFreeTierZeroBilled: (config as any).keySource !== 'custom_byok',
       });
 
       return repairJsonIfNeeded(raw);

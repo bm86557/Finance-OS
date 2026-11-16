@@ -32,6 +32,9 @@ import {
   reorderGatewayProvidersDb,
   testGatewayNodeDirect,
   getPrimaryGatewayApiKey,
+  isGlobalAiKillSwitchActive,
+  setGlobalAiKillSwitch,
+  syncGlobalAiKillSwitchFromDb,
 } from '../lib/aiGateway.js';
 import {
   resolveKeyTier,
@@ -100,6 +103,10 @@ export function createPlatformAiRouter(): Router {
       let byokPromptTokens = 0;
       let byokCompletionTokens = 0;
       let byokEvents = 0;
+      let byokCommercialUsd = 0;
+
+      let platformActualSpendUsd = 0;
+      let platformCommercialUsd = 0;
 
       let totalSystemTokens = 0;
       let totalSystemEvents = 0;
@@ -112,47 +119,153 @@ export function createPlatformAiRouter(): Router {
         statement_import_batch: 0,
       };
 
+      type KeyBreakdownAgg = {
+        keyFingerprint: string;
+        keyLast4: string;
+        provider: string;
+        modelName: string;
+        keySource: 'platform' | 'custom_byok';
+        billingMode: string;
+        calls: number;
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        actualCostUsd: number;
+        commercialCostUsd: number;
+        lastUsedAt: string | null;
+      };
+      const keyBreakdownMap = new Map<string, KeyBreakdownAgg>();
+
+      const accumulateKeyLedger = (params: {
+        provider: string;
+        modelName: string;
+        keySource: 'platform' | 'custom_byok';
+        keyLast4: string;
+        keyFingerprint: string;
+        pt: number;
+        ct: number;
+        tt: number;
+        actualCost: number;
+        commercialCost: number;
+        createdAt?: string | null;
+      }) => {
+        const mapKey = params.keyFingerprint || `${params.provider}:${params.keyLast4}:${params.keySource}`;
+        const existing = keyBreakdownMap.get(mapKey) || {
+          keyFingerprint: mapKey,
+          keyLast4: params.keyLast4 || 'env',
+          provider: params.provider || 'gemini',
+          modelName: params.modelName || 'gemini-flash-latest',
+          keySource: params.keySource,
+          billingMode: params.keySource === 'custom_byok' ? 'tenant_byok' : (params.actualCost > 0 ? 'paid' : 'free'),
+          calls: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          totalTokens: 0,
+          actualCostUsd: 0,
+          commercialCostUsd: 0,
+          lastUsedAt: null,
+        };
+        existing.calls += 1;
+        existing.promptTokens += params.pt;
+        existing.completionTokens += params.ct;
+        existing.totalTokens += params.tt;
+        existing.actualCostUsd += params.actualCost;
+        existing.commercialCostUsd += params.commercialCost;
+        if (params.actualCost > 0 && params.keySource === 'platform') existing.billingMode = 'paid';
+        if (params.createdAt && (!existing.lastUsedAt || params.createdAt > existing.lastUsedAt)) {
+          existing.lastUsedAt = params.createdAt;
+        }
+        keyBreakdownMap.set(mapKey, existing);
+      };
+
+      const inferCommercialCost = (ev: any, pt: number, ct: number): number => {
+        if (ev.commercial_cost_usd !== undefined && ev.commercial_cost_usd !== null && Number(ev.commercial_cost_usd) > 0) {
+          return Number(ev.commercial_cost_usd);
+        }
+        if (ev.commercialCostUsd !== undefined && Number(ev.commercialCostUsd) > 0) {
+          return Number(ev.commercialCostUsd);
+        }
+        if (Number(ev.cost_usd ?? ev.costUsd ?? 0) > 0) {
+          return Number(ev.cost_usd ?? ev.costUsd);
+        }
+        const prov = String(ev.provider || 'gemini').toLowerCase();
+        const inRate = prov === 'anthropic' ? 0.80 : prov === 'openai' ? 0.15 : 0.075;
+        const outRate = prov === 'anthropic' ? 4.00 : prov === 'openai' ? 0.60 : 0.30;
+        return Number(((pt * inRate) / 1_000_000 + (ct * outRate) / 1_000_000).toFixed(6));
+      };
+
+      await syncGlobalAiKillSwitchFromDb();
+
       // 1. Fetch persisted telemetry from Supabase platform_ai_usage_events
       if (sb) {
         try {
-          const { data: dbEvents, error: dbErr } = await sb
+          let dbEvents: any[] | null = null;
+          const resExt = await sb
             .from('platform_ai_usage_events')
-            .select('organization_id, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, created_at')
+            .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, commercial_cost_usd, key_source, key_last4, key_fingerprint, created_at')
             .order('created_at', { ascending: false })
             .limit(5000);
 
-          if (!dbErr && dbEvents && dbEvents.length > 0) {
+          if (!resExt.error) {
+            dbEvents = resExt.data;
+          } else {
+            const resBase = await sb
+              .from('platform_ai_usage_events')
+              .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, created_at')
+              .order('created_at', { ascending: false })
+              .limit(5000);
+            if (!resBase.error) dbEvents = resBase.data;
+          }
+
+          if (dbEvents && dbEvents.length > 0) {
             for (const ev of dbEvents) {
               const pt = Number(ev.prompt_tokens) || 0;
               const ct = Number(ev.completion_tokens) || 0;
               const tt = Number(ev.total_tokens) || (pt + ct);
               const lat = Number(ev.latency_ms) || 0;
+              const actualCost = Number(ev.cost_usd) || 0;
+              const commercialCost = inferCommercialCost(ev, pt, ct);
 
               totalSystemTokens += tt;
               totalSystemEvents += 1;
 
-              // An event is definitively BYOK if recorded with custom_byok or cost_usd > 0
-              // (zero billed cost strictly represents platform shared free-tier gateway calls)
-              const isByok = (ev as any).key_source === 'custom_byok'
-                || Number(ev.cost_usd) > 0
-                || (ev.organization_id && customKeyOrgs.has(ev.organization_id) && ev.cost_usd === undefined);
+              // Only treat as BYOK when explicitly flagged custom_byok, or legacy org-with-key that had cost_usd > 0
+              const isByok = ev.key_source === 'custom_byok'
+                || (!ev.key_source && ev.organization_id && customKeyOrgs.has(ev.organization_id) && actualCost > 0);
 
               if (isByok) {
                 byokTokens += tt;
                 byokPromptTokens += pt;
                 byokCompletionTokens += ct;
                 byokEvents += 1;
+                byokCommercialUsd += commercialCost;
               } else {
                 platformTokens += tt;
                 platformPromptTokens += pt;
                 platformCompletionTokens += ct;
                 platformEvents += 1;
                 platformLatencySum += lat;
+                platformActualSpendUsd += actualCost;
+                platformCommercialUsd += commercialCost;
 
                 if (ev.fallback_triggered) {
                   fallbackCount += 1;
                 }
               }
+
+              accumulateKeyLedger({
+                provider: ev.provider || 'gemini',
+                modelName: ev.model_name || 'gemini-flash-latest',
+                keySource: isByok ? 'custom_byok' : 'platform',
+                keyLast4: ev.key_last4 || (isByok ? 'byok' : (rawApiKey ? rawApiKey.slice(-4) : 'env')),
+                keyFingerprint: ev.key_fingerprint || `${ev.provider || 'gemini'}:${ev.key_last4 || (isByok ? 'byok' : 'platform')}:${isByok ? 'custom_byok' : 'platform'}`,
+                pt,
+                ct,
+                tt,
+                actualCost,
+                commercialCost,
+                createdAt: ev.created_at,
+              });
 
               const feat = ev.feature_area || 'narration_classification';
               featureBreakdown[feat] = (featureBreakdown[feat] || 0) + 1;
@@ -166,13 +279,14 @@ export function createPlatformAiRouter(): Router {
       // 2. Add unpersisted in-memory events only (prevents double-counting)
       const unpersisted = getUnpersistedTelemetryEvents();
       for (const ev of unpersisted) {
+        const actualCost = ev.costUsd || 0;
         const isByok = ev.keySource === 'custom_byok'
-          || (ev.costUsd !== undefined && ev.costUsd > 0)
-          || (ev.organizationId && customKeyOrgs.has(ev.organizationId) && ev.keySource === undefined);
+          || (!ev.keySource && ev.organizationId && customKeyOrgs.has(ev.organizationId) && actualCost > 0);
         const pt = ev.promptTokens || 0;
         const ct = ev.completionTokens || 0;
         const tt = ev.totalTokens || (pt + ct);
         const lat = ev.latencyMs || 0;
+        const commercialCost = inferCommercialCost(ev, pt, ct);
 
         totalSystemTokens += tt;
         totalSystemEvents += 1;
@@ -182,17 +296,34 @@ export function createPlatformAiRouter(): Router {
           byokPromptTokens += pt;
           byokCompletionTokens += ct;
           byokEvents += 1;
+          byokCommercialUsd += commercialCost;
         } else {
           platformTokens += tt;
           platformPromptTokens += pt;
           platformCompletionTokens += ct;
           platformEvents += 1;
           platformLatencySum += lat;
+          platformActualSpendUsd += actualCost;
+          platformCommercialUsd += commercialCost;
 
           if (ev.fallbackTriggered) {
             fallbackCount += 1;
           }
         }
+
+        accumulateKeyLedger({
+          provider: ev.provider || 'gemini',
+          modelName: ev.modelName || 'gemini-flash-latest',
+          keySource: isByok ? 'custom_byok' : 'platform',
+          keyLast4: ev.keyLast4 || (isByok ? 'byok' : (rawApiKey ? rawApiKey.slice(-4) : 'env')),
+          keyFingerprint: ev.keyFingerprint || `${ev.provider || 'gemini'}:${ev.keyLast4 || (isByok ? 'byok' : 'platform')}:${isByok ? 'custom_byok' : 'platform'}`,
+          pt,
+          ct,
+          tt,
+          actualCost,
+          commercialCost,
+          createdAt: ev.timestamp,
+        });
 
         const feat = ev.featureArea || 'narration_classification';
         featureBreakdown[feat] = (featureBreakdown[feat] || 0) + 1;
@@ -236,14 +367,39 @@ export function createPlatformAiRouter(): Router {
       }).length;
       requestsToday += unpersistedPlatformToday;
 
-      // 4. Calculate Commercial Shadow Valuation at Flash-Lite list rates for Platform key usage
-      // ($0.075 / 1M prompt, $0.300 / 1M completion)
-      const commercialEquivalentUsd = Number(
-        ((platformPromptTokens * 0.075) / 1_000_000 + (platformCompletionTokens * 0.300) / 1_000_000).toFixed(4)
-      );
+      // 4. Dual-Ledger Valuation: Actual Billed Spend + Commercial Equivalent + Free Tier Savings
+      const commercialEquivalentUsd = Number(platformCommercialUsd.toFixed(6));
+      const actualSpendUsd = Number(platformActualSpendUsd.toFixed(6));
+      const freeTierSavingsUsd = Number(Math.max(0, commercialEquivalentUsd - actualSpendUsd).toFixed(6));
 
-      // Out-of-pocket billed spend: $0.00 if Free Tier, otherwise commercial cost
-      const actualSpendUsd = tierInfo.isBilledAsZero ? 0.0 : commercialEquivalentUsd;
+      // Compute real SaaS Plan Revenue vs Platform AI COGS
+      let totalMonthlyPlanRevenuePkr = 0;
+      try {
+        const orgs = await loadPlatformOrganizations();
+        const planPricesPkr: Record<string, number> = { basic: 0, professional: 49900, enterprise: 149900 };
+        for (const o of orgs) {
+          const pk = String(o.plan || 'basic').toLowerCase().replace(/^plan-/, '');
+          totalMonthlyPlanRevenuePkr += planPricesPkr[pk] ?? 0;
+        }
+      } catch {
+        // non-blocking
+      }
+      const PKR_TO_USD_STAT = 0.0036;
+      const totalMonthlyPlanRevenueUsd = Number((totalMonthlyPlanRevenuePkr * PKR_TO_USD_STAT).toFixed(2));
+      const netMarginUsd = Number((totalMonthlyPlanRevenueUsd - actualSpendUsd).toFixed(2));
+      const netMarginPkr = Math.round(totalMonthlyPlanRevenuePkr - actualSpendUsd / PKR_TO_USD_STAT);
+      const marginPercent = totalMonthlyPlanRevenueUsd > 0
+        ? Number(((netMarginUsd / totalMonthlyPlanRevenueUsd) * 100).toFixed(2))
+        : (actualSpendUsd === 0 ? 100 : 0);
+
+      const apiKeyBreakdown = Array.from(keyBreakdownMap.values())
+        .map((k) => ({
+          ...k,
+          actualCostUsd: Number(k.actualCostUsd.toFixed(6)),
+          commercialCostUsd: Number(k.commercialCostUsd.toFixed(6)),
+          savingsUsd: Number(Math.max(0, k.commercialCostUsd - k.actualCostUsd).toFixed(6)),
+        }))
+        .sort((a, b) => b.totalTokens - a.totalTokens);
 
       // 5. Query live system entities from Supabase
       let totalTransactions = 0;
@@ -278,6 +434,20 @@ export function createPlatformAiRouter(): Router {
         billingTier: tierInfo.tier,
         actualSpendUsd,
         commercialEquivalentUsd,
+        freeTierSavingsUsd,
+        byokCommercialUsd: Number(byokCommercialUsd.toFixed(6)),
+        apiKeyBreakdown,
+        platformMarginEconomics: {
+          monthlyRevenuePkr: totalMonthlyPlanRevenuePkr,
+          monthlyRevenueUsd: totalMonthlyPlanRevenueUsd,
+          actualAiSpendUsd: actualSpendUsd,
+          commercialAiShadowUsd: commercialEquivalentUsd,
+          freeTierSavingsUsd,
+          netMarginPkr,
+          netMarginUsd,
+          marginPercent,
+        },
+        globalAiKillSwitch: isGlobalAiKillSwitchActive(),
         totalTokens: platformTokens,
         totalPromptTokens: platformPromptTokens,
         totalCompletionTokens: platformCompletionTokens,
@@ -298,9 +468,9 @@ export function createPlatformAiRouter(): Router {
         rateLimitRpm: tierInfo.limits.rpm,
         rateLimitTpm: tierInfo.limits.tpm,
         dailyResetTime: tierInfo.limits.dailyResetTime,
-        activeProvider: 'Google Gemini',
+        activeProvider: gatewayState.activeProvider || 'Google Gemini',
         activeModel: gatewayState.activeModel,
-        fallbackChain: ['gemini-flash-lite-latest', 'gemini-flash-latest', 'gemini-3-flash-preview', 'gemini-2.0-flash'],
+        fallbackChain: (gatewayState.models || []).map((m) => m.modelName),
         apiKeyConfigured: !!rawApiKey,
         apiKeyMasked: maskedKey,
         avgLatencyMs,
@@ -430,12 +600,24 @@ export function createPlatformAiRouter(): Router {
       }>();
 
       // Aggregate from Supabase platform_ai_usage_events
+      const orgCostMap = new Map<string, { platformActualUsd: number; platformCommercialUsd: number; byokCommercialUsd: number }>();
+
       if (sb) {
         try {
-          const { data: events } = await sb
+          let events: any[] | null = null;
+          const resExt = await sb
             .from('platform_ai_usage_events')
-            .select('organization_id, total_tokens, portal_type, created_at, cost_usd')
+            .select('organization_id, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd, commercial_cost_usd, key_source')
             .gte('created_at', defaultPeriodStart);
+          if (!resExt.error) {
+            events = resExt.data;
+          } else {
+            const resBase = await sb
+              .from('platform_ai_usage_events')
+              .select('organization_id, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd')
+              .gte('created_at', defaultPeriodStart);
+            if (!resBase.error) events = resBase.data;
+          }
 
           if (events) {
             for (const ev of events) {
@@ -447,21 +629,33 @@ export function createPlatformAiRouter(): Router {
                 platformRequests: 0,
                 byokRequests: 0,
               };
+              const costCur = orgCostMap.get(ev.organization_id) || {
+                platformActualUsd: 0,
+                platformCommercialUsd: 0,
+                byokCommercialUsd: 0,
+              };
               const tt = Number(ev.total_tokens) || 0;
+              const actualCost = Number(ev.cost_usd) || 0;
+              const commercialCost = Number(ev.commercial_cost_usd) > 0
+                ? Number(ev.commercial_cost_usd)
+                : (actualCost > 0 ? actualCost : Number((tt * 0.00000015).toFixed(6)));
               cur.totalTokens += tt;
 
-              const isEvByok = (ev as any).key_source === 'custom_byok'
-                || Number(ev.cost_usd) > 0
-                || (ev.organization_id && customKeyOrgs.has(ev.organization_id) && ev.cost_usd === undefined);
+              const isEvByok = ev.key_source === 'custom_byok'
+                || (!ev.key_source && ev.organization_id && customKeyOrgs.has(ev.organization_id) && actualCost > 0);
 
               if (isEvByok) {
                 cur.byokTokens += tt;
                 cur.byokRequests += 1;
+                costCur.byokCommercialUsd += commercialCost;
               } else {
                 cur.platformTokens += tt;
                 cur.platformRequests += 1;
+                costCur.platformActualUsd += actualCost;
+                costCur.platformCommercialUsd += commercialCost;
               }
               orgUsageMap.set(ev.organization_id, cur);
+              orgCostMap.set(ev.organization_id, costCur);
             }
           }
         } catch {
@@ -480,21 +674,33 @@ export function createPlatformAiRouter(): Router {
           platformRequests: 0,
           byokRequests: 0,
         };
+        const costCur = orgCostMap.get(ev.organizationId) || {
+          platformActualUsd: 0,
+          platformCommercialUsd: 0,
+          byokCommercialUsd: 0,
+        };
         const tt = ev.totalTokens || 0;
+        const actualCost = ev.costUsd || 0;
+        const commercialCost = (ev.commercialCostUsd && ev.commercialCostUsd > 0)
+          ? ev.commercialCostUsd
+          : (actualCost > 0 ? actualCost : Number((tt * 0.00000015).toFixed(6)));
         cur.totalTokens += tt;
 
         const isEvByok = ev.keySource === 'custom_byok'
-          || (ev.costUsd !== undefined && ev.costUsd > 0)
-          || (ev.organizationId && customKeyOrgs.has(ev.organizationId) && ev.keySource === undefined);
+          || (!ev.keySource && ev.organizationId && customKeyOrgs.has(ev.organizationId) && actualCost > 0);
 
         if (isEvByok) {
           cur.byokTokens += tt;
           cur.byokRequests += 1;
+          costCur.byokCommercialUsd += commercialCost;
         } else {
           cur.platformTokens += tt;
           cur.platformRequests += 1;
+          costCur.platformActualUsd += actualCost;
+          costCur.platformCommercialUsd += commercialCost;
         }
         orgUsageMap.set(ev.organizationId, cur);
+        orgCostMap.set(ev.organizationId, costCur);
       }
 
       // Standard exchange rate: 1 PKR ~ 0.0036 USD
@@ -528,10 +734,19 @@ export function createPlatformAiRouter(): Router {
 
         const planFeePkr = planConfig.feePkr;
         const planFeeUsd = Number((planFeePkr * PKR_TO_USD).toFixed(2));
+        const orgCosts = orgCostMap.get(org.id) || { platformActualUsd: 0, platformCommercialUsd: 0, byokCommercialUsd: 0 };
 
-        // Actual raw billed AI spend on Gemini Free Tier is $0.00
-        const actualApiCostUsd = 0.0;
-        const commercialShadowCostUsd = Number((tokensUsed * 0.00000015).toFixed(4));
+        // Actual platform out-of-pocket spend (excludes tenant BYOK spend)
+        const actualApiCostUsd = Number(orgCosts.platformActualUsd.toFixed(6));
+        const commercialShadowCostUsd = isBYOK
+          ? Number(orgCosts.byokCommercialUsd.toFixed(6))
+          : Number(orgCosts.platformCommercialUsd.toFixed(6));
+
+        const netMarginUsd = Number((planFeeUsd - actualApiCostUsd).toFixed(2));
+        const netMarginPkr = Math.round(planFeePkr - (actualApiCostUsd / PKR_TO_USD));
+        const marginPercent = planFeeUsd > 0
+          ? Number(((netMarginUsd / planFeeUsd) * 100).toFixed(2))
+          : (actualApiCostUsd === 0 ? 100 : 0);
 
         let burnStatus: 'healthy' | 'warning' | 'exceeded' | 'byok_exempt' = 'healthy';
         if (isBYOK) {
@@ -561,11 +776,11 @@ export function createPlatformAiRouter(): Router {
           quotaPercent,
           rawCostUsd: actualApiCostUsd,
           commercialShadowCostUsd,
-          netMarginPkr: planFeePkr,
-          netMarginUsd: planFeeUsd,
-          marginPercent: planFeeUsd > 0 ? 100.0 : 0,
+          netMarginPkr,
+          netMarginUsd,
+          marginPercent,
           burnStatus,
-          keySource: isBYOK ? 'custom_byok' : 'platform_free_tier',
+          keySource: isBYOK ? 'custom_byok' : (actualApiCostUsd > 0 ? 'platform_paid_tier' : 'platform_free_tier'),
         };
       });
 
@@ -636,6 +851,7 @@ export function createPlatformAiRouter(): Router {
         rateLimitTpm: rateLimitTpm !== undefined ? Number(rateLimitTpm) : undefined,
         timeoutMs: timeoutMs !== undefined ? Number(timeoutMs) : undefined,
         maxTokensPerReq: maxTokensPerReq !== undefined ? Number(maxTokensPerReq) : undefined,
+        billingTier: req.body.billingTier,
       });
 
       return ok(res, created);
@@ -678,6 +894,7 @@ export function createPlatformAiRouter(): Router {
         maxTokensPerReq: maxTokensPerReq !== undefined ? Number(maxTokensPerReq) : undefined,
         circuitOpen,
         isActive,
+        billingTier: req.body.billingTier,
       });
 
       if (!updated) {
@@ -1033,22 +1250,7 @@ export function createPlatformAiRouter(): Router {
         }
       }
 
-      // 4. Record telemetry event for the quality scan
-      void recordAiTelemetryEvent({
-        organizationId: 'platform_global',
-        portalType: 'ai_assistant',
-        featureArea: 'narration_classification',
-        provider: 'gemini',
-        modelName: 'gemini-flash-lite-latest',
-        fallbackTriggered: false,
-        promptTokens: txs.length * 15,
-        completionTokens: txs.length * 5,
-        totalTokens: txs.length * 20,
-        costUsd: 0,
-        latencyMs: 120,
-        status: 'success',
-      }).catch(() => {});
-
+      // Deterministic rule evaluation does not consume LLM tokens, so do not emit synthetic LLM events.
       return ok(res, {
         success: true,
         scannedCount: txs.length,
@@ -1084,6 +1286,7 @@ export function createPlatformAiRouter(): Router {
         }
       }
 
+      await syncGlobalAiKillSwitchFromDb();
       const isFreeTier = tierInfo.tier === 'free';
 
       return ok(res, {
@@ -1094,7 +1297,7 @@ export function createPlatformAiRouter(): Router {
         piiRedactionActive: true,
         retentionPolicy: isFreeTier ? 'Google Free Tier terms (Prompt Ephemeral)' : 'Zero Retention (No Foundation Training)',
         customKeyTenants: customKeyCount,
-        globalAiKillSwitch: false,
+        globalAiKillSwitch: isGlobalAiKillSwitchActive(),
         keyTier: tierInfo,
         dataPrivacyDisclosure: isFreeTier
           ? 'Google Gemini Free Tier terms apply. Customer data is not retained in Finance OS databases, but Google free-tier developer terms permit model evaluation. Upgrade to Paid Tier or configure Tenant BYOK for full enterprise zero-training guarantees.'
@@ -1102,6 +1305,19 @@ export function createPlatformAiRouter(): Router {
       });
     } catch (err: any) {
       return fail(res, err.message || 'Failed to load security status', 500);
+    }
+  });
+
+  /**
+   * 8b. POST /security-status/kill-switch - Toggle Global AI Kill Switch (§33)
+   */
+  r.post('/security-status/kill-switch', async (req: Request, res: Response) => {
+    try {
+      const enabled = Boolean(req.body?.enabled);
+      const state = await setGlobalAiKillSwitch(enabled);
+      return ok(res, { globalAiKillSwitch: state });
+    } catch (err: any) {
+      return fail(res, err.message || 'Failed to update global AI kill switch', 500);
     }
   });
 
