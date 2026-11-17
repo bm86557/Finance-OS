@@ -15,6 +15,10 @@ import {
   doesEntryMatchTask,
   todayYmdLocal,
 } from '../../src/lib/taskReconciler.js';
+import {
+  isValidProjectTransaction,
+  isDirectProjectDebit,
+} from '../../src/lib/projectTransactionFilter.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -23,55 +27,6 @@ function getOrgId(req: Request): string {
 
 function callerId(req: Request): string {
   return (req as any).user?.id || (req as any).userId || (req.headers['x-user-id'] as string) || '';
-}
-
-/**
- * Validates financial transactions for project profitability (§5, §8, §12.4, §14):
- * - Excludes pending, draft, rejected, reversed, or cancelled transactions
- * - Excludes personal-world transactions
- * - Applies optional date range filter [fromDate, toDate]
- */
-function isValidProjectTransaction(t: any, fromDate?: string, toDate?: string): boolean {
-  if (!t) return false;
-  const status = String(t.status || '').toLowerCase();
-  if (status === 'pending' || status === 'draft' || status === 'rejected' || status === 'reversed' || status === 'cancelled') {
-    return false;
-  }
-  if (t.world_scope === 'personal' || (Array.isArray(t.tags) && t.tags.includes('personal'))) {
-    return false;
-  }
-  if (fromDate && t.date && t.date < fromDate) return false;
-  if (toDate && t.date && t.date > toDate) return false;
-  return true;
-}
-
-/**
- * Checks if a debit transaction is a valid direct operational expense (§1247):
- * Excludes reimbursement settlements, payroll transfers, and salary payouts to prevent double counting.
- */
-function isDirectProjectDebit(t: any): boolean {
-  if (t.type !== 'debit') return false;
-  const tags = Array.isArray(t.tags) ? t.tags : [];
-  const desc = (t.description || t.narration || '').toLowerCase();
-  if (
-    tags.includes('reimbursement_settlement') ||
-    tags.includes('payroll_payout') ||
-    tags.includes('salary') ||
-    tags.includes('payroll') ||
-    tags.some((tag: string) => String(tag).startsWith('payslip_alloc:'))
-  ) {
-    return false;
-  }
-  if (
-    desc.includes('reimbursement settlement') ||
-    desc.includes('expense payout') ||
-    desc.includes('salary payout') ||
-    desc.includes('payroll transfer') ||
-    desc.includes('employee salary')
-  ) {
-    return false;
-  }
-  return true;
 }
 
 /**
@@ -858,10 +813,12 @@ export function createProjectsRouter(): Router {
 
         if (costPerHour <= 0 || costPerMinute <= 0) {
           costPerHour = memberRateMap.get(uId) || 50.0;
-          costPerMinute = Math.round((costPerHour / 60) * 10000) / 10000;
+          costPerMinute = costPerHour / 60;
         }
 
-        const entryLaborCost = Math.round(durationMinutes * costPerMinute * 100) / 100;
+        const entryLaborCost = Number(ts.calculated_labor_cost || 0) > 0
+          ? Number(ts.calculated_labor_cost)
+          : Math.round(durationMinutes * costPerMinute * 100) / 100;
 
         totalLoggedMinutes += durationMinutes;
         const isApproved = ts.status === 'approved';
@@ -1256,6 +1213,13 @@ export function createProjectsRouter(): Router {
         return notFound(res, 'Timesheet entry');
       }
 
+      if (entry.status !== 'submitted') {
+        if (entry.status === 'approved') {
+          return ok(res, entry, 'Timesheet entry is already approved.');
+        }
+        return fail(res, 400, 'Only submitted timesheet entries can be approved. This entry is still in draft.');
+      }
+
       // Self-approval guard (§33 Invariant #11): Non-owner cannot approve their own timesheet
       if (entry.user_id === approverUserId && role !== 'owner') {
         return fail(res, 403, 'Self-approval of timesheet entries is strictly prohibited');
@@ -1419,6 +1383,13 @@ export function createProjectsRouter(): Router {
 
       if (fetchErr || !entry) {
         return notFound(res, 'Timesheet entry');
+      }
+
+      if (entry.status !== 'submitted') {
+        if (entry.status === 'approved') {
+          return ok(res, entry, 'Timesheet entry is already approved.');
+        }
+        return fail(res, 400, 'Only submitted timesheet entries can be approved. This entry is still in draft.');
       }
 
       const prevHours = Number(entry.hours || 0);

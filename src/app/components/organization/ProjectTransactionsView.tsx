@@ -6,6 +6,7 @@ import { useService, useServiceArray } from '@/hooks/useService';
 import { useAuth } from '@/contexts/AuthContext';
 import { formatCurrency, formatDate } from '@/lib/formatters';
 import { exportToCSV } from '@/lib/exportUtils';
+import { isValidProjectTransaction, isDirectProjectDebit } from '@/lib/projectTransactionFilter';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgWorkspaceNav } from './OrgWorkspaceNavContext';
 import { toast } from 'sonner';
@@ -137,12 +138,16 @@ export function ProjectTransactionsView() {
   };
 
   // Base transactions for the chosen project (or all projects)
+  // Excludes internal transfers, personal-world entries, and payroll/reimbursement settlements
+  // so the ledger table matches the P&L KPIs 1:1.
   const baseProjectTransactions = useMemo(() => {
-    if (selectedProjectId === 'all') {
-      // Include all transactions that have a project assigned
-      return allTransactions.filter(t => Boolean(t.projectId));
-    }
-    return allTransactions.filter(t => t.projectId === selectedProjectId);
+    const projectScoped = selectedProjectId === 'all'
+      ? allTransactions.filter(t => Boolean(t.projectId))
+      : allTransactions.filter(t => t.projectId === selectedProjectId);
+
+    return projectScoped.filter(
+      t => isValidProjectTransaction(t) && (t.type !== 'debit' || isDirectProjectDebit(t))
+    );
   }, [allTransactions, selectedProjectId]);
 
   // =========================================================================
@@ -157,31 +162,16 @@ export function ProjectTransactionsView() {
     const catSpendMap = new Map<string, number>();
 
     for (const t of baseProjectTransactions) {
-      const status = String(t.status || '').toLowerCase();
-      if (status === 'pending' || status === 'draft' || status === 'rejected' || status === 'reversed' || status === 'cancelled') {
+      if (!isValidProjectTransaction(t)) {
         continue;
       }
-      if ((t as any).worldScope === 'personal' || (t as any).world_scope === 'personal') {
-        continue;
-      }
-      const tags = Array.isArray(t.tags) ? t.tags : [];
-      if (tags.includes('personal')) continue;
 
       const amt = Math.abs(Number(t.amount) || 0);
       if (t.type === 'credit') {
         inflowTotal += amt;
         inflowCount += 1;
       } else if (t.type === 'debit') {
-        const desc = (t.description || (t as any).narration || '').toLowerCase();
-        if (
-          tags.includes('reimbursement_settlement') ||
-          tags.includes('payroll_payout') ||
-          tags.includes('salary') ||
-          tags.includes('payroll') ||
-          desc.includes('reimbursement settlement') ||
-          desc.includes('salary payout') ||
-          desc.includes('payroll transfer')
-        ) {
+        if (!isDirectProjectDebit(t)) {
           continue;
         }
         outflowTotal += amt;

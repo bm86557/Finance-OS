@@ -893,7 +893,7 @@ export function ProjectProfitDetailView() {
                   <div className="flex items-center gap-4 shrink-0">
                     <div className="text-right font-mono">
                       <span className="text-sm font-bold text-cyan-300 block">
-                        {entry.hours.toFixed(1)}h ({entry.durationMinutes || Math.round(entry.hours * 60)}m)
+                        {(entry.hours < 0.1 ? entry.hours.toFixed(2) : entry.hours.toFixed(1))}h ({entry.durationMinutes || Math.round(entry.hours * 60)}m)
                       </span>
                       <span className="text-[11px] text-emerald-400">
                         {formatCurrency(entry.calculatedLaborCost, displayCurrency)}
@@ -902,7 +902,7 @@ export function ProjectProfitDetailView() {
 
                     {/* Manager Actions */}
                     <div className="flex items-center gap-1.5">
-                      {entry.status !== 'approved' && (
+                      {entry.status === 'submitted' ? (
                         <button
                           type="button"
                           onClick={() => handleApproveEntry(entry.id)}
@@ -911,7 +911,14 @@ export function ProjectProfitDetailView() {
                           <CheckCircle2 className="size-3.5" />
                           <span>Approve</span>
                         </button>
-                      )}
+                      ) : entry.status === 'draft' ? (
+                        <span
+                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono text-slate-400 bg-slate-900/70 border border-slate-800"
+                          title="Employee has not submitted this draft entry yet"
+                        >
+                          Awaiting Submit
+                        </span>
+                      ) : null}
                       <button
                         type="button"
                         onClick={() => handleOpenRevision(entry)}

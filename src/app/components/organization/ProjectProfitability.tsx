@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
 import { formatCurrency, formatDate } from '@/lib/formatters';
+import { isValidProjectTransaction, isDirectProjectDebit } from '@/lib/projectTransactionFilter';
 import { Briefcase, Plus, Target, TrendingUp, TrendingDown, DollarSign, AlertTriangle, Loader2, FolderOpen, Receipt, Clock, Users, Calculator, ChevronRight, CheckCircle2 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { toast } from 'sonner';
@@ -147,20 +148,11 @@ export function ProjectProfitability() {
     const map = new Map<string, { directCost: number; directIncome: number; count: number; txns: typeof transactions }>();
     for (const t of transactions) {
       if (!t.projectId) continue;
-      const status = String(t.status || 'classified').toLowerCase();
-      if (['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status)) continue;
-      if (t.worldScope === 'personal' || (Array.isArray(t.tags) && t.tags.includes('personal'))) continue;
-
-      const desc = String(t.description || '').toLowerCase();
-      const tags = Array.isArray(t.tags) ? t.tags : [];
-      const isReimbursementOrPayroll = tags.some((tag: string) => ['reimbursement_settlement', 'payroll_payout', 'salary', 'payroll'].includes(tag))
-        || desc.includes('reimbursement settlement')
-        || desc.includes('payroll payout')
-        || desc.includes('salary payout');
+      if (!isValidProjectTransaction(t)) continue;
 
       const cur = map.get(t.projectId) ?? { directCost: 0, directIncome: 0, count: 0, txns: [] };
       if (t.type === 'debit') {
-        if (!isReimbursementOrPayroll) {
+        if (isDirectProjectDebit(t)) {
           cur.directCost += Math.abs(t.amount);
         }
       } else if (t.type === 'credit') {
@@ -328,6 +320,7 @@ export function ProjectProfitability() {
         transactionCount: stats?.count ?? 0,
         transactions: stats?.txns ?? [],
         loggedHours,
+        approvedHours: bProf?.approvedHours,
         billableHours,
         nonBillableHours,
         contributorCount,
@@ -679,7 +672,11 @@ export function ProjectProfitability() {
               {formatCurrency(totalMarginAtRisk, displayCurrency)}
             </p>
             <p className="text-[11px] text-slate-500 mt-0.5">
-              {totalMarginAtRisk < 0 ? 'Cost overrun projected' : 'On target (EAC matches quote)'}
+              {totalMarginAtRisk < 0
+                ? 'Cost overrun projected'
+                : totalMarginAtRisk === 0
+                  ? 'On target (EAC matches quote)'
+                  : 'Under budget (EAC below quote)'}
             </p>
           </div>
           <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400">
@@ -893,7 +890,10 @@ export function ProjectProfitability() {
                         </span>
                       </p>
                       <p className="text-xs text-slate-400 font-mono">
-                        {(project.billableHours ?? project.loggedHours ?? 0).toFixed(1)}h billable · @ {project.loggedHours > 0 ? formatCurrency((project.laborCost || 0) / project.loggedHours, displayCurrency) : '$0'}/hr
+                        {(project.billableHours ?? project.loggedHours ?? 0).toFixed(1)}h billable · @ {(() => {
+                          const rateHrs = (project.approvedHours && project.approvedHours > 0) ? project.approvedHours : project.loggedHours;
+                          return rateHrs > 0 ? formatCurrency((project.laborCost || 0) / rateHrs, displayCurrency) : '$0';
+                        })()}/hr
                       </p>
                     </div>
                     <div>
@@ -948,7 +948,7 @@ export function ProjectProfitability() {
                             <div
                               style={{ width: `${remainingPct}%` }}
                               className="h-full bg-cyan-500/25 transition-all"
-                              title={`Remaining Margin: ${formatCurrency(profit, displayCurrency)} (${remainingPct}%)`}
+                              title={`Remaining Budget: ${formatCurrency(Math.max(0, project.quotedAmount - project.actualCost), displayCurrency)} (${remainingPct}%)`}
                             />
                           )}
                         </div>
@@ -969,7 +969,7 @@ export function ProjectProfitability() {
                           ) : null}
                           <span className="flex items-center gap-1.5 ml-auto text-cyan-400">
                             <span className="w-2 h-2 rounded-full bg-cyan-400" />
-                            Remaining Margin: <strong>{formatCurrency(profit, displayCurrency)}</strong> ({remainingPct}%)
+                            Remaining Budget: <strong>{formatCurrency(Math.max(0, project.quotedAmount - project.actualCost), displayCurrency)}</strong> ({remainingPct}%)
                           </span>
                         </div>
                       </div>

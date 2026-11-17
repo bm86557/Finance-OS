@@ -838,13 +838,35 @@ export interface ProjectProfitability {
   actualCost: number;
   revenue?: number; // sum of credits
   profit: number;
+  operatingProfit?: number;
+  projectContribution?: number;
   profitMargin: number;
   status: string;
   budgetVariance: number; // percentage over/under
   directCost?: number;
   laborCost?: number;
+  assignedOverhead?: number;
+  initialBaselineCost?: number;
+  consumedBurn?: number;
+  burnRatePerDay?: number;
+  committedRemainingWork?: number;
+  costToComplete?: number;
+  projectedAtCompletion?: number;
+  marginAtRisk?: number;
   loggedHours?: number;
+  approvedHours?: number;
+  billableHours?: number;
+  nonBillableHours?: number;
   contributorCount?: number;
+  contributors?: Array<{
+    userId: string;
+    name: string;
+    email?: string;
+    avatarUrl?: string | null;
+    hours: number;
+    approvedHours?: number;
+    laborCost: number;
+  }>;
 }
 
 export interface DateRange {

@@ -11,6 +11,7 @@ import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/
 import { getSupabaseClient } from '@/lib/supabaseClient';
 import { dataStore, generateId, simulateDelay } from './dataStore';
 import { reconcileTask, buildAutoCloseDescription, todayYmdLocal } from '@/lib/taskReconciler';
+import { isValidProjectTransaction, isDirectProjectDebit } from '@/lib/projectTransactionFilter';
 import type { ServiceResponse, ProjectProfitability } from './types';
 
 const PROJ = (organizationId: string) =>
@@ -190,27 +191,14 @@ export const projectService = {
           }
 
           const profitability: ProjectProfitability[] = sbProjects.map((proj: any) => {
-            const projTxns = txns.filter((t: any) => {
-              if (t.project_id !== proj.id) return false;
-              const status = String(t.status || '').toLowerCase();
-              if (status === 'pending' || status === 'draft' || status === 'rejected' || status === 'reversed' || status === 'cancelled') return false;
-              if (t.world_scope === 'personal') return false;
-              return true;
-            });
+            const projTxns = txns.filter((t: any) => t.project_id === proj.id && isValidProjectTransaction(t));
 
             const revenue = projTxns
               .filter((t: any) => t.type === 'credit')
               .reduce((sum: number, t: any) => sum + Number(t.amount || 0), 0);
 
             const directCost = projTxns
-              .filter((t: any) => {
-                if (t.type !== 'debit') return false;
-                const tags = Array.isArray(t.tags) ? t.tags : [];
-                const desc = (t.description || t.narration || '').toLowerCase();
-                if (tags.includes('reimbursement_settlement') || tags.includes('payroll_payout') || tags.includes('salary') || tags.includes('payroll')) return false;
-                if (desc.includes('reimbursement settlement') || desc.includes('expense payout') || desc.includes('salary payout')) return false;
-                return true;
-              })
+              .filter((t: any) => isDirectProjectDebit(t))
               .reduce((sum: number, t: any) => sum + Math.abs(Number(t.amount || 0)), 0);
 
             const projTs = ts.filter((t: any) => t.project_id === proj.id);
@@ -305,12 +293,7 @@ export const projectService = {
     const projects = dataStore.projects.filter(p => p.organizationId === organizationId);
     const orgTxns = dataStore.transactions.filter(t =>
       t.organizationId === organizationId &&
-      t.date >= fromDate &&
-      t.date <= toDate &&
-      t.status !== 'pending' &&
-      t.status !== 'draft' &&
-      t.status !== 'rejected' &&
-      t.status !== 'reversed'
+      isValidProjectTransaction(t, fromDate, toDate)
     );
 
     const profitability: ProjectProfitability[] = projects.map(proj => {
@@ -319,7 +302,7 @@ export const projectService = {
         .filter(t => t.type === 'credit')
         .reduce((sum, t) => sum + Number(t.amount || 0), 0);
       const costs = projTxns
-        .filter(t => t.type === 'debit')
+        .filter(t => isDirectProjectDebit(t))
         .reduce((sum, t) => sum + Math.abs(Number(t.amount || 0)), 0);
 
       const projTs = dataStore.timesheets.filter(t => t.organizationId === organizationId && t.projectId === proj.id);
@@ -499,6 +482,24 @@ export const projectService = {
       const { getSupabaseClient } = await import('@/lib/supabaseClient');
       const sb = getSupabaseClient();
       if (sb) {
+        const { data: existingTs } = await sb
+          .from('timesheet_entries')
+          .select('id, status')
+          .eq('id', entryId)
+          .eq('organization_id', organizationId)
+          .maybeSingle();
+
+        if (existingTs && existingTs.status !== 'submitted') {
+          if (existingTs.status === 'approved') {
+            return { success: true, data: existingTs, message: 'Timesheet entry is already approved.' };
+          }
+          return {
+            success: false,
+            data: null,
+            error: 'Only submitted timesheet entries can be approved. This entry is still in draft.',
+          };
+        }
+
         const nowIso = new Date().toISOString();
         const { data: updatedTs, error: updateErr } = await sb
           .from('timesheet_entries')
