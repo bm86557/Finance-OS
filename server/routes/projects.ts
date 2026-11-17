@@ -9,6 +9,12 @@ import type { Project, TimesheetEntry, ProjectTask } from '../../src/services/ty
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import {
+  reconcileTask,
+  buildAutoCloseDescription,
+  doesEntryMatchTask,
+  todayYmdLocal,
+} from '../../src/lib/taskReconciler.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -834,6 +840,9 @@ export function createProjectsRouter(): Router {
         return true;
       });
 
+      const rawProjectTasks = (tasksData || []).filter((t: any) => t.project_id === projectId);
+      const reconciledTasks = rawProjectTasks.map((t: any) => reconcileTask(t, tsData || []));
+
       const timesheetEntries = rawTimesheets.map((ts: any) => {
         const uId = String(ts.user_id);
         const prof = profileMap.get(uId);
@@ -904,6 +913,13 @@ export function createProjectsRouter(): Router {
         if (ts.date < contrib.firstDate) contrib.firstDate = ts.date;
         if (ts.date > contrib.lastDate) contrib.lastDate = ts.date;
 
+        const linkedTask = reconciledTasks.find((t) =>
+          doesEntryMatchTask(
+            { taskId: ts.task_id, projectId, description: ts.description },
+            t,
+          ),
+        );
+
         return {
           id: ts.id,
           date: ts.date,
@@ -916,6 +932,13 @@ export function createProjectsRouter(): Router {
           status: ts.status || 'draft',
           userId: uId,
           userName: memName,
+          taskId: ts.task_id || linkedTask?.id || undefined,
+          taskEstimatedHours: linkedTask?.estimatedHours ?? undefined,
+          taskLoggedHours: linkedTask?.loggedHours ?? undefined,
+          taskApprovedHours: linkedTask?.approvedHours ?? undefined,
+          taskIncompleteHours: linkedTask?.incompleteHours ?? undefined,
+          taskCompletionStatus: linkedTask?.completionStatus ?? undefined,
+          taskCompletionNote: linkedTask?.completionNote ?? undefined,
           ratePerMinute: Math.round(costPerMinute * 10000) / 10000,
           ratePerHour: Math.round(costPerHour * 100) / 100,
           calculatedLaborCost: entryLaborCost,
@@ -1128,11 +1151,28 @@ export function createProjectsRouter(): Router {
         burnRatePerDay = laborCost;
       }
 
-      const contributors = Array.from(contributorMap.values()).map(c => ({
-        ...c,
-        totalHours: Math.round(c.totalHours * 100) / 100,
-        totalLaborCost: Math.round(c.totalLaborCost * 100) / 100,
-      }));
+      const contributors = Array.from(contributorMap.values()).map(c => {
+        const userTasks = reconciledTasks.filter(t => t.assignedTo === c.userId);
+        const allocatedTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.estimatedHours || 0), 0) * 100) / 100;
+        const approvedTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.approvedHours || 0), 0) * 100) / 100;
+        const incompleteTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.incompleteHours || 0), 0) * 100) / 100;
+        const completedOnTimeCount = userTasks.filter(t => t.completionStatus === 'completed_on_time').length;
+        const partialClosedCount = userTasks.filter(t => t.completionStatus === 'closed_partial').length;
+        const overdueCount = userTasks.filter(t => t.completionStatus === 'overdue' || t.completionStatus === 'completed_late').length;
+
+        return {
+          ...c,
+          totalHours: Math.round(c.totalHours * 100) / 100,
+          totalLaborCost: Math.round(c.totalLaborCost * 100) / 100,
+          assignedTasksCount: userTasks.length,
+          allocatedTaskHours,
+          approvedTaskHours,
+          incompleteTaskHours,
+          completedOnTimeCount,
+          partialClosedCount,
+          overdueCount,
+        };
+      });
 
       return ok(res, {
         project: mapDbToDomainProject(projectData),
@@ -1174,6 +1214,7 @@ export function createProjectsRouter(): Router {
         },
         contributors,
         timesheetEntries,
+        tasks: reconciledTasks,
         income,
         expenses,
         overheadAllocations: oaData || [],
@@ -1264,24 +1305,75 @@ export function createProjectsRouter(): Router {
         console.warn('[projects.timesheetApprove] Could not advance project status:', pErr);
       }
 
-      // Auto-advance associated task/deliverable to completed
+      // Auto-advance & close associated task/deliverable with partial/full hour verification
+      let autoClosedTask: any = null;
+      let completionMsg = 'Timesheet entry approved and labor cost locked.';
       try {
+        let targetTask: any = null;
         if (entry.task_id) {
-          await sb
+          const { data: tById } = await sb
             .from('project_tasks')
-            .update({ status: 'completed', updated_at: new Date().toISOString() })
+            .select('*')
             .eq('id', entry.task_id)
-            .eq('organization_id', orgId);
-        } else if (entry.description) {
-          await sb
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          targetTask = tById;
+        }
+        if (!targetTask && entry.description) {
+          const { data: tByTitle } = await sb
             .from('project_tasks')
-            .update({ status: 'completed', updated_at: new Date().toISOString() })
+            .select('*')
             .eq('project_id', projectId)
             .eq('organization_id', orgId)
-            .ilike('title', entry.description.trim());
+            .ilike('title', entry.description.trim())
+            .maybeSingle();
+          targetTask = tByTitle;
+        }
+
+        if (targetTask) {
+          const { data: projTs } = await sb
+            .from('timesheet_entries')
+            .select('*')
+            .eq('project_id', projectId)
+            .eq('organization_id', orgId);
+
+          const allTs = (projTs || []).map((r: any) => (r.id === entryId ? updated : r));
+          const reconciled = reconcileTask({ ...targetTask, status: 'completed' }, allTs);
+          const estH = Number(targetTask.estimated_hours || 0);
+          const appH = Number(reconciled.approvedHours || 0);
+          const incH = Number(reconciled.incompleteHours || 0);
+          const entryDate = entry.date || todayYmdLocal();
+
+          let noteText = '';
+          if (estH > 0 && appH < estH - 0.001) {
+            noteText = `Logged ${appH.toFixed(1)}h of ${estH.toFixed(1)}h allocated (${incH.toFixed(1)}h incomplete on ${entryDate})`;
+            completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed with note: ${appH.toFixed(1)}h / ${estH.toFixed(1)}h logged (${incH.toFixed(1)}h incomplete).`;
+          } else if (targetTask.due_date && entryDate > targetTask.due_date) {
+            noteText = `Completed late (${appH.toFixed(1)}h approved on ${entryDate}; due ${targetTask.due_date})`;
+            completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed (Completed Late).`;
+          } else {
+            noteText = `Completed on time (${appH.toFixed(1)}h${estH > 0 ? ` / ${estH.toFixed(1)}h` : ''} approved on ${entryDate})`;
+            completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed (Completed On Time).`;
+          }
+
+          const updatedDesc = buildAutoCloseDescription(targetTask.description, noteText);
+          const { data: closedTask } = await sb
+            .from('project_tasks')
+            .update({
+              status: 'completed',
+              logged_hours: reconciled.loggedHours ?? appH,
+              description: updatedDesc,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', targetTask.id)
+            .eq('organization_id', orgId)
+            .select()
+            .maybeSingle();
+
+          autoClosedTask = closedTask ? reconcileTask(closedTask, allTs) : reconciled;
         }
       } catch (tErr) {
-        console.warn('[projects.timesheetApprove] Could not advance task status:', tErr);
+        console.warn('[projects.timesheetApprove] Could not auto-close task status:', tErr);
       }
 
       // Emit timesheet approval notification (gated by employee notification preferences)
@@ -1292,7 +1384,7 @@ export function createProjectsRouter(): Router {
         console.warn('[projects.timesheetApprove] Notification emit warning:', notifErr);
       }
 
-      return ok(res, updated, 'Timesheet entry approved and labor cost locked.');
+      return ok(res, { ...updated, autoClosedTask }, completionMsg);
     } catch (err: any) {
       console.error('[projects.timesheetApprove] Error:', err);
       return fail(res, 500, err?.message || 'Error approving timesheet');
@@ -1550,15 +1642,23 @@ export function createProjectsRouter(): Router {
 
     if (sb) {
       try {
-        const { data, error } = await sb
-          .from('project_tasks')
-          .select('*')
-          .eq('organization_id', orgId)
-          .eq('project_id', projectId)
-          .order('created_at', { ascending: true });
+        const [
+          { data, error },
+          { data: tsData },
+        ] = await Promise.all([
+          sb.from('project_tasks')
+            .select('*')
+            .eq('organization_id', orgId)
+            .eq('project_id', projectId)
+            .order('created_at', { ascending: true }),
+          sb.from('timesheet_entries')
+            .select('*')
+            .eq('organization_id', orgId)
+            .eq('project_id', projectId),
+        ]);
 
         if (!error && data) {
-          return ok(res, data.map(mapDbToDomainTask));
+          return ok(res, data.map((row: any) => reconcileTask(row, tsData || [])));
         }
       } catch (err) {
         console.warn('[projects.tasks.get] Supabase query error, fallback:', err);
@@ -1566,6 +1666,77 @@ export function createProjectsRouter(): Router {
     }
 
     return ok(res, []);
+  });
+
+  // Batch create whole-week tasks (Mon–Fri) at once with auto-validated dates
+  r.post('/:id/tasks/batch', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const projectId = req.params.id;
+    const { tasks } = req.body as { tasks: Array<Partial<ProjectTask>> };
+    const sb = getSupabaseAdminClient();
+
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      return fail(res, 400, 'Tasks array is required');
+    }
+
+    const nowIso = new Date().toISOString();
+    const todayStr = todayYmdLocal();
+    const dbRows = tasks
+      .filter((t) => t && t.title?.trim())
+      .map((t, idx) => ({
+        id: t.id || `task-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+        organization_id: orgId,
+        project_id: projectId,
+        title: t.title!.trim(),
+        description: t.description?.trim() || '',
+        assigned_to: t.assignedTo || null,
+        assigned_to_name: t.assignedToName?.trim() || '',
+        status: t.status || 'todo',
+        priority: t.priority || 'medium',
+        estimated_hours: Number(t.estimatedHours || 0),
+        logged_hours: Number(t.loggedHours || 0),
+        start_date: t.startDate || t.dueDate || todayStr,
+        due_date: t.dueDate || t.startDate || todayStr,
+        created_at: nowIso,
+        updated_at: nowIso,
+      }));
+
+    if (dbRows.length === 0) {
+      return fail(res, 400, 'At least one task with a title is required');
+    }
+
+    if (sb) {
+      try {
+        const { data, error } = await sb
+          .from('project_tasks')
+          .insert(dbRows)
+          .select();
+
+        if (error) {
+          console.warn('[projects.tasks.batch] Supabase insert error:', error.message);
+          return fail(res, 500, error.message);
+        }
+
+        const firstAssigned = (data || []).find((d: any) => d.assigned_to);
+        if (firstAssigned) {
+          try {
+            const { emitEmployeeTaskAssignmentNotification } = await import('./employee.js');
+            await emitEmployeeTaskAssignmentNotification(sb, orgId, {
+              ...firstAssigned,
+              title: `${dbRows.length} Weekly Tasks Assigned (starting ${firstAssigned.title})`,
+            }, callerId(req));
+          } catch (notifErr) {
+            console.warn('[projects.tasks.batch] Notification warning:', notifErr);
+          }
+        }
+
+        return created(res, (data || []).map((row: any) => reconcileTask(row, [])));
+      } catch (err: any) {
+        return fail(res, 500, err?.message || 'Database error');
+      }
+    }
+
+    return created(res, dbRows.map((row) => reconcileTask(row, [])));
   });
 
   r.post('/:id/tasks', async (req: Request, res: Response) => {

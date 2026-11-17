@@ -250,6 +250,7 @@ export interface ProjectServices {
   approveTimesheetEntry(projectId: string, entryId: string): ReturnType<typeof projectService.approveTimesheetEntry>;
   reviseTimesheetEntry(projectId: string, entryId: string, newHours: number, reason?: string): ReturnType<typeof projectService.reviseTimesheetEntry>;
   rejectTimesheetEntry(projectId: string, entryId: string, reason?: string): ReturnType<typeof projectService.rejectTimesheetEntry>;
+  createTasksBatch(projectId: string, tasks: Parameters<typeof projectService.createTasksBatch>[2]): ReturnType<typeof projectService.createTasksBatch>;
   getProjectTransactions(projectId: string): ReturnType<typeof projectService.getProjectTransactions>;
 }
 
@@ -561,6 +562,7 @@ export function useOrgServices(): OrgServices {
       approveTimesheetEntry:  (projId: string, entryId: string) => projectService.approveTimesheetEntry(orgId, projId, entryId),
       reviseTimesheetEntry:   (projId: string, entryId: string, newHours: number, reason?: string) => projectService.reviseTimesheetEntry(orgId, projId, entryId, newHours, reason),
       rejectTimesheetEntry:   (projId: string, entryId: string, reason?: string) => projectService.rejectTimesheetEntry(orgId, projId, entryId, reason),
+      createTasksBatch:       (projId: string, tasks: any[]) => projectService.createTasksBatch(orgId, projId, tasks),
       getProjectTransactions: (projId)        => projectService.getProjectTransactions(projId, orgId || undefined),
     },
 

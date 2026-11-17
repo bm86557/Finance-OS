@@ -10,6 +10,7 @@ import { Project, Transaction, ProjectTask } from '@/services/types';
 import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/apiClient';
 import { getSupabaseClient } from '@/lib/supabaseClient';
 import { dataStore, generateId, simulateDelay } from './dataStore';
+import { reconcileTask, buildAutoCloseDescription, todayYmdLocal } from '@/lib/taskReconciler';
 import type { ServiceResponse, ProjectProfitability } from './types';
 
 const PROJ = (organizationId: string) =>
@@ -338,7 +339,7 @@ export const projectService = {
       const recognizedRevenue = revenue;
       const operatingProfit = Math.round((recognizedRevenue - totalCosts) * 100) / 100;
       const directCosts = Math.round((directCost + laborCost) * 100) / 100;
-            const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
+      const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
       const profitMargin = recognizedRevenue > 0 ? Math.round(((operatingProfit / recognizedRevenue) * 100) * 10) / 10 : 0;
       const budgetVariance = proj.quotedAmount > 0
         ? Math.round((((totalCosts - proj.quotedAmount) / proj.quotedAmount) * 100) * 10) / 10
@@ -511,6 +512,68 @@ export const projectService = {
           .single();
 
         if (!updateErr && updatedTs) {
+          let completionMsg = 'Timesheet approved';
+          try {
+            let targetTask: any = null;
+            if (updatedTs.task_id) {
+              const { data: tById } = await sb
+                .from('project_tasks')
+                .select('*')
+                .eq('id', updatedTs.task_id)
+                .eq('organization_id', organizationId)
+                .maybeSingle();
+              targetTask = tById;
+            }
+            if (!targetTask && updatedTs.description) {
+              const { data: tByTitle } = await sb
+                .from('project_tasks')
+                .select('*')
+                .eq('project_id', projectId)
+                .eq('organization_id', organizationId)
+                .ilike('title', String(updatedTs.description).trim())
+                .maybeSingle();
+              targetTask = tByTitle;
+            }
+            if (targetTask) {
+              const { data: projTs } = await sb
+                .from('timesheet_entries')
+                .select('*')
+                .eq('project_id', projectId)
+                .eq('organization_id', organizationId);
+              const allTs = (projTs || []).map((r: any) => (r.id === entryId ? updatedTs : r));
+              const reconciled = reconcileTask({ ...targetTask, status: 'completed' }, allTs);
+              const estH = Number(targetTask.estimated_hours || 0);
+              const appH = Number(reconciled.approvedHours || 0);
+              const incH = Number(reconciled.incompleteHours || 0);
+              const entryDate = updatedTs.date || todayYmdLocal();
+
+              let noteText = '';
+              if (estH > 0 && appH < estH - 0.001) {
+                noteText = `Logged ${appH.toFixed(1)}h of ${estH.toFixed(1)}h allocated (${incH.toFixed(1)}h incomplete on ${entryDate})`;
+                completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed: ${appH.toFixed(1)}h / ${estH.toFixed(1)}h (${incH.toFixed(1)}h incomplete).`;
+              } else if (targetTask.due_date && entryDate > targetTask.due_date) {
+                noteText = `Completed late (${appH.toFixed(1)}h approved on ${entryDate}; due ${targetTask.due_date})`;
+                completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed (Completed Late).`;
+              } else {
+                noteText = `Completed on time (${appH.toFixed(1)}h${estH > 0 ? ` / ${estH.toFixed(1)}h` : ''} approved on ${entryDate})`;
+                completionMsg = `Timesheet approved. Task "${targetTask.title}" auto-closed (Completed On Time).`;
+              }
+
+              await sb
+                .from('project_tasks')
+                .update({
+                  status: 'completed',
+                  logged_hours: reconciled.loggedHours ?? appH,
+                  description: buildAutoCloseDescription(targetTask.description, noteText),
+                  updated_at: nowIso,
+                })
+                .eq('id', targetTask.id)
+                .eq('organization_id', organizationId);
+            }
+          } catch (tErr) {
+            console.warn('[projectService.approveTimesheetEntry] Task auto-close warning:', tErr);
+          }
+
           const { employeeService } = await import('./employeeService');
           const sRes = await employeeService.getMySettings(organizationId, updatedTs.user_id);
           if (sRes.data?.notifications?.timesheetReminders !== false) {
@@ -527,7 +590,7 @@ export const projectService = {
               action_tab: 'timesheets',
             } as any);
           }
-          return { success: true, data: updatedTs, message: 'Timesheet approved' };
+          return { success: true, data: updatedTs, message: completionMsg };
         }
       }
     } catch (err: any) {
@@ -601,7 +664,23 @@ export const projectService = {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<ProjectTask[]>(organizationId);
       if (err) return err;
-      return apiGet<ProjectTask[]>(`${PROJ(organizationId)}/${encodeURIComponent(projectId)}/tasks`);
+      const res = await apiGet<ProjectTask[]>(`${PROJ(organizationId)}/${encodeURIComponent(projectId)}/tasks`);
+      if (res.success && Array.isArray(res.data)) return res;
+    }
+
+    try {
+      const sb = getSupabaseClient();
+      if (sb) {
+        const [{ data: tData, error: tErr }, { data: tsData }] = await Promise.all([
+          sb.from('project_tasks').select('*').eq('organization_id', organizationId).eq('project_id', projectId).order('created_at', { ascending: true }),
+          sb.from('timesheet_entries').select('*').eq('organization_id', organizationId).eq('project_id', projectId),
+        ]);
+        if (!tErr && tData) {
+          return { success: true, data: tData.map((r: any) => reconcileTask(r, tsData || [])) };
+        }
+      }
+    } catch (e) {
+      console.warn('[projectService.getTasks] Supabase fallback error:', e);
     }
 
     await simulateDelay();
@@ -621,8 +700,42 @@ export const projectService = {
       if (res.success) {
         dataStore.notify('projects');
         dataStore.notify('project_tasks');
+        return res;
       }
-      return res;
+    }
+
+    const todayStr = todayYmdLocal();
+    const nowIso = new Date().toISOString();
+    const taskId = taskData.id || `task-${Date.now()}`;
+    try {
+      const sb = getSupabaseClient();
+      if (sb) {
+        const dbRow = {
+          id: taskId,
+          organization_id: organizationId,
+          project_id: projectId,
+          title: (taskData.title || 'New Task').trim(),
+          description: taskData.description || '',
+          assigned_to: taskData.assignedTo || null,
+          assigned_to_name: taskData.assignedToName || '',
+          status: taskData.status || 'todo',
+          priority: taskData.priority || 'medium',
+          estimated_hours: Number(taskData.estimatedHours || 0),
+          logged_hours: Number(taskData.loggedHours || 0),
+          start_date: taskData.startDate || todayStr,
+          due_date: taskData.dueDate || todayStr,
+          created_at: nowIso,
+          updated_at: nowIso,
+        };
+        const { data, error } = await sb.from('project_tasks').insert(dbRow).select().single();
+        if (!error && data) {
+          dataStore.notify('projects');
+          dataStore.notify('project_tasks');
+          return { success: true, data: reconcileTask(data, []) };
+        }
+      }
+    } catch (e) {
+      console.warn('[projectService.createTask] Supabase fallback error:', e);
     }
 
     await simulateDelay();
@@ -638,16 +751,97 @@ export const projectService = {
       priority: taskData.priority || 'medium',
       estimatedHours: taskData.estimatedHours || 0,
       loggedHours: taskData.loggedHours || 0,
-      startDate: taskData.startDate,
-      dueDate: taskData.dueDate,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      startDate: taskData.startDate || todayStr,
+      dueDate: taskData.dueDate || todayStr,
+      createdAt: nowIso,
+      updatedAt: nowIso,
     };
     if (!(dataStore as any).tasks) (dataStore as any).tasks = [];
     (dataStore as any).tasks.push(newTask);
     dataStore.notify('projects');
     dataStore.notify('project_tasks');
     return { success: true, data: newTask };
+  },
+
+  async createTasksBatch(
+    organizationId: string,
+    projectId: string,
+    tasks: Array<Partial<ProjectTask>>,
+  ): Promise<ServiceResponse<ProjectTask[]>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<ProjectTask[]>(organizationId);
+      if (err) return err;
+      const res = await apiPostJson<{ tasks: Array<Partial<ProjectTask>> }, ProjectTask[]>(
+        `${PROJ(organizationId)}/${encodeURIComponent(projectId)}/tasks/batch`,
+        { tasks },
+      );
+      if (res.success) {
+        dataStore.notify('projects');
+        dataStore.notify('project_tasks');
+        return res;
+      }
+    }
+
+    const todayStr = todayYmdLocal();
+    const nowIso = new Date().toISOString();
+    const valid = tasks.filter(t => t && t.title?.trim());
+    try {
+      const sb = getSupabaseClient();
+      if (sb && valid.length > 0) {
+        const dbRows = valid.map((t, idx) => ({
+          id: t.id || `task-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
+          organization_id: organizationId,
+          project_id: projectId,
+          title: t.title!.trim(),
+          description: t.description?.trim() || '',
+          assigned_to: t.assignedTo || null,
+          assigned_to_name: t.assignedToName?.trim() || '',
+          status: t.status || 'todo',
+          priority: t.priority || 'medium',
+          estimated_hours: Number(t.estimatedHours || 0),
+          logged_hours: Number(t.loggedHours || 0),
+          start_date: t.startDate || t.dueDate || todayStr,
+          due_date: t.dueDate || t.startDate || todayStr,
+          created_at: nowIso,
+          updated_at: nowIso,
+        }));
+        const { data, error } = await sb.from('project_tasks').insert(dbRows).select();
+        if (!error && data) {
+          dataStore.notify('projects');
+          dataStore.notify('project_tasks');
+          return { success: true, data: data.map((r: any) => reconcileTask(r, [])) };
+        }
+      }
+    } catch (e) {
+      console.warn('[projectService.createTasksBatch] Supabase fallback error:', e);
+    }
+
+    await simulateDelay();
+    if (!(dataStore as any).tasks) (dataStore as any).tasks = [];
+    const created: ProjectTask[] = valid.map((t) => {
+      const row: ProjectTask = {
+        id: generateId('task'),
+        organizationId,
+        projectId,
+        title: t.title!.trim(),
+        description: t.description?.trim() || '',
+        assignedTo: t.assignedTo,
+        assignedToName: t.assignedToName,
+        status: t.status || 'todo',
+        priority: t.priority || 'medium',
+        estimatedHours: Number(t.estimatedHours || 0),
+        loggedHours: Number(t.loggedHours || 0),
+        startDate: t.startDate || t.dueDate || todayStr,
+        dueDate: t.dueDate || t.startDate || todayStr,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      (dataStore as any).tasks.push(row);
+      return row;
+    });
+    dataStore.notify('projects');
+    dataStore.notify('project_tasks');
+    return { success: true, data: created };
   },
 
   async updateTask(
@@ -663,8 +857,37 @@ export const projectService = {
       if (res.success) {
         dataStore.notify('projects');
         dataStore.notify('project_tasks');
+        return res;
       }
-      return res;
+    }
+
+    try {
+      const sb = getSupabaseClient();
+      if (sb) {
+        const dbUpdates: Record<string, any> = { updated_at: new Date().toISOString() };
+        if (updates.title !== undefined) dbUpdates.title = updates.title.trim();
+        if (updates.description !== undefined) dbUpdates.description = updates.description;
+        if (updates.status !== undefined) dbUpdates.status = updates.status;
+        if (updates.priority !== undefined) dbUpdates.priority = updates.priority;
+        if (updates.estimatedHours !== undefined) dbUpdates.estimated_hours = Number(updates.estimatedHours);
+        if (updates.loggedHours !== undefined) dbUpdates.logged_hours = Number(updates.loggedHours);
+        if (updates.dueDate !== undefined) dbUpdates.due_date = updates.dueDate;
+        const { data, error } = await sb
+          .from('project_tasks')
+          .update(dbUpdates)
+          .eq('id', taskId)
+          .eq('project_id', projectId)
+          .eq('organization_id', organizationId)
+          .select()
+          .maybeSingle();
+        if (!error && data) {
+          dataStore.notify('projects');
+          dataStore.notify('project_tasks');
+          return { success: true, data: reconcileTask(data, []) };
+        }
+      }
+    } catch (e) {
+      console.warn('[projectService.updateTask] Supabase fallback error:', e);
     }
 
     await simulateDelay();

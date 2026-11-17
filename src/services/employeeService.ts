@@ -7,11 +7,18 @@
 
 import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/apiClient';
 import { dataStore, simulateDelay, generateId } from './dataStore';
+import {
+  reconcileTask,
+  validateTaskHoursAllocation,
+  doesEntryMatchTask,
+  todayYmdLocal,
+} from '@/lib/taskReconciler';
 import type {
   ServiceResponse,
   EmployeeExpense,
   EmployeePayslip,
   TimesheetEntry,
+  ActiveTimerSession,
   EmployeeTeamMember,
   CompanyAnnouncement,
   ProjectTask,
@@ -20,6 +27,12 @@ import type {
   EmployeeSecuritySettings,
   EmployeeSessionTimeout,
 } from './types';
+import {
+  getOfflineOutbox,
+  removeOfflineOutboxItem,
+  computeLoggedDuration,
+  generateClientEventId,
+} from '@/lib/timerRecovery';
 
 export type Expense = EmployeeExpense;
 export type Payslip = EmployeePayslip;
@@ -442,29 +455,44 @@ export const employeeService = {
           effectiveCostPerHour = baseSalary > 0
             ? Math.round((baseSalary / capacityHours) * 100) / 100
             : (hourlyRateVal > 0 ? hourlyRateVal : 50);
-        } catch {}
+        } catch { }
 
         const effectiveCostPerMinute = Math.round((effectiveCostPerHour / 60) * 10000) / 10000;
         const insertedRows: TimesheetEntry[] = [];
+        const { data: orgTasks } = await sb.from('project_tasks').select('*').eq('organization_id', o);
+        const { data: orgTs } = await sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status').eq('organization_id', o);
+        const runningTsList = [...(orgTs || [])];
 
         for (const item of entries) {
           const hrs = Number(item.hours || 0);
           if (hrs <= 0) continue;
+
+          const linkedTask = (orgTasks || []).find((t: any) =>
+            ((item as any).taskId && String(t.id) === String((item as any).taskId)) ||
+            (t.project_id === item.projectId && String(t.title || '').trim().toLowerCase() === String(item.description || '').trim().toLowerCase())
+          );
+          if (linkedTask) {
+            const check = validateTaskHoursAllocation(linkedTask, runningTsList, hrs);
+            if (!check.ok) continue;
+          }
+
           const entryId = (item as any).id || generateId('ts');
           const calculatedLaborCost = Math.round(hrs * effectiveCostPerHour * 100) / 100;
+          const resolvedTaskId = (item as any).taskId || linkedTask?.id || null;
 
           const dbRow = {
             id: entryId,
             organization_id: o,
             user_id: u,
-            date: item.date,
+            date: item.date || todayYmdLocal(),
             project_id: item.projectId,
             project_name: item.projectName || '',
             hours: hrs,
             description: item.description || '',
             billable: item.billable ?? true,
             status: item.status || 'draft',
-            task_id: (item as any).taskId || null,
+            task_id: resolvedTaskId,
+            duration_minutes: Math.round(hrs * 60),
             effective_cost_per_hour: effectiveCostPerHour,
             effective_cost_per_minute: effectiveCostPerMinute,
             calculated_labor_cost: calculatedLaborCost,
@@ -472,26 +500,28 @@ export const employeeService = {
 
           const { error } = await sb.from('timesheet_entries').upsert(dbRow);
           if (!error) {
+            runningTsList.push(dbRow);
             insertedRows.push({
               ...item,
               id: entryId,
               organizationId: o,
               userId: u,
+              taskId: resolvedTaskId || undefined,
               effectiveCostPerHour,
               effectiveCostPerMinute,
               calculatedLaborCost,
             });
-            if ((item as any).taskId) {
+            if (resolvedTaskId && linkedTask) {
               try {
-                const { data: tRow } = await sb.from('project_tasks').select('logged_hours, status').eq('id', (item as any).taskId).maybeSingle();
-                if (tRow) {
-                  await sb.from('project_tasks').update({
-                    logged_hours: Number(tRow.logged_hours || 0) + hrs,
-                    status: tRow.status === 'todo' ? 'in_progress' : tRow.status,
-                    updated_at: new Date().toISOString(),
-                  }).eq('id', (item as any).taskId);
-                }
-              } catch {}
+                const totalForTask = runningTsList
+                  .filter((r: any) => doesEntryMatchTask(r, linkedTask))
+                  .reduce((s: number, r: any) => s + Number(r.hours || 0), 0);
+                await sb.from('project_tasks').update({
+                  logged_hours: Math.round(totalForTask * 100) / 100,
+                  status: linkedTask.status === 'todo' ? 'in_progress' : linkedTask.status,
+                  updated_at: new Date().toISOString(),
+                }).eq('id', resolvedTaskId);
+              } catch { }
             }
           }
         }
@@ -531,10 +561,268 @@ export const employeeService = {
 
     await simulateDelay(200);
 
-    const entry: TimesheetEntry = { ...data, id: generateId('ts'), organizationId: o, userId: u };
+    const storeTasks = ((dataStore as any).tasks || []).filter((t: ProjectTask) => t.organizationId === o && t.projectId === data.projectId);
+    const matchedTask = ((data as any).taskId && storeTasks.find((t: ProjectTask) => t.id === (data as any).taskId)) ||
+      storeTasks.find((t: ProjectTask) => t.title.trim().toLowerCase() === (data.description || '').trim().toLowerCase());
+    if (matchedTask) {
+      const orgTs = dataStore.timesheets.filter(t => t.organizationId === o);
+      const check = validateTaskHoursAllocation(matchedTask, orgTs, Number(data.hours || 0));
+      if (!check.ok) {
+        return { success: false, data: null as unknown as TimesheetEntry, error: check.error };
+      }
+      matchedTask.loggedHours = Math.round((check.existingHours + Number(data.hours || 0)) * 100) / 100;
+      if (matchedTask.status === 'todo') matchedTask.status = 'in_progress';
+    }
+
+    const entry: TimesheetEntry = { ...data, date: data.date || todayYmdLocal(), id: generateId('ts'), organizationId: o, userId: u };
     dataStore.timesheets.unshift(entry);
     dataStore.notify('timesheets', true);
     return { success: true, data: entry };
+  },
+
+  async getActiveTimer(orgId: string, userId: string): Promise<ServiceResponse<ActiveTimerSession | null>> {
+    const ru = requireOrgAndUser(orgId, userId);
+    if (!ru.ok) return { success: false, data: null, error: ru.error };
+
+    if (isHttpBackendConfigured()) {
+      const res = await apiGet<ActiveTimerSession | null>(`${ME(ru.orgId)}/timer/active`);
+      if (res.success) return res;
+    }
+
+    try {
+      const { getSupabaseClient } = await import('@/lib/supabaseClient');
+      const sb = getSupabaseClient();
+      if (sb) {
+        const { data, error } = await sb
+          .from('active_timer_sessions')
+          .select('*')
+          .eq('organization_id', ru.orgId)
+          .eq('user_id', ru.userId)
+          .in('status', ['running', 'paused'])
+          .order('updated_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        if (!error && data) {
+          return {
+            success: true,
+            data: {
+              id: data.id,
+              organizationId: data.organization_id,
+              userId: data.user_id,
+              projectId: data.project_id,
+              projectName: data.project_name || '',
+              taskId: data.task_id || undefined,
+              description: data.description || '',
+              billable: Boolean(data.billable ?? true),
+              startedAt: data.started_at,
+              pausedAt: data.paused_at || undefined,
+              accumulatedSeconds: Number(data.accumulated_seconds || 0),
+              status: data.status,
+              clientEventId: data.client_event_id,
+              lastHeartbeatAt: data.last_heartbeat_at,
+            },
+          };
+        }
+      }
+    } catch {
+      /* fallback safely */
+    }
+    return { success: true, data: null };
+  },
+
+  async startTimerSession(
+    orgId: string,
+    userId: string,
+    payload: {
+      projectId: string;
+      projectName?: string;
+      taskId?: string;
+      description: string;
+      billable?: boolean;
+      startedAt?: string;
+      accumulatedSeconds?: number;
+      clientEventId?: string;
+      sessionId?: string;
+    },
+  ): Promise<ServiceResponse<ActiveTimerSession>> {
+    const ru = requireOrgAndUser(orgId, userId);
+    if (!ru.ok) return { success: false, data: null as any, error: ru.error };
+
+    if (isHttpBackendConfigured()) {
+      const res = await apiPostJson<typeof payload, ActiveTimerSession>(`${ME(ru.orgId)}/timer/start`, payload);
+      if (res.success && res.data) return res;
+    }
+
+    const nowIso = payload.startedAt || new Date().toISOString();
+    const evtId = payload.clientEventId || generateClientEventId('evt_timer');
+    const id = payload.sessionId || generateId('tmr');
+
+    try {
+      const { getSupabaseClient } = await import('@/lib/supabaseClient');
+      const sb = getSupabaseClient();
+      if (sb) {
+        await sb
+          .from('active_timer_sessions')
+          .update({ status: 'stopped', updated_at: nowIso })
+          .eq('organization_id', ru.orgId)
+          .eq('user_id', ru.userId)
+          .in('status', ['running', 'paused'])
+          .neq('client_event_id', evtId);
+
+        await sb.from('active_timer_sessions').upsert({
+          id,
+          organization_id: ru.orgId,
+          user_id: ru.userId,
+          project_id: payload.projectId,
+          project_name: payload.projectName || '',
+          task_id: payload.taskId || null,
+          description: payload.description || '',
+          billable: payload.billable ?? true,
+          started_at: nowIso,
+          paused_at: null,
+          accumulated_seconds: Math.max(0, Math.floor(Number(payload.accumulatedSeconds || 0))),
+          status: 'running',
+          client_event_id: evtId,
+          last_heartbeat_at: nowIso,
+          updated_at: nowIso,
+        });
+      }
+    } catch {
+      /* non-fatal if table not migrated */
+    }
+
+    return {
+      success: true,
+      data: {
+        id,
+        organizationId: ru.orgId,
+        userId: ru.userId,
+        projectId: payload.projectId,
+        projectName: payload.projectName || '',
+        taskId: payload.taskId,
+        description: payload.description || '',
+        billable: payload.billable ?? true,
+        startedAt: nowIso,
+        accumulatedSeconds: Math.max(0, Math.floor(Number(payload.accumulatedSeconds || 0))),
+        status: 'running',
+        clientEventId: evtId,
+        lastHeartbeatAt: nowIso,
+      },
+    };
+  },
+
+  async pauseTimerSession(
+    orgId: string,
+    userId: string,
+    payload: { clientEventId: string; pausedAt: string; accumulatedSeconds: number },
+  ): Promise<ServiceResponse<Partial<ActiveTimerSession>>> {
+    const ru = requireOrgAndUser(orgId, userId);
+    if (!ru.ok) return { success: false, data: {}, error: ru.error };
+
+    if (isHttpBackendConfigured()) {
+      const res = await apiPostJson<typeof payload, Partial<ActiveTimerSession>>(`${ME(ru.orgId)}/timer/pause`, payload);
+      if (res.success) return res;
+    }
+
+    try {
+      const { getSupabaseClient } = await import('@/lib/supabaseClient');
+      const sb = getSupabaseClient();
+      if (sb) {
+        await sb
+          .from('active_timer_sessions')
+          .update({
+            status: 'paused',
+            paused_at: payload.pausedAt,
+            accumulated_seconds: payload.accumulatedSeconds,
+            last_heartbeat_at: payload.pausedAt,
+            updated_at: payload.pausedAt,
+          })
+          .eq('organization_id', ru.orgId)
+          .eq('user_id', ru.userId)
+          .eq('client_event_id', payload.clientEventId);
+      }
+    } catch { /* ignore */ }
+
+    return { success: true, data: { ...payload, status: 'paused' } };
+  },
+
+  async stopTimerSession(
+    orgId: string,
+    userId: string,
+    payload: {
+      clientEventId: string;
+      projectId: string;
+      projectName?: string;
+      taskId?: string;
+      description: string;
+      billable: boolean;
+      startedAt: string;
+      stoppedAt: string;
+      elapsedSeconds: number;
+      source?: 'live_timer' | 'offline_recovered';
+    },
+  ): Promise<ServiceResponse<TimesheetEntry>> {
+    const ru = requireOrgAndUser(orgId, userId);
+    if (!ru.ok) return { success: false, data: null as any, error: ru.error };
+
+    if (isHttpBackendConfigured()) {
+      const res = await apiPostJson<typeof payload, TimesheetEntry>(`${ME(ru.orgId)}/timer/stop`, payload);
+      if (res.success && res.data) return res;
+      // If network/offline error, let caller enqueue to offline outbox
+      if (!res.success && res.error && /network|fetch|timed out|offline/i.test(res.error)) {
+        return res;
+      }
+      if (!res.success) return res;
+    }
+
+    const stopDt = new Date(payload.stoppedAt);
+    const startDt = new Date(payload.startedAt);
+    const { durationSeconds, durationMinutes, hours } = computeLoggedDuration(payload.elapsedSeconds);
+    const entryDate = todayYmdLocal(stopDt);
+
+    return this.createTimesheetEntry(ru.orgId, ru.userId, {
+      date: entryDate,
+      projectId: payload.projectId,
+      projectName: payload.projectName || '',
+      hours,
+      description: payload.description || 'Timer entry',
+      taskId: payload.taskId,
+      billable: payload.billable,
+      status: 'draft',
+      startTime: startDt.toTimeString().slice(0, 5),
+      endTime: stopDt.toTimeString().slice(0, 5),
+      durationMinutes,
+      durationSeconds,
+      clientEventId: payload.clientEventId,
+      source: payload.source || 'live_timer',
+    });
+  },
+
+  async flushOfflineTimerOutbox(orgId: string, userId: string): Promise<{ syncedCount: number; failedCount: number }> {
+    const items = getOfflineOutbox(orgId, userId);
+    if (items.length === 0) return { syncedCount: 0, failedCount: 0 };
+
+    let syncedCount = 0;
+    let failedCount = 0;
+    for (const item of items) {
+      try {
+        const res = await this.createTimesheetEntry(orgId, userId, item.entry);
+        if (res.success) {
+          removeOfflineOutboxItem(orgId, userId, item.clientEventId);
+          syncedCount += 1;
+        } else if (res.error && !/network|fetch|timed out|offline/i.test(res.error)) {
+          // Permanent validation error (e.g. task closed) — remove from outbox so it doesn't loop forever
+          removeOfflineOutboxItem(orgId, userId, item.clientEventId);
+          failedCount += 1;
+        } else {
+          failedCount += 1;
+        }
+      } catch {
+        failedCount += 1;
+      }
+    }
+    return { syncedCount, failedCount };
   },
 
   async submitTimesheet(ids: string[], organizationId?: string): Promise<ServiceResponse<null>> {
@@ -632,15 +920,15 @@ export const employeeService = {
         const profile = profilesMap.get(om.user_id);
         const email = (profile?.email || '').toLowerCase().trim();
         const existing = (email ? map.get(email) : null) || map.get(om.user_id) || map.get(om.id);
-        
+
         // Determine the display role from position or fallback to role
-        const displayRole = om.position || 
-          (om.role === 'owner' ? 'Owner / Lead' : 
-           om.role === 'admin' ? 'Admin' : 
-           om.role === 'accountant' ? 'Accountant' : 
-           'Team Member');
+        const displayRole = om.position ||
+          (om.role === 'owner' ? 'Owner / Lead' :
+            om.role === 'admin' ? 'Admin' :
+              om.role === 'accountant' ? 'Accountant' :
+                'Team Member');
         const displayDepartment = om.department || 'Development';
-        
+
         console.log(`[getTeamDirectory] Processing member:`, {
           email,
           user_id: om.user_id,
@@ -650,7 +938,7 @@ export const employeeService = {
           displayDepartment,
           existing: !!existing
         });
-        
+
         if (existing) {
           // Update existing record with organization_members data (takes precedence)
           existing.role = displayRole;
@@ -812,10 +1100,10 @@ export const employeeService = {
         }));
 
         const memberDepartment = (myMembership as any)?.department ?? undefined;
-        const memberPosition = (myMembership as any)?.position || 
+        const memberPosition = (myMembership as any)?.position ||
           ((myMembership as any)?.role === 'owner' ? 'Owner / Lead' :
-           (myMembership as any)?.role === 'admin' ? 'Admin' :
-           (myMembership as any)?.role === 'accountant' ? 'Accountant' : 'Member');
+            (myMembership as any)?.role === 'admin' ? 'Admin' :
+              (myMembership as any)?.role === 'accountant' ? 'Accountant' : 'Member');
         const fixedSalary = Number((myMembership as any)?.fixed_salary || 0);
 
         let memberAssignedProjects: string[] = [];
@@ -1121,23 +1409,16 @@ export const employeeService = {
       if (sb) {
         let q = sb.from('project_tasks').select('*').eq('organization_id', o);
         if (userId) q = q.eq('assigned_to', userId);
-        const { data, error } = await q.order('created_at', { ascending: false });
+        const [{ data, error }, { data: tsRows }, { data: projRows }] = await Promise.all([
+          q.order('created_at', { ascending: false }),
+          sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status, date').eq('organization_id', o),
+          sb.from('projects').select('id, name').eq('organization_id', o),
+        ]);
         if (!error && data) {
-          const mapped: ProjectTask[] = data.map((t: any) => ({
-            id: t.id,
-            organizationId: t.organization_id,
-            projectId: t.project_id,
-            title: t.title,
-            description: t.description || undefined,
-            assignedTo: t.assigned_to || undefined,
-            assignedToName: t.assigned_to_name || undefined,
-            status: t.status || 'todo',
-            priority: t.priority || 'medium',
-            estimatedHours: Number(t.estimated_hours || 0),
-            loggedHours: Number(t.logged_hours || 0),
-            dueDate: t.due_date || undefined,
-            createdAt: t.created_at || undefined,
-          }));
+          const projMap = new Map((projRows || []).map((p: any) => [p.id, p.name]));
+          const mapped: ProjectTask[] = data.map((t: any) =>
+            reconcileTask({ ...t, projectName: projMap.get(t.project_id) || '' }, tsRows || []),
+          );
           return { success: true, data: mapped };
         }
       }
@@ -1426,20 +1707,20 @@ export const employeeService = {
         ).trim();
         const fullName = String(
           (prof as any)?.full_name ||
-            omSettings?.profile?.fullName ||
-            profSettings?.profile?.fullName ||
-            authMeta?.full_name ||
-            authMeta?.name ||
-            (email ? email.split('@')[0] : 'Employee'),
+          omSettings?.profile?.fullName ||
+          profSettings?.profile?.fullName ||
+          authMeta?.full_name ||
+          authMeta?.name ||
+          (email ? email.split('@')[0] : 'Employee'),
         ).trim();
         const phone = String(
           (om as any)?.phone ||
-            (prof as any)?.phone ||
-            omSettings?.profile?.phone ||
-            profSettings?.profile?.phone ||
-            metaSettings?.profile?.phone ||
-            authMeta?.phone ||
-            '',
+          (prof as any)?.phone ||
+          omSettings?.profile?.phone ||
+          profSettings?.profile?.phone ||
+          metaSettings?.profile?.phone ||
+          authMeta?.phone ||
+          '',
         ).trim();
         const department = String(
           (om as any)?.department || 'Development',
@@ -1478,9 +1759,9 @@ export const employeeService = {
             security: mergedSecurity,
             updatedAt: String(
               omSettings?.updatedAt ||
-                profSettings?.updatedAt ||
-                metaSettings?.updatedAt ||
-                new Date().toISOString(),
+              profSettings?.updatedAt ||
+              metaSettings?.updatedAt ||
+              new Date().toISOString(),
             ),
           },
         };
@@ -1722,7 +2003,7 @@ export const employeeService = {
 
         const notifRow = {
           organization_id: ro.orgId,
-                    title: `Employee Support Request: ${payload.subject}`,
+          title: `Employee Support Request: ${payload.subject}`,
           message: `From ${userName} (${userEmail}): ${payload.message}`,
           type: 'info',
           category: payload.category || 'general',

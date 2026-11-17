@@ -8,6 +8,7 @@ import { organizationService } from '@/services/organizationService';
 import { useAuth } from '@/contexts/AuthContext';
 import { formatCurrency, formatDate } from '@/lib/formatters';
 import { exportToCSV } from '@/lib/exportUtils';
+import { reconcileTask, todayYmdLocal, currentWeekWeekdays } from '@/lib/taskReconciler';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgWorkspaceNav } from './OrgWorkspaceNavContext';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '../ui/dialog';
@@ -128,7 +129,7 @@ export function ProjectProfitDetailView() {
       const res = await svc.projects.approveTimesheetEntry(projectId, entryId);
       if (res.success) {
         toast.success(res.message || 'Timesheet entry approved and labor cost locked.');
-        refetch();
+        await Promise.all([refetch(), refetchTasks()]);
       } else {
         toast.error(res.error || 'Failed to approve timesheet entry');
       }
@@ -138,7 +139,7 @@ export function ProjectProfitDetailView() {
   };
 
   // Manager Revision action (§13)
-  
+
 
   // Fetch organization members for task assignment (§13 Work Domain)
   const { data: members = [] } = useServiceArray(
@@ -154,38 +155,112 @@ export function ProjectProfitDetailView() {
     [`project-tasks-${projectId}`],
   );
 
+  const liveTodayStr = todayYmdLocal();
+  const currentWeekDays = useMemo(() => currentWeekWeekdays(), []);
+
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
+  const [taskModalMode, setTaskModalMode] = useState<'single' | 'week'>('single');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskAssignee, setNewTaskAssignee] = useState('');
-  const [newTaskEstHours, setNewTaskEstHours] = useState('20');
+  const [newTaskEstHours, setNewTaskEstHours] = useState('8');
   const [newTaskPriority, setNewTaskPriority] = useState<'low' | 'medium' | 'high' | 'urgent'>('medium');
-  const [newTaskDueDate, setNewTaskDueDate] = useState('');
+  const [weeklyPlanRows, setWeeklyPlanRows] = useState<Array<{ day: string; date: string; label: string; title: string; hours: string; enabled: boolean }>>(() =>
+    currentWeekWeekdays().map(d => ({ ...d, title: '', hours: '8', enabled: true })),
+  );
   const [isSubmittingTask, setIsSubmittingTask] = useState(false);
 
-  // Authoritative project tasks (§13 Work Domain & §12.4 Deliverables)
-  const projectTasks = rawProjectTasks;
+  // Authoritative project tasks reconciled with live timesheet entries (§13 Work Domain & §12.4 Deliverables)
+  const projectTasks = useMemo(() => {
+    const base = rawProjectTasks.length > 0 ? rawProjectTasks : (detailData?.tasks || []);
+    return base.map((t: any) => reconcileTask(t, timesheets, liveTodayStr));
+  }, [rawProjectTasks, detailData?.tasks, timesheets, liveTodayStr]);
 
   const handleCreateTask = async () => {
-    if (!newTaskTitle.trim() || !projectId) return;
+    if (!projectId) return;
+    const assigneeMember = members.find((m: any) => m.userId === newTaskAssignee || m.id === newTaskAssignee);
+    const assigneeName = (assigneeMember as any)?.user?.name || (assigneeMember as any)?.name || 'Team Member';
+
+    if (taskModalMode === 'week') {
+      const activeRows = weeklyPlanRows.filter(r => r.enabled && (r.title.trim() || newTaskTitle.trim()));
+      if (activeRows.length === 0) {
+        toast.error('Enter a task title for at least one weekday.');
+        return;
+      }
+      setIsSubmittingTask(true);
+      try {
+        const batchPayload = activeRows.map(r => ({
+          title: (r.title.trim() || `${newTaskTitle.trim()} (${r.day})`),
+          assignedTo: newTaskAssignee || undefined,
+          assignedToName: assigneeName,
+          status: 'todo' as const,
+          priority: newTaskPriority,
+          estimatedHours: parseFloat(r.hours) || 8,
+          startDate: r.date,
+          dueDate: r.date,
+        }));
+        const res = await svc.projects.createTasksBatch(projectId, batchPayload);
+        if (res.success) {
+          toast.success(`Assigned ${batchPayload.length} weekly tasks (Mon–Fri) automatically.`);
+          setNewTaskTitle('');
+          setWeeklyPlanRows(currentWeekWeekdays().map(d => ({ ...d, title: '', hours: '8', enabled: true })));
+          setShowNewTaskModal(false);
+          await Promise.all([refetchTasks(), refetch()]);
+        } else {
+          toast.error(res.error || 'Failed to assign weekly tasks');
+        }
+      } catch (err: any) {
+        toast.error(err?.message || 'Error creating weekly tasks');
+      } finally {
+        setIsSubmittingTask(false);
+      }
+      return;
+    }
+
+    if (!newTaskTitle.trim()) return;
     setIsSubmittingTask(true);
     try {
-      const assigneeMember = members.find((m: any) => m.userId === newTaskAssignee || m.id === newTaskAssignee);
       await projectService.createTask(svc.orgId, projectId, {
         title: newTaskTitle.trim(),
         assignedTo: newTaskAssignee || undefined,
-        assignedToName: (assigneeMember as any)?.user?.name || (assigneeMember as any)?.name || 'Team Member',
+        assignedToName: assigneeName,
         status: 'todo',
         priority: newTaskPriority,
         estimatedHours: parseFloat(newTaskEstHours) || 0,
-        dueDate: newTaskDueDate || undefined,
+        startDate: liveTodayStr,
+        dueDate: liveTodayStr,
       });
+      toast.success(`Task assigned for today (${liveTodayStr}).`);
       setNewTaskTitle('');
       setShowNewTaskModal(false);
-      refetchTasks();
+      await Promise.all([refetchTasks(), refetch()]);
     } catch (err) {
       console.error('Error creating task:', err);
     } finally {
       setIsSubmittingTask(false);
+    }
+  };
+
+  const handleCarryOverIncompleteTask = async (task: any) => {
+    const rem = Number(task.incompleteHours || 0);
+    if (rem <= 0) return;
+    try {
+      const res = await projectService.createTask(svc.orgId, projectId, {
+        title: `${task.title} (Carry-over)`,
+        description: `Carried over ${rem.toFixed(1)}h incomplete from ${task.dueDate || liveTodayStr}`,
+        assignedTo: task.assignedTo || undefined,
+        assignedToName: task.assignedToName || 'Team Member',
+        status: 'todo',
+        priority: task.priority || 'medium',
+        estimatedHours: rem,
+        startDate: liveTodayStr,
+        dueDate: liveTodayStr,
+      });
+      if (res.success) {
+        toast.success(`Carried over ${rem.toFixed(1)}h to today (${liveTodayStr}).`);
+        await Promise.all([refetchTasks(), refetch()]);
+      }
+    } catch (err: any) {
+      toast.error(err?.message || 'Could not carry over remaining hours');
     }
   };
 
@@ -311,8 +386,8 @@ export function ProjectProfitDetailView() {
                     project?.status === 'active'
                       ? AXIOM.badges.info
                       : project?.status === 'completed'
-                      ? AXIOM.badges.success
-                      : AXIOM.badges.warning
+                        ? AXIOM.badges.success
+                        : AXIOM.badges.warning
                   }
                 >
                   {project?.status || 'Quoted'}
@@ -350,41 +425,37 @@ export function ProjectProfitDetailView() {
             </span>
             <button
               onClick={() => setPeriodFilter('all')}
-              className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                periodFilter === 'all'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`px-3 py-1 rounded-lg font-medium transition-all ${periodFilter === 'all'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               All Time
             </button>
             <button
               onClick={() => setPeriodFilter('1M')}
-              className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                periodFilter === '1M'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`px-3 py-1 rounded-lg font-medium transition-all ${periodFilter === '1M'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               Last 30 Days
             </button>
             <button
               onClick={() => setPeriodFilter('3M')}
-              className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                periodFilter === '3M'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`px-3 py-1 rounded-lg font-medium transition-all ${periodFilter === '3M'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               Last 90 Days
             </button>
             <button
               onClick={() => setPeriodFilter('custom')}
-              className={`px-3 py-1 rounded-lg font-medium transition-all ${
-                periodFilter === 'custom'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              className={`px-3 py-1 rounded-lg font-medium transition-all ${periodFilter === 'custom'
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                : 'text-slate-400 hover:text-slate-200'
+                }`}
             >
               Custom Range
             </button>
@@ -561,55 +632,50 @@ export function ProjectProfitDetailView() {
       <div className="flex items-center gap-2 border-b border-slate-800 pb-2">
         <button
           onClick={() => setActiveTab('hours')}
-          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-            activeTab === 'hours'
-              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
-              : 'text-slate-400 hover:text-white'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${activeTab === 'hours'
+            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+            : 'text-slate-400 hover:text-white'
+            }`}
         >
           <Users className="size-3.5" />
           <span>Employee Hours & Labor Cost ({contributors.length})</span>
         </button>
         <button
           onClick={() => setActiveTab('timelogs')}
-          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-            activeTab === 'timelogs'
-              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
-              : 'text-slate-400 hover:text-white'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${activeTab === 'timelogs'
+            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+            : 'text-slate-400 hover:text-white'
+            }`}
         >
           <Clock className="size-3.5" />
           <span>Timestamped Time Logs ({timesheets.length})</span>
         </button>
         <button
           onClick={() => setActiveTab('tasks')}
-          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-            activeTab === 'tasks'
-              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
-              : 'text-slate-400 hover:text-white'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${activeTab === 'tasks'
+            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+            : 'text-slate-400 hover:text-white'
+            }`}
         >
           <CheckSquare className="size-3.5" />
           <span>Tasks & Deliverables ({projectTasks.length})</span>
         </button>
         <button
           onClick={() => setActiveTab('expenses')}
-          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-            activeTab === 'expenses'
-              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
-              : 'text-slate-400 hover:text-white'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${activeTab === 'expenses'
+            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+            : 'text-slate-400 hover:text-white'
+            }`}
         >
           <Receipt className="size-3.5" />
           <span>Direct Expenses ({expenses.length})</span>
         </button>
         <button
           onClick={() => setActiveTab('overhead')}
-          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
-            activeTab === 'overhead'
-              ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
-              : 'text-slate-400 hover:text-white'
-          }`}
+          className={`px-4 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${activeTab === 'overhead'
+            ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 shadow-lg shadow-cyan-500/10'
+            : 'text-slate-400 hover:text-white'
+            }`}
         >
           <Layers className="size-3.5" />
           <span>Assigned Overhead ({overheadBreakdown.length > 0 ? overheadBreakdown.length : overheads.length})</span>
@@ -694,15 +760,27 @@ export function ProjectProfitDetailView() {
                         {formatCurrency(c.totalLaborCost, displayCurrency)}
                       </td>
                       <td className="px-4 py-3.5 text-center">
-                        {c.pendingCount === 0 ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                            <ShieldCheck className="size-3" /> Fully Approved
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
-                            {c.pendingCount} Pending
-                          </span>
-                        )}
+                        <div className="flex flex-col items-center gap-1">
+                          {c.pendingCount === 0 ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                              <ShieldCheck className="size-3" /> All Logs Approved
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                              {c.pendingCount} Pending Log{c.pendingCount > 1 ? 's' : ''}
+                            </span>
+                          )}
+                          {(c.assignedTasksCount || 0) > 0 && (
+                            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${(c.incompleteTaskHours || 0) > 0
+                              ? 'bg-amber-500/10 text-amber-300 border-amber-500/25'
+                              : 'bg-cyan-500/10 text-cyan-300 border-cyan-500/25'
+                              }`}>
+                              {(c.incompleteTaskHours || 0) > 0
+                                ? `Tasks: ${c.approvedTaskHours || 0}/${c.allocatedTaskHours || 0}h (${c.incompleteTaskHours}h incomplete)`
+                                : `Tasks: ${c.completedOnTimeCount || 0}/${c.assignedTasksCount} On Time`}
+                            </span>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -763,18 +841,45 @@ export function ProjectProfitDetailView() {
                         </span>
                       )}
                       <span
-                        className={`text-[10px] uppercase px-1.5 py-0.2 rounded font-mono ${
-                          entry.status === 'approved'
-                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                            : entry.status === 'submitted'
+                        className={`text-[10px] uppercase px-1.5 py-0.2 rounded font-mono ${entry.status === 'approved'
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                          : entry.status === 'submitted'
                             ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                             : 'bg-slate-800 text-slate-400'
-                        }`}
+                          }`}
                       >
                         {entry.status}
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 truncate">{entry.description || 'General delivery'}</p>
+
+                    {entry.taskEstimatedHours > 0 && (
+                      <div className="flex items-center gap-2 mt-1 flex-wrap text-[10px] font-mono">
+                        <span className="px-1.5 py-0.5 rounded bg-slate-800/80 text-slate-300 border border-slate-700/60">
+                          Task Allocation: {entry.taskApprovedHours ?? entry.taskLoggedHours ?? entry.hours}h / {entry.taskEstimatedHours}h
+                        </span>
+                        {entry.taskCompletionStatus === 'closed_partial' && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                            Auto-Closed Partial ({entry.taskIncompleteHours}h incomplete)
+                          </span>
+                        )}
+                        {entry.taskCompletionStatus === 'completed_on_time' && (
+                          <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            Completed On Time
+                          </span>
+                        )}
+                        {entry.taskCompletionStatus === 'completed_late' && (
+                          <span className="px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                            Completed Late
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {entry.taskCompletionNote && (
+                      <p className="text-[10px] text-amber-300/90 font-mono mt-0.5">
+                        Note: {entry.taskCompletionNote}
+                      </p>
+                    )}
 
                     {/* Revision history badge if modified (§13) */}
                     {entry.revisionHistory && entry.revisionHistory.length > 0 && (
@@ -849,7 +954,22 @@ export function ProjectProfitDetailView() {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => setShowNewTaskModal(true)}
+                onClick={() => {
+                  setTaskModalMode('week');
+                  setWeeklyPlanRows(currentWeekDays.map(d => ({ ...d, title: '', hours: '8', enabled: true })));
+                  setShowNewTaskModal(true);
+                }}
+                className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-purple-500/20 hover:bg-purple-500/30 text-purple-200 border border-purple-500/40 transition-all cursor-pointer flex items-center gap-1.5"
+              >
+                <Calendar className="size-3.5" />
+                <span>Assign Week Tasks (Mon–Fri)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setTaskModalMode('single');
+                  setShowNewTaskModal(true);
+                }}
                 className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-cyan-500 hover:bg-cyan-400 text-white shadow-lg shadow-cyan-500/20 transition-all cursor-pointer flex items-center gap-1.5"
               >
                 <Plus className="size-3.5" />
@@ -908,13 +1028,12 @@ export function ProjectProfitDetailView() {
                 return (
                   <div
                     key={task.id}
-                    className={`p-4 rounded-xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-3 ${
-                      isDone
-                        ? 'bg-slate-950/30 border-slate-800/50 opacity-80'
-                        : isInProgress
+                    className={`p-4 rounded-xl border transition-all flex flex-col md:flex-row md:items-center justify-between gap-3 ${isDone
+                      ? 'bg-slate-950/30 border-slate-800/50 opacity-80'
+                      : isInProgress
                         ? 'bg-slate-950/70 border-cyan-500/30 shadow-lg shadow-cyan-500/5'
                         : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
-                    }`}
+                      }`}
                   >
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 mb-1.5 flex-wrap">
@@ -922,13 +1041,12 @@ export function ProjectProfitDetailView() {
                         <button
                           type="button"
                           onClick={() => handleToggleTaskStatus(task)}
-                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-medium uppercase tracking-wider cursor-pointer transition-all ${
-                            isDone
-                              ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                              : isInProgress
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono font-medium uppercase tracking-wider cursor-pointer transition-all ${isDone
+                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                            : isInProgress
                               ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                               : 'bg-slate-800 text-slate-400 border border-slate-700'
-                          }`}
+                            }`}
                           title="Click to toggle status"
                         >
                           {isDone ? (
@@ -951,13 +1069,12 @@ export function ProjectProfitDetailView() {
 
                         {/* Priority Badge */}
                         <span
-                          className={`text-[10px] px-2 py-0.5 rounded font-mono font-medium uppercase ${
-                            task.priority === 'urgent'
-                              ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                              : task.priority === 'high'
+                          className={`text-[10px] px-2 py-0.5 rounded font-mono font-medium uppercase ${task.priority === 'urgent'
+                            ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                            : task.priority === 'high'
                               ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                               : 'bg-slate-800/80 text-slate-400'
-                          }`}
+                            }`}
                         >
                           {task.priority || 'medium'}
                         </span>
@@ -966,7 +1083,29 @@ export function ProjectProfitDetailView() {
                         {task.dueDate && (
                           <span className="text-[11px] text-slate-400 font-mono flex items-center gap-1">
                             <Calendar className="size-3" />
-                            <span>Due: {formatDate(task.dueDate)}</span>
+                            <span>Date: {formatDate(task.dueDate)}</span>
+                          </span>
+                        )}
+
+                        {/* Completion Status Badge */}
+                        {task.completionStatus === 'closed_partial' && (
+                          <span className="text-[10px] px-2 py-0.5 rounded font-mono bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                            Auto-Closed Partial ({task.incompleteHours}h incomplete)
+                          </span>
+                        )}
+                        {task.completionStatus === 'completed_on_time' && (
+                          <span className="text-[10px] px-2 py-0.5 rounded font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                            Completed On Time
+                          </span>
+                        )}
+                        {task.completionStatus === 'completed_late' && (
+                          <span className="text-[10px] px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                            Completed Late
+                          </span>
+                        )}
+                        {task.completionStatus === 'overdue' && (
+                          <span className="text-[10px] px-2 py-0.5 rounded font-mono bg-rose-500/20 text-rose-300 border border-rose-500/30">
+                            Overdue
                           </span>
                         )}
                       </div>
@@ -977,6 +1116,11 @@ export function ProjectProfitDetailView() {
                       </h4>
                       {task.description && (
                         <p className="text-xs text-slate-400 mt-0.5 line-clamp-1">{task.description}</p>
+                      )}
+                      {task.completionNote && (
+                        <p className="text-[11px] text-amber-300/90 font-mono mt-1">
+                          {task.completionNote}
+                        </p>
                       )}
 
                       {/* Assigned Member */}
@@ -999,16 +1143,25 @@ export function ProjectProfitDetailView() {
                       </div>
 
                       <div className="flex items-center gap-1.5">
+                        {task.completionStatus === 'closed_partial' && (task.incompleteHours || 0) > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => handleCarryOverIncompleteTask(task)}
+                            className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-amber-500/20 text-amber-300 hover:bg-amber-500/30 border border-amber-500/30 cursor-pointer transition-all"
+                            title="Create a new task for today with the remaining incomplete hours"
+                          >
+                            Carry Over {task.incompleteHours}h
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => handleToggleTaskStatus(task)}
-                          className={`px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all ${
-                            isDone
-                              ? 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                              : isInProgress
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all ${isDone
+                            ? 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                            : isInProgress
                               ? 'bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/30'
                               : 'bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30 border border-cyan-500/30'
-                          }`}
+                            }`}
                         >
                           {isDone ? 'Reopen' : isInProgress ? 'Complete' : 'Start'}
                         </button>
@@ -1247,7 +1400,7 @@ export function ProjectProfitDetailView() {
                     Math.max(
                       0,
                       overheadBreakdown.reduce((sum: number, b: any) => sum + (b.departmentOverheadPool || 0), 0) -
-                        (summary?.assignedOverhead || 0)
+                      (summary?.assignedOverhead || 0)
                     ),
                     displayCurrency
                   )}
@@ -1404,7 +1557,7 @@ export function ProjectProfitDetailView() {
       {/* 7. New Deliverable / Task Modal (§13 Work Domain) */}
       <Dialog open={showNewTaskModal} onOpenChange={open => { if (!open) setShowNewTaskModal(false); }}>
         <DialogContent
-          className="max-w-md text-white"
+          className={`${taskModalMode === 'week' ? 'max-w-2xl' : 'max-w-md'} text-white max-h-[90vh] overflow-y-auto`}
           style={{
             background: AXIOM.containers.list.background,
             border: AXIOM.containers.list.border,
@@ -1413,16 +1566,39 @@ export function ProjectProfitDetailView() {
           <DialogHeader>
             <DialogTitle className="text-white flex items-center gap-2">
               <CheckSquare className="size-4 text-cyan-400" />
-              <span>Add Deliverable / Task (§13)</span>
+              <span>{taskModalMode === 'week' ? 'Assign Whole Week Tasks (Mon–Fri)' : 'Add Deliverable / Task (§13)'}</span>
             </DialogTitle>
             <DialogDescription className="text-slate-400 text-xs">
-              Define a project deliverable or task milestone. Assigned employees can log hours against this task to trace project labor burn.
+              {taskModalMode === 'week'
+                ? 'Automatically populates the current week (Mon–Fri) dates from the system clock. Assign daily tasks and allocated hours in one click.'
+                : 'Dates are automatically stamped from the current system date. Employees cannot log more hours than allocated.'}
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4 pt-2">
+          <div className="flex items-center gap-2 p-1 rounded-xl bg-slate-900/80 border border-slate-800">
+            <button
+              type="button"
+              onClick={() => setTaskModalMode('single')}
+              className={`flex-1 py-1.5 rounded-lg text-xs font-mono transition-all cursor-pointer ${taskModalMode === 'single' ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/40' : 'text-slate-400 hover:text-white'
+                }`}
+            >
+              Single Task (Auto Today)
+            </button>
+            <button
+              type="button"
+              onClick={() => setTaskModalMode('week')}
+              className={`flex-1 py-1.5 rounded-lg text-xs font-mono transition-all cursor-pointer ${taskModalMode === 'week' ? 'bg-purple-500/25 text-purple-200 border border-purple-500/40' : 'text-slate-400 hover:text-white'
+                }`}
+            >
+              Whole Week (Mon–Fri)
+            </button>
+          </div>
+
+          <div className="space-y-4 pt-1">
             <div>
-              <label className="text-white text-xs font-semibold block mb-1.5">Task Title *</label>
+              <label className="text-white text-xs font-semibold block mb-1.5">
+                {taskModalMode === 'week' ? 'Default Task Title (used for any blank day)' : 'Task Title *'}
+              </label>
               <input
                 type="text"
                 value={newTaskTitle}
@@ -1432,51 +1608,41 @@ export function ProjectProfitDetailView() {
                   background: AXIOM.inputs.background,
                   border: AXIOM.inputs.border,
                 }}
-                placeholder="e.g. Backend API Endpoints & Auth"
+                placeholder={taskModalMode === 'week' ? 'e.g. Sprint Delivery & Backend API' : 'e.g. Backend API Endpoints & Auth'}
               />
-            </div>
-
-            <div>
-              <label className="text-white text-xs font-semibold block mb-1.5">Assignee</label>
-              <select
-                value={newTaskAssignee}
-                onChange={e => setNewTaskAssignee(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg text-white text-xs"
-                style={{
-                  background: AXIOM.inputs.background,
-                  border: AXIOM.inputs.border,
-                }}
-              >
-                <option value="">Select Team Member</option>
-                {members.map((m: any) => {
-                  const mId = m.userId || m.id;
-                  const mName = m.user?.name || m.name || m.user?.email || mId;
-                  const mRole = m.role || m.position || 'Member';
-                  return (
-                    <option key={mId} value={mId}>
-                      {mName} ({mRole})
-                    </option>
-                  );
-                })}
-              </select>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="text-white text-xs font-semibold block mb-1.5">Estimated Hours</label>
-                <input
-                  type="number"
-                  step="1"
-                  min="0"
-                  value={newTaskEstHours}
-                  onChange={e => setNewTaskEstHours(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg text-white font-mono text-xs"
+                <label className="text-white text-xs font-semibold block mb-1.5">Assignee</label>
+                <select
+                  value={newTaskAssignee}
+                  onChange={e => setNewTaskAssignee(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg text-white text-xs"
                   style={{
                     background: AXIOM.inputs.background,
                     border: AXIOM.inputs.border,
                   }}
-                  placeholder="20"
-                />
+                >
+                  <option value="">Select Employee</option>
+                  {members
+                    .filter((m: any) => {
+                      const role = String(m.role || '').toLowerCase();
+                      const portal = String(m.portalType || m.portal_type || '').toLowerCase();
+                      const status = String(m.status || 'active').toLowerCase();
+                      return status === 'active' && role !== 'owner' && role !== 'admin' && role !== 'org_admin' && portal !== 'organization_admin';
+                    })
+                    .map((m: any) => {
+                      const mId = m.userId || m.id;
+                      const mName = m.user?.name || m.name || m.user?.email || mId;
+                      const mRole = m.position || m.role || 'Employee';
+                      return (
+                        <option key={mId} value={mId}>
+                          {mName} ({mRole})
+                        </option>
+                      );
+                    })}
+                </select>
               </div>
 
               <div>
@@ -1498,19 +1664,85 @@ export function ProjectProfitDetailView() {
               </div>
             </div>
 
-            <div>
-              <label className="text-white text-xs font-semibold block mb-1.5">Due Date</label>
-              <input
-                type="date"
-                value={newTaskDueDate}
-                onChange={e => setNewTaskDueDate(e.target.value)}
-                className="w-full px-3 py-2 rounded-lg text-white text-xs font-mono"
-                style={{
-                  background: AXIOM.inputs.background,
-                  border: AXIOM.inputs.border,
-                }}
-              />
-            </div>
+            {taskModalMode === 'single' ? (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-white text-xs font-semibold block mb-1.5">Allocated Hours</label>
+                  <input
+                    type="number"
+                    step="0.5"
+                    min="0.5"
+                    max="8"
+                    value={newTaskEstHours}
+                    onChange={e => setNewTaskEstHours(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg text-white font-mono text-xs"
+                    style={{
+                      background: AXIOM.inputs.background,
+                      border: AXIOM.inputs.border,
+                    }}
+                    placeholder="8"
+                  />
+                </div>
+                <div>
+                  <label className="text-white text-xs font-semibold block mb-1.5">Auto Assigned Date</label>
+                  <div
+                    className="w-full px-3 py-2 rounded-lg text-cyan-300 text-xs font-mono flex items-center justify-between"
+                    style={{
+                      background: AXIOM.inputs.background,
+                      border: '1px solid rgba(6, 182, 212, 0.35)',
+                    }}
+                  >
+                    <span>{liveTodayStr}</span>
+                    <span className="text-[10px] text-slate-400">AUTO</span>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-white text-xs font-semibold">Current Week Schedule (Auto-Populated Mon–Fri)</label>
+                  <span className="text-[10px] font-mono text-purple-300">
+                    Total: {weeklyPlanRows.filter(r => r.enabled).reduce((s, r) => s + (parseFloat(r.hours) || 0), 0)}h
+                  </span>
+                </div>
+                <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                  {weeklyPlanRows.map((row, idx) => (
+                    <div key={row.date} className="grid grid-cols-12 gap-2 items-center p-2 rounded-lg bg-slate-900/70 border border-slate-800">
+                      <label className="col-span-3 flex items-center gap-2 text-xs font-mono text-slate-200 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={row.enabled}
+                          onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, enabled: e.target.checked } : r))}
+                          className="accent-purple-500"
+                        />
+                        <span>{row.day} <span className="text-cyan-300">{row.label}</span></span>
+                      </label>
+                      <input
+                        type="text"
+                        disabled={!row.enabled}
+                        value={row.title}
+                        onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, title: e.target.value } : r))}
+                        placeholder={newTaskTitle.trim() ? `${newTaskTitle.trim()} (${row.day})` : `${row.day} task title...`}
+                        className="col-span-6 px-2.5 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs disabled:opacity-40"
+                      />
+                      <div className="col-span-3 flex items-center gap-1">
+                        <input
+                          type="number"
+                          min="0.5"
+                          max="8"
+                          step="0.5"
+                          disabled={!row.enabled}
+                          value={row.hours}
+                          onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, hours: e.target.value } : r))}
+                          className="w-full px-2 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs font-mono disabled:opacity-40"
+                        />
+                        <span className="text-[10px] text-slate-400 font-mono">h</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             <div className="flex gap-2 pt-2 border-t border-slate-800">
               <button
@@ -1523,11 +1755,15 @@ export function ProjectProfitDetailView() {
               </button>
               <button
                 type="button"
-                disabled={isSubmittingTask || !newTaskTitle.trim()}
+                disabled={isSubmittingTask || (taskModalMode === 'single' && !newTaskTitle.trim())}
                 onClick={handleCreateTask}
                 className="flex-1 px-4 py-2 rounded-xl text-xs font-medium bg-cyan-500 hover:bg-cyan-400 text-white font-semibold cursor-pointer disabled:opacity-50"
               >
-                {isSubmittingTask ? 'Creating...' : 'Create Deliverable'}
+                {isSubmittingTask
+                  ? 'Saving...'
+                  : taskModalMode === 'week'
+                    ? 'Assign Whole Week (Mon–Fri)'
+                    : 'Create Deliverable'}
               </button>
             </div>
           </div>

@@ -230,10 +230,19 @@ export interface Project {
   committedRemainingWork?: number;
 }
 
+export type TaskCompletionStatus =
+  | 'completed_on_time'
+  | 'completed_late'
+  | 'closed_partial'
+  | 'in_progress'
+  | 'overdue'
+  | 'scheduled';
+
 export interface ProjectTask {
   id: string;
   organizationId: string;
   projectId: string;
+  projectName?: string;
   title: string;
   description?: string;
   status: 'todo' | 'in_progress' | 'completed' | 'blocked';
@@ -242,6 +251,11 @@ export interface ProjectTask {
   startDate?: string;
   estimatedHours?: number;
   loggedHours?: number;
+  approvedHours?: number;
+  incompleteHours?: number;
+  completionNote?: string;
+  completionStatus?: TaskCompletionStatus;
+  closedAt?: string;
   priority?: 'low' | 'medium' | 'high' | 'urgent';
   dueDate?: string;
   createdAt?: string;
@@ -616,6 +630,43 @@ export interface TimesheetEntry {
   description: string;
   billable: boolean;
   status: 'draft' | 'submitted' | 'approved';
+  taskId?: string;
+  startTime?: string;
+  endTime?: string;
+  durationMinutes?: number;
+  durationSeconds?: number;
+  clientEventId?: string;
+  source?: 'live_timer' | 'manual' | 'offline_recovered' | 'batch_auto_fill';
+  effectiveCostPerMinute?: number;
+  effectiveCostPerHour?: number;
+  calculatedLaborCost?: number;
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectionReason?: string;
+  revisionHistory?: Array<{
+    previousHours: number;
+    newHours: number;
+    revisedAt: string;
+    revisedBy?: string;
+    reason?: string;
+  }>;
+}
+
+export interface ActiveTimerSession {
+  id: string;
+  organizationId: string;
+  userId: string;
+  projectId: string;
+  projectName?: string;
+  taskId?: string;
+  description: string;
+  billable: boolean;
+  startedAt: string;
+  pausedAt?: string;
+  accumulatedSeconds: number;
+  status: 'running' | 'paused' | 'stopped';
+  clientEventId: string;
+  lastHeartbeatAt: string;
 }
 
 export interface EmployeeTeamMember {

@@ -18,6 +18,7 @@ import {
   Cpu,
   Radio,
   Brain,
+  Sparkles,
   ChevronRight,
   Settings,
   HelpCircle
@@ -179,52 +180,33 @@ export function EmployeeLayout({ children, currentView, onViewChange }: Employee
               </div>
             ))}
           </nav>
-
-          {/* Footer - Interactive AI Assistant */}
-          <div className="p-4" style={{ borderTop: '1px solid rgba(59, 130, 246, 0.15)' }}>
-            <button
-              type="button"
-              onClick={() => setIsAIAssistantOpen(true)}
-              className="w-full p-3 rounded-lg text-left transition-all duration-200 group cursor-pointer hover:border-blue-400/60"
-              style={{
-                background: 'linear-gradient(135deg, rgba(59, 130, 246, 0.12), rgba(139, 92, 246, 0.12))',
-                border: '1px solid rgba(59, 130, 246, 0.3)',
-                boxShadow: '0 0 15px rgba(59, 130, 246, 0.08)',
-              }}
-            >
-              <div className="flex items-center justify-between mb-1.5">
-                <div className="flex items-center gap-2">
-                  <Brain className="size-4 text-blue-400 group-hover:scale-110 transition-transform" />
-                  <span className="text-xs text-blue-400 font-mono font-bold tracking-wide">AI ASSISTANT</span>
-                </div>
-                <span className="size-2 rounded-full bg-green-400 animate-pulse" />
-              </div>
-              <div className="flex items-center justify-between">
-                <p className="text-xs text-slate-300 font-mono">Ask me anything</p>
-                <ChevronRight className="size-3.5 text-blue-400 opacity-60 group-hover:opacity-100 group-hover:translate-x-0.5 transition-all" />
-              </div>
-            </button>
-          </div>
         </div>
 
         {/* Main Content */}
         <div className="flex-1 overflow-auto relative">
           {children}
 
-          {/* Floating AI Assistant Action Trigger */}
+          {/* Single Floating AI Assistant Action Trigger (Bottom-Right) */}
           <button
             type="button"
             onClick={() => setIsAIAssistantOpen(true)}
-            className="fixed bottom-6 right-6 size-12 rounded-full flex items-center justify-center cursor-pointer shadow-2xl transition-all duration-200 hover:scale-105 z-40 group"
+            className="fixed bottom-6 right-6 px-4 py-3 rounded-full flex items-center gap-2.5 cursor-pointer shadow-2xl transition-all duration-200 hover:scale-105 z-40 group"
             style={{
-              background: 'linear-gradient(135deg, #7c3aed 0%, #3b82f6 100%)',
-              border: '1px solid rgba(255, 255, 255, 0.2)',
-              boxShadow: '0 10px 30px -5px rgba(124, 58, 237, 0.5)',
+              background: 'linear-gradient(135deg, rgba(124, 58, 237, 0.95) 0%, rgba(59, 130, 246, 0.95) 100%)',
+              border: '1px solid rgba(147, 197, 253, 0.4)',
+              boxShadow: '0 12px 32px -6px rgba(99, 102, 241, 0.6), 0 0 20px rgba(59, 130, 246, 0.35)',
+              backdropFilter: 'blur(12px)',
             }}
-            title="Open Employee AI Advisor"
+            title="Open AI Assistant"
           >
-            <Brain className="size-6 text-white group-hover:rotate-12 transition-transform" />
-            <span className="absolute -top-1 -right-1 size-3 bg-green-400 rounded-full border-2 border-slate-900" />
+            <span className="relative flex items-center justify-center size-7 rounded-full bg-white/15 border border-white/20">
+              <Brain className="size-4 text-white group-hover:scale-110 transition-transform" />
+              <Sparkles className="size-2.5 text-cyan-200 absolute -top-0.5 -right-0.5" />
+            </span>
+            <span className="text-xs font-mono font-bold tracking-wide text-white pr-1">
+              AI Assistant
+            </span>
+            <span className="size-2 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]" />
           </button>
 
           {/* Modal */}

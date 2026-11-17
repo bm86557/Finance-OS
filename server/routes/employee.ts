@@ -20,6 +20,17 @@ import { detectAndIssuePayslipsForTransactions, voidPayslip } from '../lib/aiPay
 import { canViewConfidentialPayroll, canWriteFinance } from '../middleware/auth.js';
 import { env } from '../config/env.js';
 import { createEmployeeAIAssistantRouter } from './employeeAIAssistant.js';
+import {
+  reconcileTask,
+  validateTaskHoursAllocation,
+  doesEntryMatchTask,
+  todayYmdLocal,
+} from '../../src/lib/taskReconciler.js';
+import {
+  computeElapsedSeconds,
+  computeLoggedDuration,
+  generateClientEventId,
+} from '../../src/lib/timerRecovery.js';
 
 /**
  * Every route here is a self-service endpoint for the logged-in employee (mounted under
@@ -1118,12 +1129,52 @@ export function createEmployeeMeRouter(): Router {
     const userId = callerId(req);
     const entryId = (body as any).id || `ts_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
     const newHours = Number(body.hours || 0);
+    const entryDate = (body.date && String(body.date).trim()) || todayYmdLocal();
+    (body as any).date = entryDate;
 
     if (newHours <= 0 || isNaN(newHours)) {
       return fail(res, 400, 'Hours must be greater than 0');
     }
 
     const sb = getSupabaseAdminClient();
+    const clientEventId = (body as any).clientEventId ? String((body as any).clientEventId).trim() : null;
+    const entrySource = (body as any).source ? String((body as any).source).trim() : 'manual';
+
+    // Idempotency check (§7 unique external event id, §33.7 Idempotency at every write boundary)
+    if (sb && clientEventId) {
+      try {
+        const { data: existingDup } = await sb
+          .from('timesheet_entries')
+          .select('*')
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .eq('client_event_id', clientEventId)
+          .maybeSingle();
+        if (existingDup) {
+          return ok(res, {
+            id: existingDup.id,
+            organizationId: existingDup.organization_id,
+            userId: existingDup.user_id,
+            date: existingDup.date,
+            projectId: existingDup.project_id,
+            projectName: existingDup.project_name || '',
+            hours: Number(existingDup.hours || 0),
+            description: existingDup.description || '',
+            billable: Boolean(existingDup.billable ?? true),
+            status: existingDup.status,
+            taskId: existingDup.task_id || undefined,
+            startTime: existingDup.start_time || undefined,
+            endTime: existingDup.end_time || undefined,
+            durationMinutes: Number(existingDup.duration_minutes || 0),
+            clientEventId: existingDup.client_event_id || undefined,
+            source: existingDup.source || undefined,
+          }, 'Idempotent replay: time entry already recorded');
+        }
+      } catch {
+        /* client_event_id column may not be migrated yet — continue safely */
+      }
+    }
+
     let existingHours = 0;
 
     if (sb && body.projectId) {
@@ -1195,20 +1246,59 @@ export function createEmployeeMeRouter(): Router {
       return fail(
         res,
         400,
-        `Daily limit of 8 hours exceeded. You have already logged ${existingHours.toFixed(1)}h on ${body.date} across projects. Maximum remaining is ${remaining.toFixed(1)}h.`
+        `Daily limit of 8 hours exceeded. You have already logged ${existingHours.toFixed(1)}h on ${entryDate} across projects. Maximum remaining is ${remaining.toFixed(1)}h.`
       );
     }
+
+    // Enforce allocated task hours cap (§13 Work Domain)
+    let matchedTaskRow: any = null;
+    let updatedTaskLoggedHours = newHours;
+    if (sb && body.projectId && ((body as any).taskId || body.description?.trim())) {
+      try {
+        const [{ data: projTasks }, { data: projTs }] = await Promise.all([
+          sb.from('project_tasks').select('*').eq('organization_id', orgId).eq('project_id', body.projectId),
+          sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status').eq('organization_id', orgId).eq('project_id', body.projectId),
+        ]);
+        const taskList = projTasks || [];
+        matchedTaskRow =
+          ((body as any).taskId && taskList.find((t: any) => String(t.id) === String((body as any).taskId))) ||
+          taskList.find((t: any) => String(t.title || '').trim().toLowerCase() === String(body.description || '').trim().toLowerCase());
+
+        if (matchedTaskRow) {
+          const filteredTs = (projTs || []).filter((r: any) => r.id !== entryId);
+          const check = validateTaskHoursAllocation(matchedTaskRow, filteredTs, newHours);
+          if (!check.ok) {
+            return fail(res, 400, check.error);
+          }
+          updatedTaskLoggedHours = Math.round((check.existingHours + newHours) * 100) / 100;
+          if (!(body as any).taskId) {
+            (body as any).taskId = matchedTaskRow.id;
+          }
+        }
+      } catch (taskValErr) {
+        console.warn('[employee.createTimesheet] Task hours validation warning:', taskValErr);
+      }
+    }
+
+    const durationMinutes = Number((body as any).durationMinutes || Math.round(newHours * 60));
+    const startTimeStr = (body as any).startTime || undefined;
+    const endTimeStr = (body as any).endTime || undefined;
 
     const entry: TimesheetEntry = {
       ...body,
       id: entryId,
       organizationId: orgId,
       userId,
+      date: entryDate,
       projectName: body.projectName || '',
       hours: newHours,
       description: body.description || '',
       billable: body.billable ?? true,
       status: body.status || 'draft',
+      taskId: (body as any).taskId || undefined,
+      startTime: startTimeStr,
+      endTime: endTimeStr,
+      durationMinutes,
     };
 
     if (sb) {
@@ -1242,7 +1332,7 @@ export function createEmployeeMeRouter(): Router {
         (entry as any).effectiveCostPerMinute = effectiveCostPerMinute;
         (entry as any).calculatedLaborCost = calculatedLaborCost;
 
-        const dbRow = {
+        const dbRow: Record<string, any> = {
           id: entry.id,
           organization_id: orgId,
           user_id: userId,
@@ -1254,29 +1344,34 @@ export function createEmployeeMeRouter(): Router {
           billable: entry.billable,
           status: entry.status,
           task_id: (entry as any).taskId || null,
+          start_time: startTimeStr || null,
+          end_time: endTimeStr || null,
+          duration_minutes: durationMinutes,
           effective_cost_per_hour: effectiveCostPerHour,
           effective_cost_per_minute: effectiveCostPerMinute,
           calculated_labor_cost: calculatedLaborCost,
+          ...(clientEventId ? { client_event_id: clientEventId, source: entrySource } : {}),
         };
 
-        if ((entry as any).taskId) {
+        if ((entry as any).taskId && matchedTaskRow) {
           try {
-            const { data: tRow } = await sb.from('project_tasks').select('logged_hours, status').eq('id', (entry as any).taskId).maybeSingle();
-            if (tRow) {
-              const updatedLoggedHours = Number(tRow.logged_hours || 0) + Number(entry.hours || 0);
-              const updatedStatus = tRow.status === 'todo' ? 'in_progress' : tRow.status;
-              await sb.from('project_tasks').update({
-                logged_hours: updatedLoggedHours,
-                status: updatedStatus,
-                updated_at: new Date().toISOString()
-              }).eq('id', (entry as any).taskId);
-            }
+            const updatedStatus = matchedTaskRow.status === 'todo' ? 'in_progress' : matchedTaskRow.status;
+            await sb.from('project_tasks').update({
+              logged_hours: updatedTaskLoggedHours,
+              status: updatedStatus,
+              updated_at: new Date().toISOString()
+            }).eq('id', (entry as any).taskId);
           } catch (taskErr) {
             console.warn('[employee.timesheet] project_task update skipped:', taskErr);
           }
         }
         const { error: upsertErr } = await sb.from('timesheet_entries').upsert(dbRow);
-        if (upsertErr) {
+        if (upsertErr && clientEventId) {
+          // Graceful fallback if client_event_id/source columns haven't been migrated yet
+          delete dbRow.client_event_id;
+          delete dbRow.source;
+          await sb.from('timesheet_entries').upsert(dbRow);
+        } else if (upsertErr) {
           console.warn('[employee.createTimesheet] Supabase upsert error:', upsertErr.message);
         }
       } catch (err) {
@@ -1285,6 +1380,425 @@ export function createEmployeeMeRouter(): Router {
     }
 
     created(res, entry);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // Authoritative Live Timer Session Endpoints (§0.3, §6, §7, §13, §33.7)
+  // ─────────────────────────────────────────────────────────────────────────────
+  r.get('/timer/active', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const userId = callerId(req);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return ok(res, null);
+
+    try {
+      const { data, error } = await sb
+        .from('active_timer_sessions')
+        .select('*')
+        .eq('organization_id', orgId)
+        .eq('user_id', userId)
+        .in('status', ['running', 'paused'])
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error || !data) return ok(res, null);
+      return ok(res, {
+        id: data.id,
+        organizationId: data.organization_id,
+        userId: data.user_id,
+        projectId: data.project_id,
+        projectName: data.project_name || '',
+        taskId: data.task_id || undefined,
+        description: data.description || '',
+        billable: Boolean(data.billable ?? true),
+        startedAt: data.started_at,
+        pausedAt: data.paused_at || undefined,
+        accumulatedSeconds: Number(data.accumulated_seconds || 0),
+        status: data.status,
+        clientEventId: data.client_event_id,
+        lastHeartbeatAt: data.last_heartbeat_at,
+      });
+    } catch {
+      return ok(res, null);
+    }
+  });
+
+  r.post('/timer/start', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const userId = callerId(req);
+    const {
+      projectId,
+      projectName,
+      taskId,
+      description,
+      billable = true,
+      startedAt,
+      accumulatedSeconds = 0,
+      clientEventId,
+      sessionId,
+    } = req.body || {};
+
+    if (!projectId) return fail(res, 400, 'projectId is required');
+    const sb = getSupabaseAdminClient();
+    const nowIso = startedAt || new Date().toISOString();
+    const evtId = clientEventId || generateClientEventId('evt_timer');
+    const id = sessionId || `tmr_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    if (sb) {
+      try {
+        // Validate task remaining hours if taskId is provided
+        if (taskId) {
+          const [{ data: tRow }, { data: projTs }] = await Promise.all([
+            sb.from('project_tasks').select('*').eq('id', taskId).eq('organization_id', orgId).maybeSingle(),
+            sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status').eq('organization_id', orgId).eq('project_id', projectId),
+          ]);
+          if (tRow) {
+            const check = validateTaskHoursAllocation(tRow, projTs || [], 0.01);
+            if (!check.ok) return fail(res, 400, check.error);
+          }
+        }
+
+        // Close any previous running/paused sessions for this user unless resuming same session
+        await sb
+          .from('active_timer_sessions')
+          .update({ status: 'stopped', updated_at: new Date().toISOString() })
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .in('status', ['running', 'paused'])
+          .neq('client_event_id', evtId);
+
+        const row = {
+          id,
+          organization_id: orgId,
+          user_id: userId,
+          project_id: projectId,
+          project_name: projectName || '',
+          task_id: taskId || null,
+          description: String(description || '').trim(),
+          billable: Boolean(billable),
+          started_at: nowIso,
+          paused_at: null,
+          accumulated_seconds: Math.max(0, Math.floor(Number(accumulatedSeconds || 0))),
+          status: 'running',
+          client_event_id: evtId,
+          last_heartbeat_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+
+        await sb.from('active_timer_sessions').upsert(row);
+      } catch {
+        /* Fallback gracefully if active_timer_sessions table is not yet migrated */
+      }
+    }
+
+    return ok(res, {
+      id,
+      organizationId: orgId,
+      userId,
+      projectId,
+      projectName: projectName || '',
+      taskId: taskId || undefined,
+      description: String(description || '').trim(),
+      billable: Boolean(billable),
+      startedAt: nowIso,
+      accumulatedSeconds: Math.max(0, Math.floor(Number(accumulatedSeconds || 0))),
+      status: 'running',
+      clientEventId: evtId,
+      lastHeartbeatAt: new Date().toISOString(),
+    });
+  });
+
+  r.post('/timer/pause', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const userId = callerId(req);
+    const { clientEventId, pausedAt, accumulatedSeconds } = req.body || {};
+    const sb = getSupabaseAdminClient();
+    const nowIso = pausedAt || new Date().toISOString();
+
+    if (sb && clientEventId) {
+      try {
+        const { data: existing } = await sb
+          .from('active_timer_sessions')
+          .select('*')
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .eq('client_event_id', clientEventId)
+          .maybeSingle();
+
+        if (existing) {
+          const computedSec = accumulatedSeconds !== undefined
+            ? Math.max(0, Math.floor(Number(accumulatedSeconds)))
+            : computeElapsedSeconds({
+              status: existing.status,
+              startedAt: existing.started_at,
+              accumulatedSeconds: existing.accumulated_seconds,
+            }, Date.parse(nowIso));
+
+          const { data: updated } = await sb
+            .from('active_timer_sessions')
+            .update({
+              status: 'paused',
+              paused_at: nowIso,
+              accumulated_seconds: computedSec,
+              last_heartbeat_at: nowIso,
+              updated_at: nowIso,
+            })
+            .eq('id', existing.id)
+            .select()
+            .single();
+
+          if (updated) {
+            return ok(res, {
+              id: updated.id,
+              organizationId: updated.organization_id,
+              userId: updated.user_id,
+              projectId: updated.project_id,
+              projectName: updated.project_name || '',
+              taskId: updated.task_id || undefined,
+              description: updated.description || '',
+              billable: Boolean(updated.billable ?? true),
+              startedAt: updated.started_at,
+              pausedAt: updated.paused_at,
+              accumulatedSeconds: Number(updated.accumulated_seconds || 0),
+              status: 'paused',
+              clientEventId: updated.client_event_id,
+              lastHeartbeatAt: updated.last_heartbeat_at,
+            });
+          }
+        }
+      } catch {
+        /* ignore if table not migrated */
+      }
+    }
+
+    return ok(res, {
+      clientEventId,
+      pausedAt: nowIso,
+      accumulatedSeconds: Math.max(0, Math.floor(Number(accumulatedSeconds || 0))),
+      status: 'paused',
+    });
+  });
+
+  r.post('/timer/stop', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const userId = callerId(req);
+    const {
+      clientEventId,
+      projectId,
+      projectName,
+      taskId,
+      description,
+      billable = true,
+      startedAt,
+      stoppedAt,
+      elapsedSeconds: rawElapsedSec,
+      source = 'live_timer',
+    } = req.body || {};
+
+    const sb = getSupabaseAdminClient();
+    const evtId = clientEventId || generateClientEventId('evt_ts');
+    const stopDt = stoppedAt ? new Date(stoppedAt) : new Date();
+    const startDt = startedAt ? new Date(startedAt) : new Date(stopDt.getTime() - Math.max(1, Number(rawElapsedSec || 1)) * 1000);
+    const totalSec = rawElapsedSec !== undefined
+      ? Math.max(1, Math.round(Number(rawElapsedSec)))
+      : Math.max(1, Math.round((stopDt.getTime() - startDt.getTime()) / 1000));
+
+    const { durationSeconds, durationMinutes, hours } = computeLoggedDuration(totalSec);
+    const entryDate = todayYmdLocal(stopDt);
+    const startTimeStr = startDt.toTimeString().slice(0, 5);
+    const endTimeStr = stopDt.toTimeString().slice(0, 5);
+
+    if (sb) {
+      try {
+        await sb
+          .from('active_timer_sessions')
+          .update({ status: 'stopped', updated_at: stopDt.toISOString() })
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .eq('client_event_id', evtId);
+      } catch {
+        /* ignore if table not migrated */
+      }
+    }
+
+    // Forward to the exact same idempotent creation logic by invoking Supabase directly
+    if (!projectId) return fail(res, 400, 'projectId is required');
+
+    // Check idempotency first
+    if (sb) {
+      try {
+        const { data: existingDup } = await sb
+          .from('timesheet_entries')
+          .select('*')
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .eq('client_event_id', evtId)
+          .maybeSingle();
+        if (existingDup) {
+          return ok(res, {
+            id: existingDup.id,
+            organizationId: existingDup.organization_id,
+            userId: existingDup.user_id,
+            date: existingDup.date,
+            projectId: existingDup.project_id,
+            projectName: existingDup.project_name || '',
+            hours: Number(existingDup.hours || 0),
+            description: existingDup.description || '',
+            billable: Boolean(existingDup.billable ?? true),
+            status: existingDup.status,
+            taskId: existingDup.task_id || undefined,
+            startTime: existingDup.start_time || undefined,
+            endTime: existingDup.end_time || undefined,
+            durationMinutes: Number(existingDup.duration_minutes || 0),
+            durationSeconds,
+            clientEventId: existingDup.client_event_id || evtId,
+            source: existingDup.source || source,
+          }, 'Timer stopped (already saved)');
+        }
+      } catch {
+        /* ignore if client_event_id not migrated */
+      }
+    }
+
+    // Validate task hours cap & daily cap
+    let cappedHours = hours;
+    let cappedMins = durationMinutes;
+    let matchedTaskRow: any = null;
+    let existingTaskHours = 0;
+
+    if (sb) {
+      const { data: dayEntries } = await sb
+        .from('timesheet_entries')
+        .select('id, hours')
+        .eq('organization_id', orgId)
+        .eq('user_id', userId)
+        .eq('date', entryDate);
+      const dayExisting = (dayEntries || []).reduce((s: number, r: any) => s + Number(r.hours || 0), 0);
+      const dayRem = Math.max(0, Math.round((8.0 - dayExisting) * 100) / 100);
+      if (dayRem <= 0) {
+        return fail(res, 400, `Daily limit of 8 hours already reached on ${entryDate}.`);
+      }
+      if (cappedHours > dayRem) {
+        cappedHours = dayRem;
+        cappedMins = Math.max(1, Math.round(cappedHours * 60));
+      }
+
+      if (taskId || description?.trim()) {
+        const [{ data: projTasks }, { data: projTs }] = await Promise.all([
+          sb.from('project_tasks').select('*').eq('organization_id', orgId).eq('project_id', projectId),
+          sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status').eq('organization_id', orgId).eq('project_id', projectId),
+        ]);
+        const taskList = projTasks || [];
+        matchedTaskRow =
+          (taskId && taskList.find((t: any) => String(t.id) === String(taskId))) ||
+          taskList.find((t: any) => String(t.title || '').trim().toLowerCase() === String(description || '').trim().toLowerCase());
+
+        if (matchedTaskRow) {
+          const check = validateTaskHoursAllocation(matchedTaskRow, projTs || [], cappedHours);
+          existingTaskHours = check.existingHours;
+          if (!check.ok) {
+            if (check.remainingHours > 0) {
+              cappedHours = check.remainingHours;
+              cappedMins = Math.max(1, Math.round(cappedHours * 60));
+            } else {
+              return fail(res, 400, check.error);
+            }
+          }
+        }
+      }
+    }
+
+    let effectiveCostPerHour = 50;
+    if (sb) {
+      try {
+        const { data: memberCostData } = await sb
+          .from('organization_members')
+          .select('fixed_salary, hourly_rate, hours_per_day, working_days_per_month')
+          .eq('organization_id', orgId)
+          .eq('user_id', userId)
+          .maybeSingle();
+        const baseSalary = Number(memberCostData?.fixed_salary || 0);
+        const hourlyRateVal = Number(memberCostData?.hourly_rate || 0);
+        const hoursPerDay = Number(memberCostData?.hours_per_day || 8);
+        const daysPerMonth = Number(memberCostData?.working_days_per_month || 20);
+        const capacityHours = (hoursPerDay > 0 && daysPerMonth > 0) ? (hoursPerDay * daysPerMonth) : 160;
+        effectiveCostPerHour = baseSalary > 0
+          ? Math.round((baseSalary / capacityHours) * 100) / 100
+          : (hourlyRateVal > 0 ? hourlyRateVal : 50);
+      } catch { /* ignore */ }
+    }
+
+    const effectiveCostPerMinute = Math.round((effectiveCostPerHour / 60) * 10000) / 10000;
+    const calculatedLaborCost = Math.round(cappedHours * effectiveCostPerHour * 100) / 100;
+    const entryId = `ts_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const resolvedTaskId = taskId || matchedTaskRow?.id || undefined;
+
+    const entry: TimesheetEntry = {
+      id: entryId,
+      organizationId: orgId,
+      userId,
+      date: entryDate,
+      projectId,
+      projectName: projectName || '',
+      hours: cappedHours,
+      description: String(description || 'Timer entry').trim(),
+      billable: Boolean(billable),
+      status: 'draft',
+      taskId: resolvedTaskId,
+      startTime: startTimeStr,
+      endTime: endTimeStr,
+      durationMinutes: cappedMins,
+      durationSeconds,
+      clientEventId: evtId,
+      source: source as any,
+      effectiveCostPerHour,
+      effectiveCostPerMinute,
+      calculatedLaborCost,
+    };
+
+    if (sb) {
+      const dbRow: Record<string, any> = {
+        id: entry.id,
+        organization_id: orgId,
+        user_id: userId,
+        date: entry.date,
+        project_id: entry.projectId,
+        project_name: entry.projectName,
+        hours: entry.hours,
+        description: entry.description,
+        billable: entry.billable,
+        status: entry.status,
+        task_id: resolvedTaskId || null,
+        start_time: startTimeStr,
+        end_time: endTimeStr,
+        duration_minutes: cappedMins,
+        effective_cost_per_hour: effectiveCostPerHour,
+        effective_cost_per_minute: effectiveCostPerMinute,
+        calculated_labor_cost: calculatedLaborCost,
+        client_event_id: evtId,
+        source,
+      };
+      const { error: upsertErr } = await sb.from('timesheet_entries').upsert(dbRow);
+      if (upsertErr) {
+        delete dbRow.client_event_id;
+        delete dbRow.source;
+        await sb.from('timesheet_entries').upsert(dbRow);
+      }
+
+      if (resolvedTaskId && matchedTaskRow) {
+        try {
+          const updatedLogged = Math.round((existingTaskHours + cappedHours) * 100) / 100;
+          await sb.from('project_tasks').update({
+            logged_hours: updatedLogged,
+            status: matchedTaskRow.status === 'todo' ? 'in_progress' : matchedTaskRow.status,
+            updated_at: new Date().toISOString(),
+          }).eq('id', resolvedTaskId);
+        } catch { /* ignore */ }
+      }
+    }
+
+    return created(res, entry, `Saved ${cappedHours}h (${startTimeStr} – ${endTimeStr})`);
   });
 
 
@@ -1333,14 +1847,13 @@ export function createEmployeeMeRouter(): Router {
 
     const effectiveCostPerMinute = Math.round((effectiveCostPerHour / 60) * 10000) / 10000;
 
-    // Check existing hours for these dates to enforce daily 8h cap
+    // Check existing hours for these dates to enforce daily 8h cap + task allocated hours cap
     const dates = Array.from(new Set(entries.map(e => e.date)));
-    const { data: existingDayEntries } = await sb
-      .from('timesheet_entries')
-      .select('id, date, hours')
-      .eq('organization_id', orgId)
-      .eq('user_id', userId)
-      .in('date', dates);
+    const [{ data: existingDayEntries }, { data: orgTasks }, { data: orgTaskTs }] = await Promise.all([
+      sb.from('timesheet_entries').select('id, date, hours').eq('organization_id', orgId).eq('user_id', userId).in('date', dates),
+      sb.from('project_tasks').select('*').eq('organization_id', orgId),
+      sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status').eq('organization_id', orgId),
+    ]);
 
     const existingHoursMap = new Map<string, number>();
     (existingDayEntries || []).forEach((row: any) => {
@@ -1348,6 +1861,7 @@ export function createEmployeeMeRouter(): Router {
       existingHoursMap.set(d, (existingHoursMap.get(d) || 0) + Number(row.hours || 0));
     });
 
+    const runningTsList = [...(orgTaskTs || [])];
     const createdEntries: any[] = [];
     for (const item of entries) {
       const hrs = Number(item.hours || 0);
@@ -1356,10 +1870,24 @@ export function createEmployeeMeRouter(): Router {
       if (currentDayTotal + hrs > 8.0) {
         continue; // Skip or cap at 8h
       }
+
+      // Check task cap if linked to a task
+      const linkedTask = (orgTasks || []).find((t: any) =>
+        ((item as any).taskId && String(t.id) === String((item as any).taskId)) ||
+        (t.project_id === item.projectId && String(t.title || '').trim().toLowerCase() === String(item.description || '').trim().toLowerCase())
+      );
+      if (linkedTask) {
+        const taskCheck = validateTaskHoursAllocation(linkedTask, runningTsList, hrs);
+        if (!taskCheck.ok) {
+          continue; // Skip entry that would exceed task's allocated hours
+        }
+      }
+
       existingHoursMap.set(item.date, currentDayTotal + hrs);
 
       const entryId = (item as any).id || `ts_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
       const calculatedLaborCost = Math.round(hrs * effectiveCostPerHour * 100) / 100;
+      const resolvedTaskId = (item as any).taskId || linkedTask?.id || null;
 
       const dbRow = {
         id: entryId,
@@ -1372,7 +1900,8 @@ export function createEmployeeMeRouter(): Router {
         description: item.description || '',
         billable: item.billable ?? true,
         status: item.status || 'draft',
-        task_id: (item as any).taskId || null,
+        task_id: resolvedTaskId,
+        duration_minutes: Math.round(hrs * 60),
         effective_cost_per_hour: effectiveCostPerHour,
         effective_cost_per_minute: effectiveCostPerMinute,
         calculated_labor_cost: calculatedLaborCost,
@@ -1381,18 +1910,18 @@ export function createEmployeeMeRouter(): Router {
       const { error: insertErr } = await sb.from('timesheet_entries').upsert(dbRow);
       if (!insertErr) {
         createdEntries.push(dbRow);
-        if ((item as any).taskId) {
+        runningTsList.push(dbRow);
+        if (resolvedTaskId && linkedTask) {
           try {
-            const { data: tRow } = await sb.from('project_tasks').select('logged_hours, status').eq('id', (item as any).taskId).maybeSingle();
-            if (tRow) {
-              const updatedLogged = Number(tRow.logged_hours || 0) + hrs;
-              const updatedStatus = tRow.status === 'todo' ? 'in_progress' : tRow.status;
-              await sb.from('project_tasks').update({
-                logged_hours: updatedLogged,
-                status: updatedStatus,
-                updated_at: new Date().toISOString()
-              }).eq('id', (item as any).taskId);
-            }
+            const totalForTask = runningTsList
+              .filter((r: any) => doesEntryMatchTask(r, linkedTask))
+              .reduce((s: number, r: any) => s + Number(r.hours || 0), 0);
+            const updatedStatus = linkedTask.status === 'todo' ? 'in_progress' : linkedTask.status;
+            await sb.from('project_tasks').update({
+              logged_hours: Math.round(totalForTask * 100) / 100,
+              status: updatedStatus,
+              updated_at: new Date().toISOString()
+            }).eq('id', resolvedTaskId);
           } catch {
             /* ignore non-fatal */
           }
@@ -2492,34 +3021,22 @@ export function createEmployeeMeRouter(): Router {
       try {
         const [
           { data: tasks, error: tErr },
-          { data: projects, error: pErr },
+          { data: projects },
+          { data: tsRows },
         ] = await Promise.all([
           sb.from('project_tasks').select('*').eq('organization_id', orgId).order('created_at', { ascending: false }),
           sb.from('projects').select('id, name, client_name').eq('organization_id', orgId),
+          sb.from('timesheet_entries').select('id, project_id, task_id, description, hours, status, date').eq('organization_id', orgId),
         ]);
 
         if (!tErr && tasks) {
           const projMap = new Map((projects || []).map((p: any) => [p.id, p]));
           // Filter to tasks assigned to this user OR unassigned on user's projects
           const filtered = tasks.filter((t: any) => !t.assigned_to || t.assigned_to === userId);
-          const mapped = filtered.map((t: any) => ({
-            id: String(t.id),
-            organizationId: String(t.organization_id),
-            projectId: String(t.project_id),
-            projectName: projMap.get(t.project_id)?.name || '',
-            title: String(t.title ?? ''),
-            description: String(t.description ?? ''),
-            assignedTo: t.assigned_to ? String(t.assigned_to) : undefined,
-            assignedToName: t.assigned_to_name ? String(t.assigned_to_name) : undefined,
-            status: t.status || 'todo',
-            priority: t.priority || 'medium',
-            estimatedHours: Number(t.estimated_hours ?? 0),
-            loggedHours: Number(t.logged_hours ?? 0),
-            startDate: t.start_date || undefined,
-            dueDate: t.due_date || undefined,
-            createdAt: t.created_at || undefined,
-            updatedAt: t.updated_at || undefined,
-          }));
+          const mapped = filtered.map((t: any) => {
+            const projName = projMap.get(t.project_id)?.name || '';
+            return reconcileTask({ ...t, projectName: projName }, tsRows || []);
+          });
           return ok(res, mapped);
         }
       } catch (err) {
