@@ -2,14 +2,13 @@
  * Project Service
  * ================
  * CRUD for client projects with profitability calculations.
- *
- * When `VITE_API_BASE_URL` is set, uses org-scoped REST routes; otherwise `dataStore`.
+ * Uses org-scoped REST routes (backed by Supabase PostgreSQL) and direct Supabase fallback.
  */
 
 import { Project, Transaction, ProjectTask } from '@/services/types';
 import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/apiClient';
 import { getSupabaseClient } from '@/lib/supabaseClient';
-import { dataStore, generateId, simulateDelay } from './dataStore';
+import { dataStore } from './dataStore';
 import { reconcileTask, buildAutoCloseDescription, todayYmdLocal } from '@/lib/taskReconciler';
 import { isValidProjectTransaction, isDirectProjectDebit } from '@/lib/projectTransactionFilter';
 import type { ServiceResponse, ProjectProfitability } from './types';
@@ -24,6 +23,10 @@ function requireOrg<T>(organizationId: string): ServiceResponse<T> | null {
   return null;
 }
 
+function backendUnavailable<T>(message = 'Backend API and Supabase client are unavailable'): ServiceResponse<T> {
+  return { success: false, data: null as unknown as T, error: message };
+}
+
 export const projectService = {
   async getAll(organizationId: string): Promise<ServiceResponse<Project[]>> {
     if (isHttpBackendConfigured()) {
@@ -31,10 +34,7 @@ export const projectService = {
       if (err) return err;
       return apiGet<Project[]>(PROJ(organizationId));
     }
-
-    await simulateDelay();
-    const projects = dataStore.projects.filter(p => p.organizationId === organizationId);
-    return { success: true, data: projects };
+    return backendUnavailable<Project[]>();
   },
 
   async getById(id: string, organizationId?: string): Promise<ServiceResponse<Project | null>> {
@@ -44,10 +44,7 @@ export const projectService = {
         : `/projects/${encodeURIComponent(id)}`;
       return apiGet<Project | null>(path);
     }
-
-    await simulateDelay(80);
-    const project = dataStore.projects.find(p => p.id === id) || null;
-    return { success: !!project, data: project };
+    return backendUnavailable<Project | null>();
   },
 
   async create(
@@ -63,12 +60,7 @@ export const projectService = {
       }
       return res;
     }
-
-    await simulateDelay(200);
-    const newProject: Project = { ...data, id: generateId('proj'), organizationId };
-    dataStore.projects.push(newProject);
-    dataStore.notify('projects');
-    return { success: true, data: newProject, message: 'Project created' };
+    return backendUnavailable<Project>();
   },
 
   async update(
@@ -86,13 +78,7 @@ export const projectService = {
       }
       return res;
     }
-
-    await simulateDelay(150);
-    const idx = dataStore.projects.findIndex(p => p.id === id);
-    if (idx === -1) return { success: false, data: null as any, error: 'Project not found' };
-    dataStore.projects[idx] = { ...dataStore.projects[idx], ...updates };
-    dataStore.notify('projects');
-    return { success: true, data: dataStore.projects[idx] };
+    return backendUnavailable<Project>();
   },
 
   async delete(id: string, organizationId?: string): Promise<ServiceResponse<null>> {
@@ -106,13 +92,7 @@ export const projectService = {
       }
       return res;
     }
-
-    await simulateDelay(150);
-    const idx = dataStore.projects.findIndex(p => p.id === id);
-    if (idx === -1) return { success: false, data: null, error: 'Project not found' };
-    dataStore.projects.splice(idx, 1);
-    dataStore.notify('projects');
-    return { success: true, data: null, message: 'Project deleted' };
+    return backendUnavailable<null>();
   },
 
   async getProfitability(
@@ -268,93 +248,7 @@ export const projectService = {
       console.warn('[projectService.getProfitability] Direct Supabase error:', e);
     }
 
-    await simulateDelay();
-
-    // Calculate date range for filtering
-    let fromDate: string;
-    let toDate: string;
-
-    if (params?.period) {
-      const now = new Date();
-      toDate = now.toISOString().slice(0, 10);
-      const daysBack = params.period === '1M' ? 30 : params.period === '3M' ? 90 : 365;
-      const fromDateObj = new Date(now);
-      fromDateObj.setDate(fromDateObj.getDate() - daysBack);
-      fromDate = fromDateObj.toISOString().slice(0, 10);
-    } else {
-      fromDate = params?.from || (() => {
-        const d = new Date();
-        d.setDate(d.getDate() - 90);
-        return d.toISOString().slice(0, 10);
-      })();
-      toDate = params?.to || new Date().toISOString().slice(0, 10);
-    }
-
-    const projects = dataStore.projects.filter(p => p.organizationId === organizationId);
-    const orgTxns = dataStore.transactions.filter(t =>
-      t.organizationId === organizationId &&
-      isValidProjectTransaction(t, fromDate, toDate)
-    );
-
-    const profitability: ProjectProfitability[] = projects.map(proj => {
-      const projTxns = orgTxns.filter(t => t.projectId === proj.id);
-      const revenue = projTxns
-        .filter(t => t.type === 'credit')
-        .reduce((sum, t) => sum + Number(t.amount || 0), 0);
-      const costs = projTxns
-        .filter(t => isDirectProjectDebit(t))
-        .reduce((sum, t) => sum + Math.abs(Number(t.amount || 0)), 0);
-
-      const projTs = dataStore.timesheets.filter(t => t.organizationId === organizationId && t.projectId === proj.id);
-      const loggedHours = projTs.reduce((sum, t) => sum + Number(t.hours || 0), 0);
-      const contributorCount = new Set(projTs.map(t => t.userId)).size;
-
-      const laborCost = projTs
-        .filter(t => t.status === 'approved')
-        .reduce((sum, t) => {
-          const member = (dataStore as any).organizationMembers?.find((m: any) => m.userId === t.userId);
-          const rate = Number(member?.hourlyRate || member?.hourly_rate || (member?.fixedSalary ? member.fixedSalary / 160 : 50));
-          return sum + (Number(t.hours || 0) * (rate > 0 ? rate : 50));
-        }, 0);
-
-      const directCost = costs;
-      const totalCosts = Math.round((directCost + laborCost) * 100) / 100;
-      const recognizedRevenue = revenue;
-      const operatingProfit = Math.round((recognizedRevenue - totalCosts) * 100) / 100;
-      const directCosts = Math.round((directCost + laborCost) * 100) / 100;
-      const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
-      const profitMargin = recognizedRevenue > 0 ? Math.round(((operatingProfit / recognizedRevenue) * 100) * 10) / 10 : 0;
-      const budgetVariance = proj.quotedAmount > 0
-        ? Math.round((((totalCosts - proj.quotedAmount) / proj.quotedAmount) * 100) * 10) / 10
-        : 0;
-      const costToComplete = Math.max(0, proj.quotedAmount - totalCosts);
-      const projectedAtCompletion = totalCosts + costToComplete;
-      const marginAtRisk = Math.round((proj.quotedAmount - projectedAtCompletion) * 100) / 100;
-
-      return {
-        projectId: proj.id,
-        projectName: proj.name,
-        clientName: proj.clientName,
-        quotedAmount: proj.quotedAmount,
-        actualCost: totalCosts,
-        revenue: recognizedRevenue,
-        profit: operatingProfit,
-        profitMargin,
-        status: proj.status,
-        budgetVariance,
-        loggedHours: Math.round(loggedHours * 100) / 100,
-        contributorCount,
-        directCost: Math.round(directCost * 100) / 100,
-        laborCost: Math.round(laborCost * 100) / 100,
-        projectContribution,
-        operatingProfit,
-        costToComplete: Math.round(costToComplete * 100) / 100,
-        projectedAtCompletion: Math.round(projectedAtCompletion * 100) / 100,
-        marginAtRisk,
-      };
-    });
-
-    return { success: true, data: profitability };
+    return backendUnavailable<ProjectProfitability[]>();
   },
 
   async getProjectTransactions(
@@ -369,12 +263,7 @@ export const projectService = {
       }
       return apiGet<Transaction[]>(`/projects/${encodeURIComponent(projectId)}/transactions`);
     }
-
-    await simulateDelay();
-    const txns = dataStore.transactions.filter(
-      t => t.projectId === projectId && (!organizationId || t.organizationId === organizationId),
-    );
-    return { success: true, data: txns };
+    return backendUnavailable<Transaction[]>();
   },
 
   async getProjectDetails(
@@ -393,72 +282,7 @@ export const projectService = {
         `${PROJ(organizationId)}/${encodeURIComponent(projectId)}/profitability-details${qs}`,
       );
     }
-
-    await simulateDelay();
-
-    // Fallback: fetch project and transactions from dataStore
-    const project = dataStore.projects.find(
-      p => p.id === projectId && p.organizationId === organizationId
-    );
-
-    if (!project) {
-      return { success: false, data: null, error: 'Project not found' };
-    }
-
-    const txns = dataStore.transactions.filter(
-      t => t.projectId === projectId &&
-        t.organizationId === organizationId &&
-        t.status !== 'pending'
-    );
-
-    const income = txns.filter(t => t.type === 'credit');
-    const expenses = txns.filter(t => t.type === 'debit');
-
-    const totalRevenue = income.reduce((sum, t) => sum + t.amount, 0);
-    const totalCosts = expenses.reduce((sum, t) => sum + Math.abs(t.amount), 0);
-    const netProfit = totalRevenue - totalCosts;
-    const varianceAmount = totalCosts - project.quotedAmount;
-    const variancePct = project.quotedAmount > 0
-      ? (varianceAmount / project.quotedAmount) * 100
-      : 0;
-
-    return {
-      success: true,
-      data: {
-        project,
-        income,
-        expenses,
-        contributors: [],
-        timesheetEntries: [],
-        timeline: {
-          startDate: project.startDate,
-          endDate: project.endDate,
-          daysElapsed: 1,
-          daysRemaining: 0,
-          completionPct: 0,
-        },
-        summary: {
-          quotedAmount: project.quotedAmount,
-          initialBaselineCost: 0,
-          directExpenses: totalCosts,
-          laborCost: 0,
-          assignedOverhead: 0,
-          actualProjectCost: totalCosts,
-          consumedBurn: totalCosts,
-          burnRatePerDay: totalCosts,
-          recognizedRevenue: totalRevenue || project.quotedAmount,
-          projectContribution: totalRevenue - totalCosts,
-          projectOperatingProfit: netProfit,
-          projectMarginPercent: variancePct,
-          costToComplete: Math.max(0, project.quotedAmount - totalCosts),
-          projectedAtCompletion: project.quotedAmount,
-          marginAtRisk: 0,
-          totalLoggedHours: 0,
-          totalApprovedHours: 0,
-          contributorCount: 0,
-        },
-      },
-    };
+    return backendUnavailable<any>();
   },
 
   async approveTimesheetEntry(
@@ -598,14 +422,7 @@ export const projectService = {
       console.warn('[projectService.approveTimesheetEntry] Supabase fallback warning:', err);
     }
 
-    await simulateDelay(100);
-    const ts = dataStore.timesheets.find(t => t.id === entryId);
-    if (ts) {
-      ts.status = 'approved';
-      (ts as any).approvedAt = new Date().toISOString();
-      dataStore.notify('timesheets');
-    }
-    return { success: true, data: ts, message: 'Timesheet approved' };
+    return backendUnavailable<any>();
   },
 
   async reviseTimesheetEntry(
@@ -621,22 +438,7 @@ export const projectService = {
         { newHours, reason },
       );
     }
-    await simulateDelay(100);
-    const ts = dataStore.timesheets.find(t => t.id === entryId);
-    if (ts) {
-      const prevHours = ts.hours;
-      ts.hours = newHours;
-      const hist = (ts as any).revisionHistory || [];
-      hist.push({
-        previousHours: prevHours,
-        newHours,
-        revisedAt: new Date().toISOString(),
-        reason: reason || 'Manager revision',
-      });
-      (ts as any).revisionHistory = hist;
-      dataStore.notify('timesheets');
-    }
-    return { success: true, data: ts, message: 'Timesheet revised' };
+    return backendUnavailable<any>();
   },
 
   async rejectTimesheetEntry(
@@ -651,14 +453,7 @@ export const projectService = {
         { reason },
       );
     }
-    await simulateDelay(100);
-    const ts = dataStore.timesheets.find(t => t.id === entryId);
-    if (ts) {
-      ts.status = 'draft';
-      (ts as any).rejectionReason = reason || 'Rejected';
-      dataStore.notify('timesheets');
-    }
-    return { success: true, data: ts, message: 'Timesheet rejected' };
+    return backendUnavailable<any>();
   },
 
   async getTasks(organizationId: string, projectId: string): Promise<ServiceResponse<ProjectTask[]>> {
@@ -684,9 +479,7 @@ export const projectService = {
       console.warn('[projectService.getTasks] Supabase fallback error:', e);
     }
 
-    await simulateDelay();
-    const tasks = ((dataStore as any).tasks || []).filter((t: ProjectTask) => t.organizationId === organizationId && t.projectId === projectId);
-    return { success: true, data: tasks };
+    return backendUnavailable<ProjectTask[]>();
   },
 
   async createTask(
@@ -739,29 +532,7 @@ export const projectService = {
       console.warn('[projectService.createTask] Supabase fallback error:', e);
     }
 
-    await simulateDelay();
-    const newTask: ProjectTask = {
-      id: generateId('task'),
-      organizationId,
-      projectId,
-      title: taskData.title || 'New Task',
-      description: taskData.description || '',
-      assignedTo: taskData.assignedTo,
-      assignedToName: taskData.assignedToName,
-      status: taskData.status || 'todo',
-      priority: taskData.priority || 'medium',
-      estimatedHours: taskData.estimatedHours || 0,
-      loggedHours: taskData.loggedHours || 0,
-      startDate: taskData.startDate || todayStr,
-      dueDate: taskData.dueDate || todayStr,
-      createdAt: nowIso,
-      updatedAt: nowIso,
-    };
-    if (!(dataStore as any).tasks) (dataStore as any).tasks = [];
-    (dataStore as any).tasks.push(newTask);
-    dataStore.notify('projects');
-    dataStore.notify('project_tasks');
-    return { success: true, data: newTask };
+    return backendUnavailable<ProjectTask>();
   },
 
   async createTasksBatch(
@@ -806,43 +577,62 @@ export const projectService = {
           created_at: nowIso,
           updated_at: nowIso,
         }));
-        const { data, error } = await sb.from('project_tasks').insert(dbRows).select();
+        const { data: existingTasks } = await sb
+          .from('project_tasks')
+          .select('id, title, assigned_to, start_date, due_date')
+          .eq('organization_id', organizationId)
+          .eq('project_id', projectId);
+
+        const existingList = existingTasks || [];
+        const seenKeys = new Set<string>();
+        const rowsToInsert: typeof dbRows = [];
+        const skippedDays: string[] = [];
+
+        for (const row of dbRows) {
+          const rowDate = row.start_date || row.due_date;
+          const rowTitleKey = row.title.trim().toLowerCase();
+          const batchKey = `${rowDate}::${row.assigned_to || 'unassigned'}::${row.assigned_to ? '' : rowTitleKey}`;
+
+          const alreadyExists = seenKeys.has(batchKey) || existingList.some((ex: any) => {
+            const sameDay = ex.start_date === rowDate || ex.due_date === rowDate;
+            if (!sameDay) return false;
+            if (row.assigned_to) {
+              return String(ex.assigned_to || '') === String(row.assigned_to);
+            }
+            return String(ex.title || '').trim().toLowerCase() === rowTitleKey;
+          });
+
+          if (alreadyExists) {
+            skippedDays.push(rowDate);
+            continue;
+          }
+          seenKeys.add(batchKey);
+          rowsToInsert.push(row);
+        }
+
+        if (rowsToInsert.length === 0) {
+          return {
+            success: true,
+            data: [],
+            message: `No new tasks created — task(s) already exist for ${skippedDays.join(', ')}.`,
+          };
+        }
+
+        const { data, error } = await sb.from('project_tasks').insert(rowsToInsert).select();
         if (!error && data) {
           dataStore.notify('projects');
           dataStore.notify('project_tasks');
-          return { success: true, data: data.map((r: any) => reconcileTask(r, [])) };
+          const message = skippedDays.length > 0
+            ? `Assigned ${rowsToInsert.length} task(s); skipped ${skippedDays.length} existing day(s) (${skippedDays.join(', ')}).`
+            : `Assigned ${rowsToInsert.length} weekly tasks (Mon–Fri).`;
+          return { success: true, data: data.map((r: any) => reconcileTask(r, [])), message };
         }
       }
     } catch (e) {
       console.warn('[projectService.createTasksBatch] Supabase fallback error:', e);
     }
 
-    await simulateDelay();
-    if (!(dataStore as any).tasks) (dataStore as any).tasks = [];
-    const created: ProjectTask[] = valid.map((t) => {
-      const row: ProjectTask = {
-        id: generateId('task'),
-        organizationId,
-        projectId,
-        title: t.title!.trim(),
-        description: t.description?.trim() || '',
-        assignedTo: t.assignedTo,
-        assignedToName: t.assignedToName,
-        status: t.status || 'todo',
-        priority: t.priority || 'medium',
-        estimatedHours: Number(t.estimatedHours || 0),
-        loggedHours: Number(t.loggedHours || 0),
-        startDate: t.startDate || t.dueDate || todayStr,
-        dueDate: t.dueDate || t.startDate || todayStr,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-      };
-      (dataStore as any).tasks.push(row);
-      return row;
-    });
-    dataStore.notify('projects');
-    dataStore.notify('project_tasks');
-    return { success: true, data: created };
+    return backendUnavailable<ProjectTask[]>();
   },
 
   async updateTask(
@@ -891,16 +681,7 @@ export const projectService = {
       console.warn('[projectService.updateTask] Supabase fallback error:', e);
     }
 
-    await simulateDelay();
-    const tasks = (dataStore as any).tasks || [];
-    const idx = tasks.findIndex((t: ProjectTask) => t.id === taskId);
-    if (idx !== -1) {
-      tasks[idx] = { ...tasks[idx], ...updates, updatedAt: new Date().toISOString() };
-      dataStore.notify('projects');
-      dataStore.notify('project_tasks');
-      return { success: true, data: tasks[idx] };
-    }
-    return { success: false, data: null as any, error: 'Task not found' };
+    return backendUnavailable<ProjectTask>('Task not found');
   },
 
   async deleteTask(
@@ -919,13 +700,7 @@ export const projectService = {
       return res;
     }
 
-    await simulateDelay();
-    if ((dataStore as any).tasks) {
-      (dataStore as any).tasks = (dataStore as any).tasks.filter((t: ProjectTask) => t.id !== taskId);
-      dataStore.notify('projects');
-      dataStore.notify('project_tasks');
-    }
-    return { success: true, data: null };
+    return backendUnavailable<null>();
   },
 
 };

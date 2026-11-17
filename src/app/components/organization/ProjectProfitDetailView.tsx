@@ -175,17 +175,55 @@ export function ProjectProfitDetailView() {
     return base.map((t: any) => reconcileTask(t, timesheets, liveTodayStr));
   }, [rawProjectTasks, detailData?.tasks, timesheets, liveTodayStr]);
 
+  // Existing tasks mapped by weekday date (for Mon–Fri duplicate/conflict detection per §13 & §33.2)
+  const existingWeekTasksByDate = useMemo(() => {
+    const map = new Map<string, any[]>();
+    for (const d of currentWeekDays) {
+      const matches = projectTasks.filter((t: any) => {
+        const taskDate = t.startDate || t.dueDate || '';
+        const sameDay = taskDate === d.date || (t.dueDate && t.dueDate === d.date);
+        if (!sameDay) return false;
+        if (newTaskAssignee) {
+          return String(t.assignedTo || '') === String(newTaskAssignee);
+        }
+        return true;
+      });
+      if (matches.length > 0) {
+        map.set(d.date, matches);
+      }
+    }
+    return map;
+  }, [currentWeekDays, projectTasks, newTaskAssignee]);
+
+  useEffect(() => {
+    if (!showNewTaskModal || taskModalMode !== 'week') return;
+    setWeeklyPlanRows(prev =>
+      prev.map(row => ({
+        ...row,
+        enabled: !existingWeekTasksByDate.has(row.date),
+      })),
+    );
+  }, [showNewTaskModal, taskModalMode, newTaskAssignee, existingWeekTasksByDate]);
+
   const handleCreateTask = async () => {
     if (!projectId) return;
     const assigneeMember = members.find((m: any) => m.userId === newTaskAssignee || m.id === newTaskAssignee);
     const assigneeName = (assigneeMember as any)?.user?.name || (assigneeMember as any)?.name || 'Team Member';
 
     if (taskModalMode === 'week') {
-      const activeRows = weeklyPlanRows.filter(r => r.enabled && (r.title.trim() || newTaskTitle.trim()));
-      if (activeRows.length === 0) {
-        toast.error('Enter a task title for at least one weekday.');
+      const enabledWithTitles = weeklyPlanRows.filter(r => r.enabled && (r.title.trim() || newTaskTitle.trim()));
+      if (enabledWithTitles.length === 0) {
+        toast.error('Enter a task title for at least one available weekday.');
         return;
       }
+
+      const activeRows = enabledWithTitles.filter(r => !existingWeekTasksByDate.has(r.date));
+      const skippedLocally = enabledWithTitles.length - activeRows.length;
+      if (activeRows.length === 0) {
+        toast.info('All selected weekdays already have an existing task assigned. Uncheck or choose another day.');
+        return;
+      }
+
       setIsSubmittingTask(true);
       try {
         const batchPayload = activeRows.map(r => ({
@@ -200,7 +238,14 @@ export function ProjectProfitDetailView() {
         }));
         const res = await svc.projects.createTasksBatch(projectId, batchPayload);
         if (res.success) {
-          toast.success(`Assigned ${batchPayload.length} weekly tasks (Mon–Fri) automatically.`);
+          const createdCount = Array.isArray(res.data) ? res.data.length : batchPayload.length;
+          if (createdCount === 0) {
+            toast.info(res.message || 'Tasks already exist for the selected weekdays.');
+          } else if (skippedLocally > 0 && res.message && !res.message.includes('skipped')) {
+            toast.success(`Assigned ${createdCount} task(s); skipped ${skippedLocally} existing day(s).`);
+          } else {
+            toast.success(res.message || `Assigned ${createdCount} weekly tasks (Mon–Fri) automatically.`);
+          }
           setNewTaskTitle('');
           setWeeklyPlanRows(currentWeekWeekdays().map(d => ({ ...d, title: '', hours: '8', enabled: true })));
           setShowNewTaskModal(false);
@@ -1713,40 +1758,69 @@ export function ProjectProfitDetailView() {
                   </span>
                 </div>
                 <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                  {weeklyPlanRows.map((row, idx) => (
-                    <div key={row.date} className="grid grid-cols-12 gap-2 items-center p-2 rounded-lg bg-slate-900/70 border border-slate-800">
-                      <label className="col-span-3 flex items-center gap-2 text-xs font-mono text-slate-200 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={row.enabled}
-                          onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, enabled: e.target.checked } : r))}
-                          className="accent-purple-500"
-                        />
-                        <span>{row.day} <span className="text-cyan-300">{row.label}</span></span>
-                      </label>
-                      <input
-                        type="text"
-                        disabled={!row.enabled}
-                        value={row.title}
-                        onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, title: e.target.value } : r))}
-                        placeholder={newTaskTitle.trim() ? `${newTaskTitle.trim()} (${row.day})` : `${row.day} task title...`}
-                        className="col-span-6 px-2.5 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs disabled:opacity-40"
-                      />
-                      <div className="col-span-3 flex items-center gap-1">
-                        <input
-                          type="number"
-                          min="0.5"
-                          max="8"
-                          step="0.5"
-                          disabled={!row.enabled}
-                          value={row.hours}
-                          onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, hours: e.target.value } : r))}
-                          className="w-full px-2 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs font-mono disabled:opacity-40"
-                        />
-                        <span className="text-[10px] text-slate-400 font-mono">h</span>
+                  {weeklyPlanRows.map((row, idx) => {
+                    const existingForDay = existingWeekTasksByDate.get(row.date) || [];
+                    const hasExisting = existingForDay.length > 0;
+                    return (
+                      <div
+                        key={row.date}
+                        className={`p-2 rounded-lg border ${
+                          hasExisting
+                            ? 'bg-amber-950/20 border-amber-500/30'
+                            : 'bg-slate-900/70 border-slate-800'
+                        }`}
+                      >
+                        <div className="grid grid-cols-12 gap-2 items-center">
+                          <label className="col-span-3 flex items-center gap-2 text-xs font-mono text-slate-200 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={row.enabled}
+                              disabled={hasExisting}
+                              onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, enabled: e.target.checked } : r))}
+                              className="accent-purple-500 disabled:opacity-40"
+                            />
+                            <span>{row.day} <span className="text-cyan-300">{row.label}</span></span>
+                          </label>
+                          <input
+                            type="text"
+                            disabled={!row.enabled || hasExisting}
+                            value={row.title}
+                            onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, title: e.target.value } : r))}
+                            placeholder={
+                              hasExisting
+                                ? 'Already assigned on this day'
+                                : (newTaskTitle.trim() ? `${newTaskTitle.trim()} (${row.day})` : `${row.day} task title...`)
+                            }
+                            className="col-span-6 px-2.5 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs disabled:opacity-40"
+                          />
+                          <div className="col-span-3 flex items-center gap-1">
+                            <input
+                              type="number"
+                              min="0.5"
+                              max="8"
+                              step="0.5"
+                              disabled={!row.enabled || hasExisting}
+                              value={row.hours}
+                              onChange={e => setWeeklyPlanRows(prev => prev.map((r, i) => i === idx ? { ...r, hours: e.target.value } : r))}
+                              className="w-full px-2 py-1.5 rounded bg-slate-950/80 border border-slate-700 text-white text-xs font-mono disabled:opacity-40"
+                            />
+                            <span className="text-[10px] text-slate-400 font-mono">h</span>
+                          </div>
+                        </div>
+                        {hasExisting && (
+                          <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-300 font-mono">
+                            <span>Existing task:</span>
+                            <span className="truncate font-semibold">
+                              {existingForDay.map((t: any) => `${t.title} (${Number(t.estimatedHours || 0)}h)`).join(', ')}
+                            </span>
+                            <span className="ml-auto text-[10px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 shrink-0">
+                              Skipped
+                            </span>
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

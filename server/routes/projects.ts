@@ -1678,9 +1678,55 @@ export function createProjectsRouter(): Router {
 
     if (sb) {
       try {
+        // §0.3 & §33.2: Backend-authoritative duplicate/idempotency check per day & assignee
+        const { data: existingTasks, error: existingErr } = await sb
+          .from('project_tasks')
+          .select('id, title, assigned_to, start_date, due_date')
+          .eq('organization_id', orgId)
+          .eq('project_id', projectId);
+
+        if (existingErr) {
+          console.warn('[projects.tasks.batch] Existing task lookup warning:', existingErr.message);
+        }
+
+        const existingList = existingTasks || [];
+        const seenBatchKeys = new Set<string>();
+        const rowsToInsert: typeof dbRows = [];
+        const skippedDays: string[] = [];
+
+        for (const row of dbRows) {
+          const rowDate = row.start_date || row.due_date;
+          const rowTitleKey = row.title.trim().toLowerCase();
+          const batchKey = `${rowDate}::${row.assigned_to || 'unassigned'}::${row.assigned_to ? '' : rowTitleKey}`;
+
+          const alreadyExists = seenBatchKeys.has(batchKey) || existingList.some((ex: any) => {
+            const sameDay = ex.start_date === rowDate || ex.due_date === rowDate;
+            if (!sameDay) return false;
+            if (row.assigned_to) {
+              return String(ex.assigned_to || '') === String(row.assigned_to);
+            }
+            return String(ex.title || '').trim().toLowerCase() === rowTitleKey;
+          });
+
+          if (alreadyExists) {
+            skippedDays.push(rowDate);
+            continue;
+          }
+          seenBatchKeys.add(batchKey);
+          rowsToInsert.push(row);
+        }
+
+        if (rowsToInsert.length === 0) {
+          return ok(
+            res,
+            [],
+            `No new tasks created — task(s) already exist for ${skippedDays.join(', ')}.`,
+          );
+        }
+
         const { data, error } = await sb
           .from('project_tasks')
-          .insert(dbRows)
+          .insert(rowsToInsert)
           .select();
 
         if (error) {
@@ -1694,14 +1740,18 @@ export function createProjectsRouter(): Router {
             const { emitEmployeeTaskAssignmentNotification } = await import('./employee.js');
             await emitEmployeeTaskAssignmentNotification(sb, orgId, {
               ...firstAssigned,
-              title: `${dbRows.length} Weekly Tasks Assigned (starting ${firstAssigned.title})`,
+              title: `${rowsToInsert.length} Weekly Task(s) Assigned (starting ${firstAssigned.title})`,
             }, callerId(req));
           } catch (notifErr) {
             console.warn('[projects.tasks.batch] Notification warning:', notifErr);
           }
         }
 
-        return created(res, (data || []).map((row: any) => reconcileTask(row, [])));
+        const msg = skippedDays.length > 0
+          ? `Assigned ${rowsToInsert.length} task(s); skipped ${skippedDays.length} existing day(s) (${skippedDays.join(', ')}).`
+          : `Assigned ${rowsToInsert.length} weekly tasks (Mon–Fri).`;
+
+        return created(res, (data || []).map((row: any) => reconcileTask(row, [])), msg);
       } catch (err: any) {
         return fail(res, 500, err?.message || 'Database error');
       }
