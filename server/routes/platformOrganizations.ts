@@ -23,6 +23,13 @@ import type { RealtimeChannel } from '@supabase/supabase-js';
 import { ok, created, fail, notFound } from '../lib/http.js';
 import { getSupabaseAdminClient, isSupabaseAdminConfigured } from '../lib/supabaseAdmin.js';
 import { env } from '../config/env.js';
+import {
+  CANONICAL_DEFAULT_PLANS,
+  normalizeCanonicalPlanLimits,
+  resolvePlanByKeyOrId,
+  createOrUpdateOrgSubscription,
+  sweepExpiredSubscriptions,
+} from '../services/planEntitlementService.js';
 
 type Sb = NonNullable<ReturnType<typeof getSupabaseAdminClient>>;
 
@@ -59,15 +66,21 @@ export interface PlatformOrganization {
   };
 }
 
-/** Authoritative Plan catalogue default fallback (in PKR) covering all 6 Handoff §3.1 tiers. */
-export const DEFAULT_PLAN_CATALOGUE: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = {
-  free: { name: 'Free', price: 0, limits: { users: 2, statements: 25, currencies: 1 } },
-  starter: { name: 'Starter', price: 19900, limits: { users: 3, statements: 50, currencies: 2 } },
-  basic: { name: 'Basic', price: 29900, limits: { users: 5, statements: 100, currencies: 2 } },
-  professional: { name: 'Professional', price: 49900, limits: { users: 10, statements: 500, currencies: 5 } },
-  business: { name: 'Business', price: 79900, limits: { users: 25, statements: 1000, currencies: 8 } },
-  enterprise: { name: 'Enterprise', price: 99900, limits: { users: 50, statements: 2000, currencies: 10 } },
-};
+/** Authoritative Plan catalogue default fallback (in PKR) covering all 5 Handoff §32 tiers. */
+export const DEFAULT_PLAN_CATALOGUE: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = Object.fromEntries(
+  CANONICAL_DEFAULT_PLANS.map((p) => [
+    p.slug || p.id,
+    {
+      name: p.name,
+      price: p.price,
+      limits: {
+        users: p.limits.users,
+        statements: p.limits.statements,
+        currencies: p.limits.currencies ?? 2,
+      },
+    },
+  ]),
+);
 
 let cachedPlansCatalogue: Record<string, { name: string; price: number; limits: Omit<PlatformOrgLimits, 'usersUsed' | 'statementsUsed' | 'currenciesUsed'> }> = { ...DEFAULT_PLAN_CATALOGUE };
 let lastCatalogueFetch = 0;
@@ -83,14 +96,16 @@ export async function getAuthoritativePlanCatalogue(sb?: Sb): Promise<Record<str
     if (plans && plans.length > 0) {
       const catalogue: Record<string, any> = { ...DEFAULT_PLAN_CATALOGUE };
       for (const p of plans) {
+        if (p.id === 'plan-basic' || p.slug === 'basic') continue;
         const key = (p.slug || p.name || '').trim().toLowerCase();
+        const normalizedLimits = normalizeCanonicalPlanLimits(p.limits, key || 'free');
         catalogue[key] = {
           name: p.name,
           price: Number(p.price) || 0,
           limits: {
-            users: p.limits?.users ?? 5,
-            statements: p.limits?.statements ?? 100,
-            currencies: p.limits?.currencies ?? 2,
+            users: normalizedLimits.users,
+            statements: normalizedLimits.statements,
+            currencies: normalizedLimits.currencies ?? 2,
           },
         };
       }
@@ -105,16 +120,15 @@ export async function getAuthoritativePlanCatalogue(sb?: Sb): Promise<Record<str
 }
 
 function normalizePlanKey(value: unknown, catalogue: Record<string, any> = DEFAULT_PLAN_CATALOGUE): string {
-  const key = String(value ?? '').trim().toLowerCase();
-  if (!key) return 'free';
+  const key = String(value ?? '').trim().toLowerCase().replace(/^plan-/, '');
+  if (!key || key === 'basic') return 'free';
   if (key in catalogue) return key;
-  if (key === 'free') return 'free';
+  if (key === 'free' || key === 'free/trial') return 'free';
   if (key.startsWith('start')) return 'starter';
-  if (key.startsWith('basic')) return 'basic';
   if (key.startsWith('prof')) return 'professional';
   if (key.startsWith('bus')) return 'business';
   if (key.startsWith('ent')) return 'enterprise';
-  return 'free';
+  return key;
 }
 
 function resolveStatus(settings: Record<string, unknown>, createdAt: string, sub?: any): PlatformOrgStatus {
@@ -202,7 +216,7 @@ function toPlatformOrganization(
   const settings = (row.settings ?? {}) as Record<string, unknown>;
   const rawPlanKey = sub?.plan_slug || settings.plan;
   const planKey = normalizePlanKey(rawPlanKey, catalogue);
-  const plan = catalogue[planKey] || DEFAULT_PLAN_CATALOGUE.basic;
+  const plan = catalogue[planKey] || DEFAULT_PLAN_CATALOGUE.free;
   const currencies = stats.currenciesUsed.get(row.id) ?? new Set<string>();
   if (row.currency) currencies.add(row.currency);
 
@@ -247,6 +261,9 @@ function toPlatformOrganization(
 export async function loadPlatformOrganizations(sb?: Sb | null): Promise<PlatformOrganization[] | null> {
   const client = sb ?? getSupabaseAdminClient();
   if (!client) return null;
+
+  // Automatically switch any expired organizations to Free tier before loading
+  await sweepExpiredSubscriptions(client);
 
   const [orgsRes, subsRes, catalogue] = await Promise.all([
     client
@@ -466,12 +483,19 @@ export function createPlatformOrganizationsRouter(): Router {
     }
 
     const id = buildOrgId();
-    const planKey = normalizePlanKey(body.plan);
+    const catalogue = await getAuthoritativePlanCatalogue(sb);
+    const planKey = normalizePlanKey(body.plan, catalogue);
+    const resolvedPlan = await resolvePlanByKeyOrId(sb, body.plan || planKey);
+    const isFreePlan = (resolvedPlan.slug || planKey) === 'free' || Number(resolvedPlan.price) === 0;
     const settings = {
       theme: 'dark',
       notifications: true,
-      plan: planKey,
-      status: 'trial',
+      plan: resolvedPlan.slug || planKey,
+      planId: resolvedPlan.id,
+      planName: resolvedPlan.name,
+      planFeatures: resolvedPlan.features,
+      limits: resolvedPlan.limits,
+      status: isFreePlan ? 'trial' : 'active',
     };
 
     const { data: inserted, error } = await sb
@@ -493,6 +517,12 @@ export function createPlatformOrganizationsRouter(): Router {
       fail(res, 500, error?.message || 'Could not create the organization.');
       return;
     }
+
+    await createOrUpdateOrgSubscription(sb, {
+      orgId: id,
+      plan: resolvedPlan,
+      status: isFreePlan ? 'trialing' : 'active',
+    });
 
     let warning: string | undefined;
     const email = (body.adminEmail ?? '').trim();
@@ -567,28 +597,16 @@ export function createPlatformOrganizationsRouter(): Router {
     if (body.fiscalYearStart !== undefined) updates.fiscal_year_start = String(body.fiscalYearStart).trim();
 
     const settingsPatch: Record<string, unknown> = {};
+    let resolvedPlanForSub: Awaited<ReturnType<typeof resolvePlanByKeyOrId>> | null = null;
     if (body.plan !== undefined) {
-      const planKey = normalizePlanKey(body.plan);
-      settingsPatch.plan = planKey;
-
-      // Look up authoritative features from public.platform_plans
-      try {
-        const { data: pData } = await sb
-          .from('platform_plans')
-          .select('id, name, features, limits')
-          .or(`id.eq.${body.plan},slug.eq.${planKey}`)
-          .single();
-        if (pData) {
-          settingsPatch.planId = pData.id;
-          settingsPatch.planName = pData.name;
-          settingsPatch.planFeatures = pData.features;
-          if (pData.limits) {
-            settingsPatch.limits = pData.limits;
-          }
-        }
-      } catch (err) {
-        console.warn('[platform-orgs] Could not enrich plan features on update:', err);
-      }
+      const catalogue = await getAuthoritativePlanCatalogue(sb);
+      const planKey = normalizePlanKey(body.plan, catalogue);
+      resolvedPlanForSub = await resolvePlanByKeyOrId(sb, body.plan || planKey);
+      settingsPatch.plan = resolvedPlanForSub.slug || planKey;
+      settingsPatch.planId = resolvedPlanForSub.id;
+      settingsPatch.planName = resolvedPlanForSub.name;
+      settingsPatch.planFeatures = resolvedPlanForSub.features;
+      settingsPatch.limits = resolvedPlanForSub.limits;
     }
     if (body.status !== undefined) settingsPatch.status = body.status;
     if (body.settings !== undefined) Object.assign(settingsPatch, body.settings);
@@ -610,6 +628,15 @@ export function createPlatformOrganizationsRouter(): Router {
       console.error('[platform-orgs] update failed:', error.message);
       fail(res, 500, error.message);
       return;
+    }
+
+    if (resolvedPlanForSub) {
+      const isFreePlan = (resolvedPlanForSub.slug || '') === 'free' || Number(resolvedPlanForSub.price) === 0;
+      await createOrUpdateOrgSubscription(sb, {
+        orgId,
+        plan: resolvedPlanForSub,
+        status: isFreePlan ? 'trialing' : 'active',
+      });
     }
 
     const orgs = await loadPlatformOrganizations(sb);

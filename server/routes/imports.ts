@@ -179,6 +179,26 @@ export function createImportsRouter(): Router {
         return fail(res, 500, 'Supabase not configured');
       }
 
+      // Enforce Plan Statements, Storage & Transactions Quotas (§32)
+      const { checkOrgQuota } = await import('../services/planEntitlementService.js');
+      const statementsQuota = await checkOrgQuota(sb, orgId, 'statements', 1);
+      if (!statementsQuota.allowed) {
+        return fail(res, 403, statementsQuota.reason || 'Monthly statement import quota reached.');
+      }
+
+      const estimatedMb = fileContent ? Math.ceil(Buffer.byteLength(fileContent, 'utf-8') / (1024 * 1024)) : 0;
+      if (estimatedMb > 0) {
+        const storageQuota = await checkOrgQuota(sb, orgId, 'storage', estimatedMb);
+        if (!storageQuota.allowed) {
+          return fail(res, 403, storageQuota.reason || 'Storage quota exceeded.');
+        }
+      }
+
+      const txQuota = await checkOrgQuota(sb, orgId, 'transactions', rows.length);
+      if (!txQuota.allowed) {
+        return fail(res, 403, txQuota.reason || 'Monthly transaction quota exceeded.');
+      }
+
       // Slice 2: Fetch and verify target bank account (§10, §17, §33 #6, #8)
       const { data: bankRow, error: bankErr } = await sb
         .from('bank_accounts')

@@ -1129,38 +1129,22 @@ export async function checkOrgAiCreditsLimit(orgId: string): Promise<{
   planName: string;
 }> {
   const sb = getSupabaseAdminClient();
-  if (!sb) return { allowed: true, creditsUsed: 0, creditsQuota: 500, planName: 'Default' };
+  if (!sb) return { allowed: true, creditsUsed: 0, creditsQuota: 50, planName: 'Free/Trial' };
 
   try {
-    const { data: org } = await sb.from('organizations').select('id, name, plan, settings').eq('id', orgId).maybeSingle();
-    const rawPlan = org?.settings?.plan || org?.plan || 'basic';
-    const planSlug = String(rawPlan).toLowerCase().replace(/^plan-/, '');
-
-    const { data: planRow } = await sb.from('platform_plans').select('name, limits').eq('slug', planSlug).maybeSingle();
-    const creditsQuota = Number(planRow?.limits?.ai_credits ?? (planSlug === 'enterprise' ? 2500 : planSlug === 'professional' ? 500 : 100));
-    const planName = planRow?.name || planSlug;
-
-    const { data: statusRow } = await sb.from('org_ai_status').select('platform_requests_this_month').eq('organization_id', orgId).maybeSingle();
-    const creditsUsed = Number(statusRow?.platform_requests_this_month ?? 0);
-
-    if (creditsQuota > 0 && creditsUsed >= creditsQuota) {
-      return {
-        allowed: false,
-        reason: `Monthly AI credits quota reached (${creditsUsed}/${creditsQuota})`,
-        creditsUsed,
-        creditsQuota,
-        planName,
-      };
-    }
+    const { resolveAuthoritativeOrgPlan, checkOrgQuota } = await import('../services/planEntitlementService.js');
+    const { plan } = await resolveAuthoritativeOrgPlan(sb, orgId);
+    const quotaRes = await checkOrgQuota(sb, orgId, 'ai_credits', 1);
 
     return {
-      allowed: true,
-      creditsUsed,
-      creditsQuota,
-      planName,
+      allowed: quotaRes.allowed,
+      reason: quotaRes.reason,
+      creditsUsed: quotaRes.used,
+      creditsQuota: quotaRes.limit,
+      planName: plan.name || quotaRes.planName,
     };
   } catch {
-    return { allowed: true, creditsUsed: 0, creditsQuota: 500, planName: 'Default' };
+    return { allowed: true, creditsUsed: 0, creditsQuota: 50, planName: 'Free/Trial' };
   }
 }
 

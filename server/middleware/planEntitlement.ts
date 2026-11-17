@@ -2,12 +2,17 @@ import type { Request, Response, NextFunction } from 'express';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { fail } from '../lib/http.js';
 import { normalizeFeatureKey } from '../../src/config/planFeatures.js';
+import { resolveAuthoritativeOrgPlan } from '../services/planEntitlementService.js';
 
 export function requirePlanFeature(featureKey: string) {
   const normalizedRequired = normalizeFeatureKey(featureKey);
 
   return async (req: Request, res: Response, next: NextFunction) => {
-    const orgId = (req.params as any).organizationId || (req.params as any).orgId || (req.query as any).organizationId || (req.body as any)?.organizationId;
+    const orgId =
+      (req.params as any).organizationId ||
+      (req.params as any).orgId ||
+      (req.query as any).organizationId ||
+      (req.body as any)?.organizationId;
 
     // If no org ID in route params or query, permit or skip (global routes)
     if (!orgId) {
@@ -16,84 +21,27 @@ export function requirePlanFeature(featureKey: string) {
 
     const sb = getSupabaseAdminClient();
     if (!sb) {
-      return next(); // Fail-open in dev if DB is offline, or next
+      return next(); // Fail-open in dev if DB is offline
     }
 
     try {
-      const { data: org, error } = await sb
-        .from('organizations')
-        .select('id, name, settings')
-        .eq('id', orgId)
-        .single();
+      const { plan, orgSettings } = await resolveAuthoritativeOrgPlan(sb, String(orgId));
 
-      if (error || !org) {
-        return next();
-      }
+      // Prefer authoritative plan.features; fall back to orgSettings.planFeatures if present
+      const grantedFeatures: string[] =
+        Array.isArray(plan?.features) && plan.features.length > 0
+          ? plan.features
+          : Array.isArray(orgSettings?.planFeatures)
+            ? orgSettings.planFeatures
+            : ['statement_import'];
 
-      // Check features array in settings.planFeatures or look up plan
-      let grantedFeatures: string[] = org.settings?.planFeatures || [];
-
-      if (!grantedFeatures || grantedFeatures.length === 0) {
-        // Look up plan directly
-        const planSlug = org.settings?.plan || 'basic';
-        const planId = org.settings?.planId;
-
-        const { data: planData } = await sb
-          .from('platform_plans')
-          .select('features')
-          .or(`id.eq.${planId || ''},slug.eq.${planSlug}`)
-          .single();
-
-        if (planData && Array.isArray(planData.features)) {
-          grantedFeatures = planData.features;
-        } else if (planSlug === 'free' || planSlug === 'basic') {
-          grantedFeatures = ['statement_import'];
-        } else if (planSlug === 'starter') {
-          grantedFeatures = [
-            'statement_import',
-            'personal_finance',
-            'recurring_transactions',
-            'budget_alerts',
-          ];
-        } else if (planSlug === 'professional') {
-          grantedFeatures = [
-            'statement_import',
-            'personal_finance',
-            'recurring_transactions',
-            'budget_alerts',
-            'profit_intelligence',
-            'team_management',
-            'costing_engine',
-            'ai_assistant',
-          ];
-        } else if (planSlug === 'business') {
-          grantedFeatures = [
-            'statement_import',
-            'personal_finance',
-            'recurring_transactions',
-            'budget_alerts',
-            'profit_intelligence',
-            'team_management',
-            'costing_engine',
-            'ai_assistant',
-            'forecast_modeling',
-            'projects',
-            'assets',
-            'loans',
-            'reports',
-          ];
-        } else if (planSlug === 'enterprise') {
-          return next(); // Enterprise has all features
-        }
-      }
-
-      const normalizedGranted = (grantedFeatures || []).map(normalizeFeatureKey);
+      const normalizedGranted = grantedFeatures.map(normalizeFeatureKey);
 
       if (!normalizedGranted.includes(normalizedRequired)) {
         return fail(
           res,
-          `Access to ${featureKey} is restricted. Your organization's current plan does not include this feature. Upgrade in Settings → Billing to unlock it.`,
-          403
+          403,
+          `PLAN_FEATURE_RESTRICTED: Access to ${featureKey} is restricted. Your organization's ${plan?.name || 'current'} plan does not include this feature. Upgrade in Settings → Billing to unlock it.`,
         );
       }
 
@@ -104,4 +52,3 @@ export function requirePlanFeature(featureKey: string) {
     }
   };
 }
-

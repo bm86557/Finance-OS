@@ -22,10 +22,14 @@ export interface SubscriptionCycleDetails {
 export function calculateSubscriptionCycle(
   subscription: SubscriptionInfo | null | undefined,
   planPrice: number = 0,
-  planSlug: string = 'basic',
+  planSlug: string = 'free',
 ): SubscriptionCycleDetails {
-  // Free tier or no paid subscription
-  if (planPrice === 0 || planSlug === 'basic' || !subscription) {
+  const isTrialingFree =
+    subscription?.status === 'trialing' &&
+    Boolean(subscription?.current_period_end);
+
+  // Permanent free tier or no active subscription (unless in a 14-day trial)
+  if (!subscription || ((planPrice === 0 || planSlug === 'free' || planSlug === 'basic') && !isTrialingFree)) {
     return {
       hasActiveSubscription: false,
       daysRemaining: 0,

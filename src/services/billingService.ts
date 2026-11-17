@@ -44,6 +44,14 @@ export interface BillingUsage {
   currenciesUsed: number;
   storage: number;
   storageUsed: number;
+  aiCredits?: number;
+  aiCreditsUsed?: number;
+  transactions?: number;
+  transactionsUsed?: number;
+  bankAccounts?: number;
+  bankAccountsUsed?: number;
+  exports?: number;
+  exportsUsed?: number;
 }
 
 export interface BillingSummary {

@@ -242,16 +242,16 @@ export function OrganizationBillingSection() {
 
         {/* Live Usage Progress Meters */}
         {usage && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6 pt-6 border-t border-white/10">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mt-6 pt-6 border-t border-white/10">
             <div>
               <div className="flex justify-between text-xs font-mono mb-1.5">
                 <span className="text-slate-400">Team Seats</span>
-                <span className="text-white font-medium">{usage.usersUsed} / {usage.users}</span>
+                <span className="text-white font-medium">{usage.usersUsed} / {usage.users || 2}</span>
               </div>
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-cyan-400 rounded-full"
-                  style={{ width: `${Math.min(100, (usage.usersUsed / usage.users) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (usage.usersUsed / (usage.users || 1)) * 100)}%` }}
                 />
               </div>
             </div>
@@ -259,12 +259,25 @@ export function OrganizationBillingSection() {
             <div>
               <div className="flex justify-between text-xs font-mono mb-1.5">
                 <span className="text-slate-400">Statements / Mo</span>
-                <span className="text-white font-medium">{usage.statementsUsed} / {usage.statements}</span>
+                <span className="text-white font-medium">{usage.statementsUsed} / {usage.statements || 50}</span>
               </div>
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-blue-400 rounded-full"
-                  style={{ width: `${Math.min(100, (usage.statementsUsed / usage.statements) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (usage.statementsUsed / (usage.statements || 1)) * 100)}%` }}
+                />
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-xs font-mono mb-1.5">
+                <span className="text-slate-400">AI Credits / Mo</span>
+                <span className="text-white font-medium">{usage.aiCreditsUsed ?? 0} / {usage.aiCredits ?? 50}</span>
+              </div>
+              <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-amber-400 rounded-full"
+                  style={{ width: `${Math.min(100, ((usage.aiCreditsUsed ?? 0) / (usage.aiCredits || 1)) * 100)}%` }}
                 />
               </div>
             </div>
@@ -272,12 +285,12 @@ export function OrganizationBillingSection() {
             <div>
               <div className="flex justify-between text-xs font-mono mb-1.5">
                 <span className="text-slate-400">Currencies</span>
-                <span className="text-white font-medium">{usage.currenciesUsed} / {usage.currencies}</span>
+                <span className="text-white font-medium">{usage.currenciesUsed} / {usage.currencies || 2}</span>
               </div>
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-purple-400 rounded-full"
-                  style={{ width: `${Math.min(100, (usage.currenciesUsed / usage.currencies) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (usage.currenciesUsed / (usage.currencies || 1)) * 100)}%` }}
                 />
               </div>
             </div>
@@ -285,12 +298,12 @@ export function OrganizationBillingSection() {
             <div>
               <div className="flex justify-between text-xs font-mono mb-1.5">
                 <span className="text-slate-400">Storage</span>
-                <span className="text-white font-medium">{usage.storageUsed} / {usage.storage} MB</span>
+                <span className="text-white font-medium">{usage.storageUsed} / {usage.storage || 1024} MB</span>
               </div>
               <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-emerald-400 rounded-full"
-                  style={{ width: `${Math.min(100, (usage.storageUsed / usage.storage) * 100)}%` }}
+                  style={{ width: `${Math.min(100, (usage.storageUsed / (usage.storage || 1)) * 100)}%` }}
                 />
               </div>
             </div>

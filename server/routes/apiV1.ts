@@ -36,6 +36,12 @@ import {
   isPlatformUser,
 } from '../middleware/auth.js';
 import { loginRateLimiter } from '../middleware/rateLimit.js';
+import { requirePlanFeature } from '../middleware/planEntitlement.js';
+import {
+  resolveAuthoritativeOrgPlan,
+  createOrUpdateOrgSubscription,
+  getFreePlan,
+} from '../services/planEntitlementService.js';
 import { getSupabaseAdminClient, isSupabaseAdminConfigured, verifyUserCredentials } from '../lib/supabaseAdmin.js';
 
 import { createOrganizationsListRouter } from './organizationsList.js';
@@ -152,23 +158,18 @@ async function fetchOrganizationByIdOrSlug(
   }
   if (!orgRow) return null;
 
-  // Sync active subscription plan if present
+  // Sync active subscription plan & enforce expiration auto-downgrade
   try {
-    const { data: sub } = await sb
-      .from('organization_subscriptions')
-      .select('plan_id, plan_slug, status')
-      .eq('organization_id', orgRow.id)
-      .eq('status', 'active')
-      .maybeSingle();
-
-    if (sub && sub.plan_slug) {
-      const currentSettings = (orgRow as any).settings || {};
-      (orgRow as any).settings = {
-        ...currentSettings,
-        plan: sub.plan_slug,
-        planId: sub.plan_id || currentSettings.planId,
-      };
-    }
+    const { plan, orgSettings } = await resolveAuthoritativeOrgPlan(sb, orgRow.id);
+    (orgRow as any).settings = {
+      ...((orgRow as any).settings || {}),
+      ...orgSettings,
+      plan: plan.slug || 'free',
+      planId: plan.id,
+      planName: plan.name,
+      planFeatures: plan.features,
+      limits: plan.limits,
+    };
   } catch {
     /* non-critical */
   }
@@ -455,6 +456,34 @@ export function createApiV1Router(): Router {
         const rpcOut = (rpcResult ?? {}) as { success?: boolean; error?: string };
         if (!rpcOut.success) {
           return fail(res, 400, rpcOut.error || 'Could not create the organization.');
+        }
+
+        // Initialize Free/Trial 14-day subscription & plan settings
+        try {
+          const freePlan = await getFreePlan(sb);
+          await sb
+            .from('organizations')
+            .update({
+              settings: {
+                theme: 'dark',
+                notifications: true,
+                plan: freePlan.slug || 'free',
+                planId: freePlan.id,
+                planName: freePlan.name,
+                planFeatures: freePlan.features,
+                limits: freePlan.limits,
+                status: 'trial',
+              },
+            })
+            .eq('id', orgId);
+          await createOrUpdateOrgSubscription(sb, {
+            orgId,
+            plan: freePlan,
+            status: 'trialing',
+            durationDays: 14,
+          });
+        } catch {
+          /* non-critical */
         }
 
         organization = await fetchOrganizationByIdOrSlug(sb, orgId);
@@ -964,26 +993,26 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
   r.use('/organizations/:organizationId/bank-accounts', createBankAccountsRouter());
   r.use('/organizations/:organizationId/categories', createCategoriesRouter());
   r.use('/organizations/:organizationId/departments', createDepartmentsRouter());
-  r.use('/organizations/:organizationId/projects', createProjectsRouter());
-  r.use('/organizations/:organizationId/profit-intelligence', createProfitIntelligenceRouter());
-  r.use('/organizations/:organizationId/overhead-allocations', createOverheadAllocationsRouter());
-  r.use('/organizations/:organizationId/recurring-transactions', createRecurringRouter());
-  r.use('/organizations/:organizationId/assets', createAssetsRouter());
-  r.use('/organizations/:organizationId/inventory', createInventoryRouter());
-  r.use('/organizations/:organizationId/budgets', createBudgetsRouter());
-  r.use('/organizations/:organizationId/loans', createLoansRouter());
+  r.use('/organizations/:organizationId/projects', requirePlanFeature('projects'), createProjectsRouter());
+  r.use('/organizations/:organizationId/profit-intelligence', requirePlanFeature('profit_intelligence'), createProfitIntelligenceRouter());
+  r.use('/organizations/:organizationId/overhead-allocations', requirePlanFeature('profit_intelligence'), createOverheadAllocationsRouter());
+  r.use('/organizations/:organizationId/recurring-transactions', requirePlanFeature('recurring_transactions'), createRecurringRouter());
+  r.use('/organizations/:organizationId/assets', requirePlanFeature('assets'), createAssetsRouter());
+  r.use('/organizations/:organizationId/inventory', requirePlanFeature('inventory'), createInventoryRouter());
+  r.use('/organizations/:organizationId/budgets', requirePlanFeature('budget_alerts'), createBudgetsRouter());
+  r.use('/organizations/:organizationId/loans', requirePlanFeature('loans'), createLoansRouter());
   r.use('/organizations/:organizationId/reports', createReportsRouter());
-  r.use('/organizations/:organizationId/simulator', createSimulatorRouter());
+  r.use('/organizations/:organizationId/simulator', requirePlanFeature('simulator'), createSimulatorRouter());
   r.use('/organizations/:organizationId/classification', createClassificationRouter());
   r.use('/organizations/:organizationId/patterns', createPatternsRouter());
   r.use('/organizations/:organizationId/ai-classification', createAIClassificationRouter());
   r.use('/organizations/:organizationId/ai', createAIConfigRouter());
-  r.use('/organizations/:organizationId/ai-assistant', createAIAssistantRouter());
-  r.use('/organizations/:organizationId/imports', createImportsRouter());
+  r.use('/organizations/:organizationId/ai-assistant', requirePlanFeature('ai_assistant'), createAIAssistantRouter());
+  r.use('/organizations/:organizationId/imports', requirePlanFeature('statement_import'), createImportsRouter());
   r.use('/organizations/:organizationId/audit-logs', createAuditRouter());
   r.use('/organizations/:organizationId/me', createEmployeeMeRouter());
   r.use('/organizations/:organizationId', createCostingRouter());
-  r.use('/organizations/:organizationId/costing', createCostingRouter());
+  r.use('/organizations/:organizationId/costing', requirePlanFeature('costing_engine'), createCostingRouter());
   r.use('/organizations/:organizationId/notifications', createOrgNotificationsRouter());
   r.use('/organizations/:organizationId/debug-forecast', createDebugForecastRouter());
   r.use('/organizations/:organizationId/billing', createBillingRouter());

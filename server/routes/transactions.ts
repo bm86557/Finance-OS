@@ -617,6 +617,15 @@ export function createTransactionsRouter(): Router {
 
     const sb = getSupabaseAdminClient();
 
+    // Enforce Plan Transactions Quota (§32)
+    if (sb) {
+      const { checkOrgQuota } = await import('../services/planEntitlementService.js');
+      const txQuota = await checkOrgQuota(sb, orgId, 'transactions', 1);
+      if (!txQuota.allowed) {
+        return fail(res, 403, txQuota.reason || 'Monthly transaction quota reached for your current plan.');
+      }
+    }
+
     // Invariant (§8, §33 #5): Cannot post or draft to a closed/locked period
     if (sb && data.date && await isPeriodLocked(sb, orgId, data.date)) {
       return fail(res, 400, 'PERIOD_CLOSED: Cannot create transactions in a locked or soft-closed accounting period.');

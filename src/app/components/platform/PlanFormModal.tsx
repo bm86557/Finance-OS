@@ -38,6 +38,9 @@ export function PlanFormModal({ isOpen, onClose, onSaved, initialPlan }: PlanFor
   const [storageLimit, setStorageLimit] = useState(2048);
   const [transactionsLimit, setTransactionsLimit] = useState(1000);
   const [aiCreditsLimit, setAiCreditsLimit] = useState(100);
+  const [bankAccountsLimit, setBankAccountsLimit] = useState(2);
+  const [exportsLimit, setExportsLimit] = useState(5);
+  const [auditRetentionLimit, setAuditRetentionLimit] = useState(14);
 
   // Selected features array
   const [selectedFeatures, setSelectedFeatures] = useState<string[]>([]);
@@ -62,6 +65,9 @@ export function PlanFormModal({ isOpen, onClose, onSaved, initialPlan }: PlanFor
       setStorageLimit(initialPlan.limits?.storage ?? 2048);
       setTransactionsLimit(initialPlan.limits?.transactions ?? 1000);
       setAiCreditsLimit(initialPlan.limits?.ai_credits ?? 100);
+      setBankAccountsLimit(initialPlan.limits?.bank_accounts ?? 2);
+      setExportsLimit(initialPlan.limits?.exports ?? 5);
+      setAuditRetentionLimit(initialPlan.limits?.audit_retention ?? 14);
 
       setSelectedFeatures(Array.isArray(initialPlan.features) ? [...initialPlan.features] : []);
     } else {
@@ -80,6 +86,9 @@ export function PlanFormModal({ isOpen, onClose, onSaved, initialPlan }: PlanFor
       setStorageLimit(5120);
       setTransactionsLimit(2500);
       setAiCreditsLimit(250);
+      setBankAccountsLimit(5);
+      setExportsLimit(25);
+      setAuditRetentionLimit(60);
 
       setSelectedFeatures(['statement_import', 'personal_finance', 'profit_intelligence']);
     }
@@ -141,6 +150,9 @@ export function PlanFormModal({ isOpen, onClose, onSaved, initialPlan }: PlanFor
       storage: Number(storageLimit) || 512,
       transactions: Number(transactionsLimit) || 500,
       ai_credits: Number(aiCreditsLimit) || 0,
+      bank_accounts: Number(bankAccountsLimit) || 2,
+      exports: Number(exportsLimit) || 5,
+      audit_retention: Number(auditRetentionLimit) || 14,
     };
 
     try {
@@ -391,6 +403,36 @@ export function PlanFormModal({ isOpen, onClose, onSaved, initialPlan }: PlanFor
                     step="50"
                     value={aiCreditsLimit}
                     onChange={(e) => setAiCreditsLimit(Number(e.target.value))}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm"
+                  />
+                </div>
+                <div className="p-3 rounded-xl bg-white/[0.02] border border-white/10">
+                  <label className="block text-xs font-mono text-slate-400 mb-1">Bank Accounts</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={bankAccountsLimit}
+                    onChange={(e) => setBankAccountsLimit(Number(e.target.value))}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm"
+                  />
+                </div>
+                <div className="p-3 rounded-xl bg-white/[0.02] border border-white/10">
+                  <label className="block text-xs font-mono text-slate-400 mb-1">Exports / Mo</label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={exportsLimit}
+                    onChange={(e) => setExportsLimit(Number(e.target.value))}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm"
+                  />
+                </div>
+                <div className="p-3 rounded-xl bg-white/[0.02] border border-white/10">
+                  <label className="block text-xs font-mono text-slate-400 mb-1">Audit Retention (Days)</label>
+                  <input
+                    type="number"
+                    min="7"
+                    value={auditRetentionLimit}
+                    onChange={(e) => setAuditRetentionLimit(Number(e.target.value))}
                     className="w-full px-2.5 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white font-mono text-sm"
                   />
                 </div>

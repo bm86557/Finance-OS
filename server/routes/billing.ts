@@ -3,6 +3,10 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { ok, fail, notFound } from '../lib/http.js';
 import { env } from '../config/env.js';
 import { stripeService, type PlatformPlan, type OrganizationSubscription, type BillingInvoice } from '../services/stripeService.js';
+import {
+  resolveAuthoritativeOrgPlan,
+  normalizeCanonicalPlanLimits,
+} from '../services/planEntitlementService.js';
 
 export function createBillingRouter(): Router {
   const router = Router({ mergeParams: true });
@@ -30,50 +34,53 @@ export function createBillingRouter(): Router {
 
       if (orgErr || !org) return notFound(res, 'Organization not found');
 
-      // 2. Fetch active plans catalogue
+      // 2. Fetch active plans catalogue (excluding legacy basic)
       const { data: plansData } = await sb
         .from('platform_plans')
         .select('*')
         .eq('active', true)
         .order('sort_order', { ascending: true });
 
-      const plans: PlatformPlan[] = (plansData as PlatformPlan[]) || [];
+      const plans: PlatformPlan[] = ((plansData as PlatformPlan[]) || [])
+        .filter((p) => p.id !== 'plan-basic' && p.slug !== 'basic')
+        .map((p) => ({
+          ...p,
+          limits: normalizeCanonicalPlanLimits(p.limits, p.slug || 'free'),
+        }));
 
-      // 3. Resolve active plan
-      const currentPlanSlug = org.settings?.plan || 'basic';
-      const currentPlanId = org.settings?.planId;
-      let currentPlan = plans.find((p) => p.id === currentPlanId || p.slug === currentPlanSlug);
+      // 3. Resolve authoritative plan & auto-downgrade if expired
+      const authResult = await resolveAuthoritativeOrgPlan(sb, orgId);
+      const currentPlan: PlatformPlan = {
+        ...authResult.plan,
+        limits: normalizeCanonicalPlanLimits(authResult.plan.limits, authResult.plan.slug || 'free'),
+      };
+      const subscription: OrganizationSubscription | null =
+        (authResult.subscription as OrganizationSubscription) || null;
 
-      if (!currentPlan) {
-        currentPlan = plans.find((p) => p.slug === 'basic') || {
-          id: 'plan-basic',
-          slug: 'basic',
-          name: 'Basic',
-          description: 'Essential financial ledger',
-          price: 0,
-          currency: 'PKR',
-          billing_interval: 'month',
-          features: ['statement_import'],
-          limits: { users: 5, statements: 100, currencies: 2, storage: 2048 },
-          is_popular: false,
-          active: true,
-        };
-      }
+      // 4. Fetch real usage counters
+      const monthStart = new Date();
+      monthStart.setUTCDate(1);
+      monthStart.setUTCHours(0, 0, 0, 0);
+      const monthStartIso = monthStart.toISOString();
 
-      // 4. Fetch subscription record
-      const { data: subData } = await sb
-        .from('organization_subscriptions')
-        .select('*')
-        .eq('organization_id', orgId)
-        .single();
-
-      const subscription: OrganizationSubscription | null = (subData as OrganizationSubscription) || null;
-
-      // 5. Fetch real usage counters
-      const [membersCountRes, statementsCountRes, accountsRes] = await Promise.all([
-        sb.from('organization_members').select('*', { count: 'exact', head: true }).eq('organization_id', orgId),
-        sb.from('import_history_records').select('*', { count: 'exact', head: true }).eq('organization_id', orgId),
+      const [
+        membersCountRes,
+        statementsCountRes,
+        accountsRes,
+        bankAccountsRes,
+        aiStatusRes,
+        txCountRes,
+        exportsCountRes,
+        importSizeRes,
+      ] = await Promise.all([
+        sb.from('organization_members').select('*', { count: 'exact', head: true }).eq('organization_id', orgId).in('status', ['active', 'pending']),
+        sb.from('import_history_records').select('*', { count: 'exact', head: true }).eq('organization_id', orgId).gte('created_at', monthStartIso),
         sb.from('accounts').select('currency').eq('organization_id', orgId),
+        sb.from('bank_accounts').select('currency').eq('organization_id', orgId).eq('is_active', true),
+        sb.from('org_ai_status').select('platform_requests_this_month').eq('organization_id', orgId).maybeSingle(),
+        sb.from('transactions').select('*', { count: 'exact', head: true }).eq('organization_id', orgId).gte('created_at', monthStartIso),
+        sb.from('audit_logs').select('*', { count: 'exact', head: true }).eq('organization_id', orgId).ilike('action', '%export%').gte('created_at', monthStartIso),
+        sb.from('import_history_records').select('file_size').eq('organization_id', orgId),
       ]);
 
       const distinctCurrencies = new Set<string>();
@@ -81,16 +88,34 @@ export function createBillingRouter(): Router {
       (accountsRes.data || []).forEach((a: any) => {
         if (a.currency) distinctCurrencies.add(a.currency.toUpperCase());
       });
+      (bankAccountsRes.data || []).forEach((a: any) => {
+        if (a.currency) distinctCurrencies.add(a.currency.toUpperCase());
+      });
 
+      const totalImportBytes = (importSizeRes.data || []).reduce(
+        (sum: number, r: any) => sum + (Number(r.file_size) || 0),
+        0,
+      );
+      const realStorageUsedMb = Math.round((totalImportBytes / (1024 * 1024)) * 100) / 100;
+
+      const limits = normalizeCanonicalPlanLimits(currentPlan.limits, currentPlan.slug || 'free');
       const usage = {
-        users: currentPlan.limits.users,
+        users: limits.users,
         usersUsed: membersCountRes.count ?? 1,
-        statements: currentPlan.limits.statements,
+        statements: limits.statements,
         statementsUsed: statementsCountRes.count ?? 0,
-        currencies: currentPlan.limits.currencies,
+        currencies: limits.currencies ?? 2,
         currenciesUsed: distinctCurrencies.size || 1,
-        storage: currentPlan.limits.storage,
-        storageUsed: Math.min(currentPlan.limits.storage, (statementsCountRes.count ?? 0) * 12 + 45), // Estimated MB
+        storage: limits.storage,
+        storageUsed: realStorageUsedMb,
+        aiCredits: limits.ai_credits ?? 50,
+        aiCreditsUsed: Number(aiStatusRes.data?.platform_requests_this_month ?? 0),
+        transactions: limits.transactions ?? 500,
+        transactionsUsed: txCountRes.count ?? 0,
+        bankAccounts: limits.bank_accounts ?? 2,
+        bankAccountsUsed: (bankAccountsRes.data || []).length,
+        exports: limits.exports ?? 5,
+        exportsUsed: exportsCountRes.count ?? 0,
       };
 
       // 6. Fetch recent invoices

@@ -201,19 +201,22 @@ export function createBankAccountsRouter(): Router {
 
     const sb = getSupabaseAdminClient();
 
-    // Enforce Plan Currency Limits (§3.1, §5.1)
+    // Enforce Plan Currency & Bank Account Limits (§3.1, §5.1, §32)
     if (sb) {
-      const { data: orgRow } = await sb.from('organizations').select('plan, settings, currency').eq('id', orgId).maybeSingle();
-      const planKey = String(orgRow?.settings?.plan || orgRow?.plan || 'basic').toLowerCase().trim();
-      const isFreeTier = planKey === 'basic' || planKey === 'free';
-      if (isFreeTier && requestedCurrency !== 'USD' && requestedCurrency !== 'PKR') {
-        return fail(res, 400, `The Free plan only supports USD and PKR currencies. Upgrade to Professional to add accounts in ${requestedCurrency}.`);
+      const { resolveAuthoritativeOrgPlan, checkOrgQuota, normalizeCanonicalPlanLimits } = await import('../services/planEntitlementService.js');
+      const { plan } = await resolveAuthoritativeOrgPlan(sb, orgId);
+      const limits = normalizeCanonicalPlanLimits(plan.limits, plan.slug || 'free');
+      const maxCurrs = Number(limits.currencies ?? 2);
+
+      const bankAcctQuota = await checkOrgQuota(sb, orgId, 'bank_accounts', 1);
+      if (!bankAcctQuota.allowed) {
+        return fail(res, 403, bankAcctQuota.reason || `Bank account limit reached (${bankAcctQuota.used}/${bankAcctQuota.limit}).`);
       }
-      const maxCurrs = isFreeTier ? 2 : (planKey === 'professional' ? 5 : 10);
+
       const { data: existingAccounts } = await sb.from('bank_accounts').select('currency').eq('organization_id', orgId).eq('is_active', true);
       const existingCurrs = new Set((existingAccounts || []).map((a: any) => String(a.currency || 'USD').toUpperCase()));
       if (!existingCurrs.has(requestedCurrency) && existingCurrs.size >= maxCurrs) {
-        return fail(res, 400, `Your ${isFreeTier ? 'Free' : planKey} plan allows a maximum of ${maxCurrs} distinct currencies. Upgrade your plan to add accounts in a new currency.`);
+        return fail(res, 403, `Your ${plan.name} plan allows a maximum of ${maxCurrs} distinct currencies. Upgrade your plan to add accounts in a new currency.`);
       }
     }
 

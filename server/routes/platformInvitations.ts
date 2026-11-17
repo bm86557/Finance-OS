@@ -593,28 +593,23 @@ router.post('/accept', async (req: Request, res: Response) => {
       }
 
       // Resolve plan details from invitation.plan + platform_plans
-      const rawPlan = String(invitation.plan || 'basic').trim().toLowerCase();
-      const planSlug = rawPlan.replace(/^plan-/, '') || 'basic';
-      let planRow: { id?: string; slug?: string; features?: string[] } | null = null;
-      try {
-        const { data: pRow } = await sb
-          .from('platform_plans')
-          .select('id, slug, features')
-          .or(`slug.eq.${planSlug},id.eq.${rawPlan}`)
-          .maybeSingle();
-        planRow = pRow;
-      } catch {
-        /* non-critical */
-      }
+      const { resolvePlanByKeyOrId, createOrUpdateOrgSubscription } = await import('../services/planEntitlementService.js');
+      const rawPlan = String(invitation.plan || 'free').trim().toLowerCase();
+      const normalizedPlanKey = rawPlan === 'basic' || rawPlan === 'plan-basic' ? 'free' : rawPlan.replace(/^plan-/, '') || 'free';
+      const resolvedPlan = await resolvePlanByKeyOrId(sb, invitation.plan || normalizedPlanKey);
+      const isFreePlan = (resolvedPlan.slug || normalizedPlanKey) === 'free' || Number(resolvedPlan.price) === 0;
 
       const orgId = `org-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const orgSettings: Record<string, any> = {
         theme: 'dark',
         notifications: true,
-        plan: planRow?.slug || planSlug,
+        plan: resolvedPlan.slug || normalizedPlanKey,
+        planId: resolvedPlan.id,
+        planName: resolvedPlan.name,
+        planFeatures: resolvedPlan.features,
+        limits: resolvedPlan.limits,
+        status: isFreePlan ? 'trial' : 'active',
       };
-      if (planRow?.id) orgSettings.planId = planRow.id;
-      if (Array.isArray(planRow?.features)) orgSettings.planFeatures = planRow.features;
 
       const { error: orgErr } = await sb.from('organizations').insert({
         id: orgId,
@@ -630,13 +625,12 @@ router.post('/accept', async (req: Request, res: Response) => {
         return res.status(500).json({ success: false, error: orgErr.message });
       }
 
-      // Best-effort subscription record so plan sync in apiV1 picks up the assigned plan
+      // Create subscription record with proper id and period dates
       try {
-        await sb.from('organization_subscriptions').insert({
-          organization_id: orgId,
-          plan_id: planRow?.id || `plan-${planSlug}`,
-          plan_slug: planRow?.slug || planSlug,
-          status: 'active',
+        await createOrUpdateOrgSubscription(sb, {
+          orgId,
+          plan: resolvedPlan,
+          status: isFreePlan ? 'trialing' : 'active',
         });
       } catch {
         /* non-critical if table/schema differs */

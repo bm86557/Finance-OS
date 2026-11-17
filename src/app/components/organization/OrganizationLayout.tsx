@@ -246,7 +246,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
           </div>
 
           {/* Plan Tier & Upgrade Pill */}
-          {(!currentPlan || currentPlan.slug === 'basic' || currentPlan.price === 0) ? (
+          {(!currentPlan || currentPlan.slug === 'free' || currentPlan.slug === 'basic' || currentPlan.price === 0) ? (
             <button
               type="button"
               onClick={() => onViewChange('settings')}

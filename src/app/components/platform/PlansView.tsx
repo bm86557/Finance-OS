@@ -151,11 +151,14 @@ export function PlansView() {
                 {/* Limits */}
                 <div className="p-4 rounded-lg mb-6" style={AXIOM.containers.item}>
                   {[
-                    { label: 'Users', value: plan.limits?.users ?? 5 },
-                    { label: 'Statements/month', value: plan.limits?.statements ?? 100 },
-                    { label: 'AI credits/month', value: plan.limits?.ai_credits ?? (plan.slug === 'enterprise' ? 2500 : plan.slug === 'professional' ? 500 : 100) },
+                    { label: 'Users', value: plan.limits?.users ?? 2 },
+                    { label: 'Statements/month', value: plan.limits?.statements ?? 50 },
+                    { label: 'AI credits/month', value: plan.limits?.ai_credits ?? 50 },
                     { label: 'Currencies', value: plan.limits?.currencies ?? 2 },
-                    { label: 'Storage', value: `${plan.limits?.storage ?? 2048} MB` },
+                    { label: 'Bank accounts', value: plan.limits?.bank_accounts ?? 2 },
+                    { label: 'Exports/month', value: plan.limits?.exports ?? 5 },
+                    { label: 'Audit retention', value: `${plan.limits?.audit_retention ?? 14} days` },
+                    { label: 'Storage', value: `${plan.limits?.storage ?? 1024} MB` },
                   ].map((limit) => (
                     <div key={limit.label} className="flex justify-between py-2" style={{ borderBottom: AXIOM.borders.default }}>
                       <span className="text-sm text-slate-400 font-mono">{limit.label}</span>

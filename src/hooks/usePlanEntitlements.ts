@@ -140,7 +140,7 @@ export function usePlanEntitlements(): UsePlanEntitlementsResult {
     }
 
     if (!currentOrganization) return null;
-    const planSlug = currentOrganization.settings?.plan || 'basic';
+    const planSlug = currentOrganization.settings?.plan || 'free';
     const planId = currentOrganization.settings?.planId;
 
     const matched = plans.find((p) => p.id === planId || p.slug === planSlug || p.name.toLowerCase() === planSlug.toLowerCase());

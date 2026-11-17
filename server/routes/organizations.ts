@@ -469,6 +469,13 @@ export function createOrganizationRouter(): Router {
     }
     const sb = getSupabaseAdminClient()!;
 
+    // Enforce Plan Users Seat Quota (§32)
+    const { checkOrgQuota } = await import('../services/planEntitlementService.js');
+    const seatQuota = await checkOrgQuota(sb, orgId, 'users', 1);
+    if (!seatQuota.allowed) {
+      return fail(res, 403, seatQuota.reason || 'Team seat limit reached for your current plan.');
+    }
+
     const { data: existing } = await sb
       .from('organization_members')
       .select('user_id, organization_id')
@@ -1228,6 +1235,15 @@ export function createOrganizationRouter(): Router {
     const orgId = paramStr(req.params.organizationId);
     const { email, name, role, department, position } = req.body as SingleInviteInput;
     if (!email?.trim()) return fail(res, 400, 'Email is required');
+
+    const sb = getSupabaseAdminClient();
+    if (sb) {
+      const { checkOrgQuota } = await import('../services/planEntitlementService.js');
+      const seatQuota = await checkOrgQuota(sb, orgId, 'users', 1);
+      if (!seatQuota.allowed) {
+        return fail(res, 403, seatQuota.reason || 'Team seat limit reached for your current plan.');
+      }
+    }
 
     const result = await executeInvite(orgId, { email, name, role, department, position }, req);
     if (!result.success) {

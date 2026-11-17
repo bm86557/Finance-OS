@@ -33,7 +33,7 @@ export function OrganizationsView() {
   const [newOrgName, setNewOrgName] = useState('');
   const [newOrgAdminEmail, setNewOrgAdminEmail] = useState('');
   const [newOrgAdminName, setNewOrgAdminName] = useState('');
-  const [newOrgPlan, setNewOrgPlan] = useState('basic');
+  const [newOrgPlan, setNewOrgPlan] = useState('free');
   const [creatingOrg, setCreatingOrg] = useState(false);
 
   // Real tenants straight from the Supabase `organizations` table, kept live via Realtime.
@@ -117,7 +117,7 @@ export function OrganizationsView() {
         organizationName: name,
         adminEmail: email,
         adminName: newOrgAdminName.trim() || undefined,
-        plan: newOrgPlan || 'basic',
+        plan: newOrgPlan || 'free',
       });
 
       console.log('[handleCreateOrg] Invitation service response:', res);
@@ -143,7 +143,7 @@ export function OrganizationsView() {
       setNewOrgName('');
       setNewOrgAdminEmail('');
       setNewOrgAdminName('');
-      setNewOrgPlan('basic');
+      setNewOrgPlan('free');
       
       await refetchOrgs();
       await refetchInvitations();
@@ -160,7 +160,7 @@ export function OrganizationsView() {
   const [manageName, setManageName] = useState('');
   const [manageCurrency, setManageCurrency] = useState('');
   const [manageFiscalYearStart, setManageFiscalYearStart] = useState('');
-  const [managePlan, setManagePlan] = useState('basic');
+  const [managePlan, setManagePlan] = useState('free');
   const [savingManage, setSavingManage] = useState(false);
 
   const openManage = (org: EnrichedOrg) => {
@@ -168,7 +168,7 @@ export function OrganizationsView() {
     setManageName(org.name);
     setManageCurrency(org.currency);
     setManageFiscalYearStart(org.fiscalYearStart);
-    setManagePlan(org.plan?.toLowerCase() || 'basic');
+    setManagePlan(org.plan?.toLowerCase().includes('free') ? 'free' : (org.plan?.toLowerCase() || 'free'));
   };
 
   const handleSaveManage = async () => {
@@ -343,9 +343,22 @@ export function OrganizationsView() {
                 className="w-full px-4 py-3 rounded-lg text-white font-mono text-sm"
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
               >
-                <option value="basic">Basic (Trial)</option>
-                <option value="professional">Professional</option>
-                <option value="enterprise">Enterprise</option>
+                {(platformPlans.filter(p => p.active !== false).length > 0
+                  ? [...platformPlans.filter(p => p.active !== false)].sort((a, b) => (a.sort_order ?? 99) - (b.sort_order ?? 99) || (a.price ?? 0) - (b.price ?? 0))
+                  : [
+                      { slug: 'free', name: 'Free/Trial', price: 0 },
+                      { slug: 'starter', name: 'Starter', price: 19900 },
+                      { slug: 'professional', name: 'Professional', price: 49900 },
+                      { slug: 'business', name: 'Business', price: 79900 },
+                      { slug: 'enterprise', name: 'Enterprise', price: 99900 },
+                    ]
+                ).map((p) => (
+                  <option key={p.slug || p.name} value={p.slug || p.name.toLowerCase()}>
+                    {p.name} {p.price === 0 ? '(Free / 14-day Trial)' : `(Rs ${(p.price || 0).toLocaleString()}/mo)`}
+                  </option>
+                ))}
+
+
               </select>
               <p className="text-xs text-slate-500 font-mono mt-1">Select initial subscription plan for organization</p>
             </div>
@@ -772,7 +785,7 @@ export function OrganizationsView() {
                 style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
               >
                 <optgroup label="Free Tier" className="bg-slate-900 text-slate-300">
-                  {(platformPlans.filter(p => p.price === 0).length > 0 ? platformPlans.filter(p => p.price === 0) : [{ slug: 'basic', name: 'Basic' }]).map(p => (
+                  {(platformPlans.filter(p => p.price === 0 && p.active !== false).length > 0 ? platformPlans.filter(p => p.price === 0 && p.active !== false) : [{ slug: 'free', name: 'Free/Trial' }]).map(p => (
                     <option key={p.slug} value={p.slug}>{p.name} (Free)</option>
                   ))}
                 </optgroup>

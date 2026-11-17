@@ -3,192 +3,12 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { ok, created, fail, notFound } from '../lib/http.js';
 import { stripeService, type PlatformPlan } from '../services/stripeService.js';
 import { requirePlatformRole } from '../middleware/auth.js';
+import { CANONICAL_DEFAULT_PLANS, normalizeCanonicalPlanLimits } from '../services/planEntitlementService.js';
 
 export function createPlatformPlansRouter(): Router {
   const router = Router();
 
-  const DEFAULT_SEEDED_PLANS: PlatformPlan[] = [
-    {
-      id: 'plan-free',
-      slug: 'free',
-      name: 'Free/Trial',
-      description: '14-day trial & essential ledger access for small agency exploration',
-      price: 0,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: ['statement_import'],
-      limits: {
-        users: 2,
-        statements: 50,
-        currencies: 2,
-        storage: 1024,
-        transactions: 500,
-        ai_credits: 50,
-        audit_retention: 14,
-      },
-      is_popular: false,
-      active: true,
-      sort_order: 1,
-    },
-    {
-      id: 'plan-starter',
-      slug: 'starter',
-      name: 'Starter',
-      description: 'Core accounting, narration learning and bank statement import for growing studios',
-      price: 19900,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: [
-        'statement_import',
-        'personal_finance',
-        'recurring_transactions',
-        'budget_alerts',
-      ],
-      limits: {
-        users: 5,
-        statements: 250,
-        currencies: 5,
-        storage: 5120,
-        transactions: 2500,
-        ai_credits: 250,
-        audit_retention: 60,
-      },
-      is_popular: false,
-      active: true,
-      sort_order: 2,
-    },
-    {
-      id: 'plan-basic',
-      slug: 'basic',
-      name: 'Basic',
-      description: 'Essential financial ledger & statement import for emerging agencies',
-      price: 0,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: ['statement_import'],
-      limits: {
-        users: 5,
-        statements: 100,
-        currencies: 2,
-        storage: 2048,
-        transactions: 1000,
-        ai_credits: 100,
-        audit_retention: 30,
-      },
-      is_popular: false,
-      active: true,
-      sort_order: 1,
-    },
-    {
-      id: 'plan-professional',
-      slug: 'professional',
-      name: 'Professional',
-      description: 'Complete intelligence, unit costing and team collaboration engine',
-      price: 49900,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: [
-        'personal_finance',
-        'statement_import',
-        'profit_intelligence',
-        'team_management',
-        'costing_engine',
-        'ai_assistant',
-        'recurring_transactions',
-        'budget_alerts',
-      ],
-      limits: {
-        users: 15,
-        statements: 1000,
-        currencies: 15,
-        storage: 20480,
-        transactions: 10000,
-        ai_credits: 1000,
-        audit_retention: 180,
-      },
-      is_popular: true,
-      active: true,
-      sort_order: 3,
-    },
-    {
-      id: 'plan-business',
-      slug: 'business',
-      name: 'Business',
-      description: 'Multi-entity support, fixed assets, debt schedules, and predictive cash flow runway',
-      price: 79900,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: [
-        'personal_finance',
-        'statement_import',
-        'recurring_transactions',
-        'budget_alerts',
-        'profit_intelligence',
-        'team_management',
-        'costing_engine',
-        'ai_assistant',
-        'forecast_modeling',
-        'projects',
-        'assets',
-        'loans',
-        'reports',
-      ],
-      limits: {
-        users: 35,
-        statements: 5000,
-        currencies: 50,
-        storage: 51200,
-        transactions: 50000,
-        ai_credits: 3000,
-        audit_retention: 365,
-      },
-      is_popular: false,
-      active: true,
-      sort_order: 4,
-    },
-    {
-      id: 'plan-enterprise',
-      slug: 'enterprise',
-      name: 'Enterprise',
-      description: 'Full-suite agency operating system with custom modeling, simulator, assets & white labeling',
-      price: 99900,
-      currency: 'PKR',
-      billing_interval: 'month',
-      features: [
-        'personal_finance',
-        'statement_import',
-        'profit_intelligence',
-        'team_management',
-        'costing_engine',
-        'ai_assistant',
-        'recurring_transactions',
-        'budget_alerts',
-        'forecast_modeling',
-        'projects',
-        'simulator',
-        'assets',
-        'inventory',
-        'loans',
-        'reports',
-        'payroll',
-        'integrations',
-        'api_access',
-        'white_label',
-      ],
-      limits: {
-        users: 50,
-        statements: 2000,
-        currencies: 10,
-        storage: 51200,
-        transactions: 50000,
-        ai_credits: 2500,
-        audit_retention: 365,
-      },
-      is_popular: false,
-      active: true,
-      sort_order: 3,
-    },
-  ];
+  const DEFAULT_SEEDED_PLANS: PlatformPlan[] = CANONICAL_DEFAULT_PLANS;
 
   /**
    * Helper to ensure plans exist in database or return memory defaults
@@ -214,7 +34,12 @@ export function createPlatformPlansRouter(): Router {
         return DEFAULT_SEEDED_PLANS;
       }
 
-      return data as PlatformPlan[];
+      return (data as PlatformPlan[])
+        .filter((p) => p.id !== 'plan-basic' && p.slug !== 'basic')
+        .map((p) => ({
+          ...p,
+          limits: normalizeCanonicalPlanLimits(p.limits, p.slug || 'free'),
+        }));
     } catch (err: any) {
       console.warn('[PlatformPlans] Error fetching plans:', err.message);
       return DEFAULT_SEEDED_PLANS;
@@ -263,15 +88,7 @@ export function createPlatformPlansRouter(): Router {
       const currency = String(body.currency || 'PKR').toUpperCase();
       const billingInterval = body.billing_interval === 'year' ? 'year' : 'month';
       const features = Array.isArray(body.features) ? body.features : [];
-      const limits = {
-        users: Number(body.limits?.users ?? 5),
-        statements: Number(body.limits?.statements ?? 100),
-        currencies: Number(body.limits?.currencies ?? 2),
-        storage: Number(body.limits?.storage ?? 2048),
-        transactions: Number(body.limits?.transactions ?? 1000),
-        ai_credits: Number(body.limits?.ai_credits ?? 100),
-        audit_retention: Number(body.limits?.audit_retention ?? 30),
-      };
+      const limits = normalizeCanonicalPlanLimits(body.limits, slug || 'free');
       const isPopular = Boolean(body.is_popular);
       const active = body.active !== undefined ? Boolean(body.active) : true;
       const sortOrder = Number(body.sort_order ?? 10);
@@ -405,10 +222,7 @@ export function createPlatformPlansRouter(): Router {
                   planName: updatedPlan.name,
                   limits: {
                     ...(org.settings?.limits || {}),
-                    users: updatedPlan.limits.users,
-                    statements: updatedPlan.limits.statements,
-                    currencies: updatedPlan.limits.currencies,
-                    storage: updatedPlan.limits.storage,
+                    ...normalizeCanonicalPlanLimits(updatedPlan.limits, updatedPlan.slug || 'free'),
                   },
                 };
 
