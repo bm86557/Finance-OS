@@ -141,15 +141,17 @@ export class ReportService {
    */
   async getProfitLoss(
     organizationId: string,
-    dateRange?: DateRange
+    dateRange?: DateRange,
+    world: 'business' | 'personal' | 'all' = 'business'
   ): Promise<ProfitLossReport> {
-    const cacheKey = `pl:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cacheKey = `pl:${organizationId}:${dateRange?.from || ''}:${dateRange?.to || ''}:${world}`;
     const cached = this.getCached<ProfitLossReport>(cacheKey);
     if (cached) return cached;
 
     const params = new URLSearchParams();
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
+    params.set('world', world);
 
     const response = await this.authedFetch(
       `${this.baseUrl}/organizations/${organizationId}/reports/profit-loss?${params}`
@@ -166,14 +168,16 @@ export class ReportService {
    */
   async getBalanceSheet(
     organizationId: string,
-    asOfDate?: string
+    asOfDate?: string,
+    world: 'business' | 'personal' | 'all' = 'business'
   ): Promise<BalanceSheetReport> {
-    const cacheKey = `bs:${organizationId}:${asOfDate || ''}`;
+    const cacheKey = `bs:${organizationId}:${asOfDate || ''}:${world}`;
     const cached = this.getCached<BalanceSheetReport>(cacheKey);
     if (cached) return cached;
 
     const params = new URLSearchParams();
     if (asOfDate) params.set('asOfDate', asOfDate);
+    params.set('world', world);
 
     const response = await this.authedFetch(
       `${this.baseUrl}/organizations/${organizationId}/reports/balance-sheet?${params}`
@@ -191,9 +195,10 @@ export class ReportService {
   async getCashFlow(
     organizationId: string,
     months: number = 6,
-    dateRange?: DateRange
+    dateRange?: DateRange,
+    world: 'business' | 'personal' | 'all' = 'business'
   ): Promise<CashFlowReport[]> {
-    const cacheKey = `cf:${organizationId}:${months}:${dateRange?.from || ''}:${dateRange?.to || ''}`;
+    const cacheKey = `cf:${organizationId}:${months}:${dateRange?.from || ''}:${dateRange?.to || ''}:${world}`;
     const cached = this.getCached<CashFlowReport[]>(cacheKey);
     if (cached) return cached;
 
@@ -201,6 +206,7 @@ export class ReportService {
     params.set('months', String(months));
     if (dateRange?.from) params.set('dateFrom', dateRange.from);
     if (dateRange?.to) params.set('dateTo', dateRange.to);
+    params.set('world', world);
 
     const response = await this.authedFetch(
       `${this.baseUrl}/organizations/${organizationId}/reports/cash-flow?${params}`

@@ -346,10 +346,11 @@ export async function calculateDepartmentProfitability(
 
       for (const aTag of allocTags) {
         const parts = aTag.split(':');
-        // parts[0] = 'payslip_alloc', parts[1] = payslipId, parts[2] = userId, parts[3] = deptId, parts[4] = gross
+        // parts[0] = 'payslip_alloc', parts[1] = payslipId, parts[2] = userId, parts[3] = deptId, parts[4] = gross, parts[6] = kind
         const tagUserId = parts[2] || '';
         const tagDeptRaw = parts[3] || '';
         const tagGross = Number(parts[4] || 0);
+        const tagKind = parts[6] || 'salary';
         if (tagGross <= 0) continue;
 
         const resolvedDeptId =
@@ -361,7 +362,11 @@ export async function calculateDepartmentProfitability(
         const effectiveAlloc = Math.min(tagGross, Math.max(0, amount - allocatedSum));
         if (effectiveAlloc > 0 && resolvedDeptId && deptDirects.has(resolvedDeptId)) {
           const st = deptDirects.get(resolvedDeptId)!;
-          st.allocatedStaffLabor += effectiveAlloc;
+          if (tagKind === 'reimbursement') {
+            st.directDepartmentExpenses += effectiveAlloc;
+          } else {
+            st.allocatedStaffLabor += effectiveAlloc;
+          }
           st.directCosts += effectiveAlloc;
           allocatedSum += effectiveAlloc;
         }

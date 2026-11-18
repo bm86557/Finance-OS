@@ -189,9 +189,9 @@ export function ReportsView() {
         // Fetch all 5 report endpoints in PARALLEL via Promise.all
         const [rawDashboard, rawPl, rawBalance, rawCashFlow, rawDepts] = await Promise.all([
           reportService.getDashboardSummary(svc.orgId, { world: 'business' }).catch(() => null),
-          reportService.getProfitLoss(svc.orgId, { from: dateFrom, to: dateTo }).catch(() => null),
-          reportService.getBalanceSheet(svc.orgId, dateTo).catch(() => null),
-          reportService.getCashFlow(svc.orgId, 6, { from: dateFrom, to: dateTo }).catch(() => []),
+          reportService.getProfitLoss(svc.orgId, { from: dateFrom, to: dateTo }, 'business').catch(() => null),
+          reportService.getBalanceSheet(svc.orgId, dateTo, 'business').catch(() => null),
+          reportService.getCashFlow(svc.orgId, 6, { from: dateFrom, to: dateTo }, 'business').catch(() => []),
           reportService.getDepartmentProfitability(svc.orgId, { from: dateFrom, to: dateTo }).catch(() => []),
         ]);
 
@@ -590,12 +590,12 @@ export function ReportsView() {
     : (dashboardData?.netProfit ?? (totalRevenue - totalExpenses));
   const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0;
 
-  // Balance Sheet from REAL data
-  const totalAssets = balanceData?.totalAssets || dashboardData?.totalAssets || 0;
-  const totalLiabilities = balanceData?.totalLiabilities || dashboardData?.totalLiabilities || 0;
-  const totalEquity = balanceData?.totalEquity || dashboardData?.netWorth || (totalAssets - totalLiabilities);
-  const netWorth = totalAssets - totalLiabilities;
-  const liquidNetWorth = balanceData?.liquidNetWorth ?? dashboardData?.liquidNetWorth ?? (dashboardData?.cashInBank ? Math.max(0, dashboardData.cashInBank - totalLiabilities) : 0);
+  // Balance Sheet from authoritative backend snapshot (reconciled with Finance OS Dashboard)
+  const totalAssets = balanceData?.totalAssets ?? dashboardData?.totalAssets ?? 0;
+  const totalLiabilities = balanceData?.totalLiabilities ?? dashboardData?.totalLiabilities ?? 0;
+  const totalEquity = balanceData?.totalEquity ?? dashboardData?.netWorth ?? (totalAssets - totalLiabilities);
+  const netWorth = balanceData?.netWorth ?? (totalAssets - totalLiabilities);
+  const liquidNetWorth = balanceData?.liquidNetWorth ?? dashboardData?.liquidNetWorth ?? 0;
   
   const totalCurrentAssets =
     (Array.isArray(balanceData?.assets) ? balanceData.assets : [])

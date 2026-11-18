@@ -16,7 +16,14 @@ import type {
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
-import { detectAndIssuePayslipsForTransactions, voidPayslip } from '../lib/aiPayrollDetector.js';
+import {
+  detectAndIssuePayslipsForTransactions,
+  voidPayslip,
+  computePayslipVariance,
+  round2,
+  normalizePeriodKey,
+  extractPeriodFromTxn,
+} from '../lib/aiPayrollDetector.js';
 import { canViewConfidentialPayroll, canWriteFinance } from '../middleware/auth.js';
 import { env } from '../config/env.js';
 import { createEmployeeAIAssistantRouter } from './employeeAIAssistant.js';
@@ -1036,15 +1043,31 @@ export function createEmployeeMeRouter(): Router {
     }
 
     const userId = requestedUserId;
+    const includeVoided = req.query.includeVoided === 'true' && canViewConfidentialPayroll(req);
+
+    // Audit sensitive cross-user payslip read (§20, §29 X-06, §33 #18)
+    if (requestedUserId !== caller) {
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'view_employee_payslips',
+        entityType: 'employee_payslip',
+        entityId: requestedUserId,
+        description: `Confidential payroll read of payslips for user ${requestedUserId}`,
+      }).catch(() => {});
+    }
+
     const sb = getSupabaseAdminClient();
     if (sb) {
       try {
-        const { data, error } = await sb
+        let q = sb
           .from('employee_payslips')
           .select('*')
           .eq('organization_id', orgId)
-          .eq('user_id', userId)
-          .order('issue_date', { ascending: false });
+          .eq('user_id', userId);
+        if (!includeVoided) {
+          q = q.neq('status', 'voided');
+        }
+        const { data, error } = await q.order('issue_date', { ascending: false });
         if (!error && data) {
           const mapped = data.map((p: any) => ({
             id: p.id,
@@ -1057,6 +1080,15 @@ export function createEmployeeMeRouter(): Router {
             net: Number(p.net || 0),
             currency: p.currency || 'USD',
             status: p.status || 'paid',
+            salaryAmount: p.salary_amount != null ? Number(p.salary_amount) : undefined,
+            reimbursementAmount: p.reimbursement_amount != null ? Number(p.reimbursement_amount) : undefined,
+            expectedSalary: p.expected_salary != null ? Number(p.expected_salary) : undefined,
+            expectedReimbursements: p.expected_reimbursements != null ? Number(p.expected_reimbursements) : undefined,
+            expectedTotal: p.expected_total != null ? Number(p.expected_total) : undefined,
+            varianceAmount: p.variance_amount != null ? Number(p.variance_amount) : undefined,
+            varianceStatus: p.variance_status || undefined,
+            reimbursementDetails: Array.isArray(p.reimbursement_details) ? p.reimbursement_details : undefined,
+            linkedExpenseIds: Array.isArray(p.linked_expense_ids) ? p.linked_expense_ids : undefined,
           }));
           return ok(res, mapped);
         }
@@ -2242,6 +2274,7 @@ export function createEmployeeMeRouter(): Router {
     let rawTxns: any[] = [];
     let rawPayslips: any[] = [];
     let rawTimesheets: any[] = [];
+    let rawPayableExpenses: any[] = [];
 
     if (sb) {
       try {
@@ -2251,12 +2284,14 @@ export function createEmployeeMeRouter(): Router {
           { data: sbTxns },
           { data: sbPayslips },
           { data: sbTimesheets },
+          { data: sbExpenses },
         ] = await Promise.all([
           sb.from('organization_members').select('*').eq('organization_id', orgId),
           sb.from('departments').select('*').eq('organization_id', orgId),
           sb.from('transactions').select('*').eq('organization_id', orgId).order('date', { ascending: false }),
           sb.from('employee_payslips').select('*').eq('organization_id', orgId).order('issue_date', { ascending: false }),
           sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
+          sb.from('employee_expenses').select('*').eq('organization_id', orgId).in('status', ['approved', 'reimbursed']),
         ]);
 
         rawMembers = sbMembers || [];
@@ -2264,6 +2299,7 @@ export function createEmployeeMeRouter(): Router {
         rawTxns = sbTxns || [];
         rawPayslips = sbPayslips || [];
         rawTimesheets = sbTimesheets || [];
+        rawPayableExpenses = sbExpenses || [];
 
         const userIds = rawMembers.map(m => m.user_id).filter(Boolean);
         if (userIds.length > 0) {
@@ -2419,7 +2455,11 @@ export function createEmployeeMeRouter(): Router {
           const uid = parts[2] || '';
           const dId = parts[3] || '';
           const gross = Number(parts[4] || 0);
-          const rawPeriod = parts.slice(5).join(':') || '';
+          const maybeKind = parts[parts.length - 1];
+          const hasExplicitKind = maybeKind === 'salary' || maybeKind === 'reimbursement';
+          const kind = hasExplicitKind ? maybeKind : 'salary';
+          const periodParts = hasExplicitKind ? parts.slice(5, -1) : parts.slice(5);
+          const rawPeriod = periodParts.join(':') || '';
           let period = rawPeriod;
           if (rawPeriod) {
             const segs = rawPeriod.split('-');
@@ -2442,6 +2482,7 @@ export function createEmployeeMeRouter(): Router {
             departmentName: emp?.departmentName || '',
             gross,
             period,
+            kind,
           };
         });
 
@@ -2449,12 +2490,21 @@ export function createEmployeeMeRouter(): Router {
         const remainingAmount = Math.max(0, Math.round((amount - allocatedAmount) * 100) / 100);
         const text = `${t.description || ''} ${t.narration || ''} ${tags.join(' ')}`.toLowerCase();
         const catId = String(t.category_id || t.categoryId || '').toLowerCase();
-        const isReimbursementOrSupplies = /\b(reimbursement|supplies|equipment|laptop|rent|electricity|travel)\b/i.test(text);
-        const isSalaryKeyword = !isReimbursementOrSupplies && (
+        const isReimbursementKeyword = /\b(reimburse|reimbursement|reimb|expense|claim|refund|ssl|travel|hardware|laptop|per\s*diem|allowance)\b/i.test(text);
+        const isSuppliesOrRent = /\b(supplies|equipment|rent|electricity)\b/i.test(text) && !isReimbursementKeyword;
+        const matchesMemberName = !isSuppliesOrRent && members.some(m => doesTxnMatchMember(text, m));
+        const matchesClaimAmount = rawPayableExpenses.some(
+          (exp: any) =>
+            !exp.settlement_transaction_id &&
+            Math.abs(round2(exp.amount) - amount) < 0.05 &&
+            (matchesMemberName || isReimbursementKeyword),
+        );
+        const isReimbursementCandidate =
+          txnType === 'debit' && ((isReimbursementKeyword && matchesMemberName) || matchesClaimAmount);
+        const isSalaryKeyword = !isReimbursementKeyword && !isSuppliesOrRent && (
           /\b(salary|salaries|payroll|payslip|wages|stipend|compensation|lump\s*sum|monthly\s*pay)\b/i.test(text) ||
           catId.includes('cat-pay')
         );
-        const matchesMemberName = !isReimbursementOrSupplies && members.some(m => doesTxnMatchMember(text, m));
 
         return {
           id: String(t.id),
@@ -2468,7 +2518,8 @@ export function createEmployeeMeRouter(): Router {
           allocatedAmount,
           remainingAmount,
           allocations,
-          isPayrollCandidate: txnType === 'debit' && (isSalaryKeyword || matchesMemberName || allocatedAmount > 0),
+          isReimbursementCandidate,
+          isPayrollCandidate: txnType === 'debit' && (isSalaryKeyword || isReimbursementCandidate || matchesMemberName || allocatedAmount > 0),
           isPayrollCredit: txnType === 'credit' && isSalaryKeyword,
         };
       });
@@ -2503,10 +2554,11 @@ export function createEmployeeMeRouter(): Router {
       const txnPeriod = extractPeriodFromTxn(txn, defaultPeriod);
       const normTxnPeriod = normalizePeriodKey(txnPeriod);
 
-      // Check how much each employee has already been paid for this period (across payslips and this txn)
+      // Check how much each employee has already been paid for this period (across active payslips and this txn)
       const memberPaymentInfo = members.map(m => {
         let paidForPeriod = 0;
         for (const p of rawPayslips) {
+          if (String(p.status || '').toLowerCase() === 'voided') continue;
           const pUid = String(p.user_id || p.userId || '');
           if (pUid === m.userId && normalizePeriodKey(p.period) === normTxnPeriod) {
             paidForPeriod += Number(p.gross || p.net || 0);
@@ -2533,23 +2585,74 @@ export function createEmployeeMeRouter(): Router {
       const unpaidInfo = memberPaymentInfo.filter(info => !info.isAlreadyPaid);
       const alreadyPaidInfo = memberPaymentInfo.filter(info => info.isAlreadyPaid);
 
+      // 0. AI Ledger Expense Claim Match: match ledger debit against employee_expenses by amount + description/period
+      if (txn.isReimbursementCandidate) {
+        const matchedClaim = rawPayableExpenses.find((exp: any) => {
+          if (exp.settlement_transaction_id && exp.settlement_transaction_id !== txn.id) return false;
+          if (Math.abs(round2(exp.amount) - txn.remainingAmount) >= 0.05) return false;
+          const expPeriod = normalizePeriodKey(extractPeriodFromTxn({ date: exp.date, description: exp.description }, defaultPeriod));
+          if (expPeriod !== normTxnPeriod) return false;
+          const emp = memberByUserId.get(String(exp.user_id));
+          const empNameMatch = emp ? doesTxnMatchMember(text, emp) : false;
+          const descWords = String(exp.description || '').toLowerCase().split(/\s+/).filter((w: string) => w.length >= 3);
+          const descMatch = descWords.some((w: string) => text.includes(w));
+          return empNameMatch || descMatch;
+        });
+
+        if (matchedClaim) {
+          const emp = memberByUserId.get(String(matchedClaim.user_id));
+          if (emp) {
+            aiSuggestions.push({
+              id: `ai-reimb-claim-${txn.id}-${emp.userId}`,
+              type: 'single_match',
+              kind: 'reimbursement',
+              matchedExpenseId: String(matchedClaim.id),
+              transactionId: txn.id,
+              transactionDescription: txn.description,
+              transactionDate: txn.date,
+              transactionAmount: txn.amount,
+              remainingAmount: txn.remainingAmount,
+              confidence: 97,
+              reasoning: `AI matched ledger debit "${txn.description}" ($${txn.remainingAmount.toLocaleString()}) to ${emp.name}'s ${matchedClaim.status} expense claim "${matchedClaim.description}".`,
+              period: txnPeriod,
+              suggestedAllocations: [
+                {
+                  userId: emp.userId,
+                  employeeName: emp.name,
+                  departmentId: emp.departmentId,
+                  departmentName: emp.departmentName,
+                  gross: txn.remainingAmount,
+                  net: txn.remainingAmount,
+                  kind: 'reimbursement',
+                },
+              ],
+            } as any);
+            continue;
+          }
+        }
+      }
+
       // 1. Check for direct employee name / email prefix match (excluding generic words like 'employee')
       const matchedMembers = members.filter(m => doesTxnMatchMember(text, m));
 
       if (matchedMembers.length === 1) {
         const emp = matchedMembers[0];
+        const isReimb = Boolean(txn.isReimbursementCandidate);
         const isSalaryWord = ['salary', 'payroll', 'pay', 'wage', 'stipend', 'wire', 'transfer'].some(w => text.includes(w));
-        const confidence = isSalaryWord ? 96 : 89;
+        const confidence = isReimb ? 93 : isSalaryWord ? 96 : 89;
         aiSuggestions.push({
           id: `ai-single-${txn.id}-${emp.userId}`,
           type: 'single_match',
+          kind: isReimb ? 'reimbursement' : 'salary',
           transactionId: txn.id,
           transactionDescription: txn.description,
           transactionDate: txn.date,
           transactionAmount: txn.amount,
           remainingAmount: txn.remainingAmount,
           confidence,
-          reasoning: `AI matched employee name "${emp.name}" (${emp.departmentName}) in ledger narration "${txn.description}". Issuing this payslip attributes ${txn.remainingAmount.toLocaleString()} directly to ${emp.departmentName} hourly cost without duplicating the ledger entry.`,
+          reasoning: isReimb
+            ? `AI matched ledger expense/reimbursement "${txn.description}" to ${emp.name} (${emp.departmentName}). Issuing merges this reimbursement into ${emp.name}'s ${txnPeriod} payslip without double-counting.`
+            : `AI matched employee name "${emp.name}" (${emp.departmentName}) in ledger narration "${txn.description}". Issuing this payslip attributes ${txn.remainingAmount.toLocaleString()} directly to ${emp.departmentName} hourly cost without duplicating the ledger entry.`,
           period: txnPeriod,
           suggestedAllocations: [
             {
@@ -2559,9 +2662,10 @@ export function createEmployeeMeRouter(): Router {
               departmentName: emp.departmentName,
               gross: txn.remainingAmount,
               net: txn.remainingAmount,
+              kind: isReimb ? 'reimbursement' : 'salary',
             },
           ],
-        });
+        } as any);
         continue;
       }
 
@@ -2699,6 +2803,22 @@ export function createEmployeeMeRouter(): Router {
       const uid = String(p.user_id || p.userId || '');
       const emp = memberByUserId.get(uid);
       const src = sourceTxnByPayslipId.get(id);
+      const netVal = round2(p.net || 0);
+      const grossVal = round2(p.gross || p.net || 0);
+      const normP = normalizePeriodKey(p.period);
+      const empPeriodExpenses = rawPayableExpenses.filter(
+        (e: any) =>
+          String(e.user_id) === uid &&
+          normalizePeriodKey(extractPeriodFromTxn({ date: e.date, description: e.description }, defaultPeriod)) === normP,
+      );
+      const expReimb = round2(
+        p.expected_reimbursements != null
+          ? p.expected_reimbursements
+          : empPeriodExpenses.reduce((s: number, e: any) => s + Number(e.amount || 0), 0),
+      );
+      const expSalary = round2(p.expected_salary != null ? p.expected_salary : emp?.fixedSalary || 0);
+      const computedVar = computePayslipVariance(netVal, expSalary, expReimb);
+
       payslipsMap.set(id, {
         id,
         organizationId: orgId,
@@ -2709,11 +2829,19 @@ export function createEmployeeMeRouter(): Router {
         departmentName: emp?.departmentName || 'General',
         period: String(p.period || ''),
         issueDate: String(p.issue_date || p.issueDate || ''),
-        gross: Number(p.gross || p.net || 0),
+        gross: grossVal,
         deductions: Array.isArray(p.deductions) ? p.deductions : [],
-        net: Number(p.net || 0),
+        net: netVal,
         currency: String(p.currency || 'USD'),
         status: String(p.status || 'paid'),
+        salaryAmount: p.salary_amount != null ? round2(p.salary_amount) : grossVal,
+        reimbursementAmount: p.reimbursement_amount != null ? round2(p.reimbursement_amount) : 0,
+        expectedSalary: computedVar.expectedSalary,
+        expectedReimbursements: computedVar.expectedReimbursements,
+        expectedTotal: p.expected_total != null ? round2(p.expected_total) : computedVar.expectedTotal,
+        varianceAmount: p.variance_amount != null ? round2(p.variance_amount) : computedVar.varianceAmount,
+        varianceStatus: p.variance_status || computedVar.varianceStatus,
+        reimbursementDetails: Array.isArray(p.reimbursement_details) ? p.reimbursement_details : [],
         sourceTransactionId: src?.txnId || null,
         sourceTransactionDescription: src?.description || null,
       });
@@ -2723,12 +2851,103 @@ export function createEmployeeMeRouter(): Router {
       (a, b) => parseTs(b.issueDate) - parseTs(a.issueDate)
     );
 
+    // Build per-employee Monthly Pay & Expense Reconciliation across all active periods + current month
+    const periodMap = new Map<string, string>();
+    periodMap.set(normalizePeriodKey(defaultPeriod), defaultPeriod);
+    for (const p of payslips) {
+      if (p.status === 'voided' || !p.period) continue;
+      const nk = normalizePeriodKey(p.period);
+      if (!periodMap.has(nk)) periodMap.set(nk, p.period);
+    }
+    for (const e of rawPayableExpenses) {
+      const ep = extractPeriodFromTxn({ date: e.date, description: e.description }, defaultPeriod);
+      const nk = normalizePeriodKey(ep);
+      if (!periodMap.has(nk)) periodMap.set(nk, ep);
+    }
+
+    const buildReconciliationForPeriod = (targetPeriod: string) => {
+      const normP = normalizePeriodKey(targetPeriod);
+      return members.map(m => {
+        const activeEmpPayslips = payslips.filter(
+          p => p.userId === m.userId && p.status !== 'voided' && normalizePeriodKey(p.period) === normP,
+        );
+        const salaryPaid = round2(activeEmpPayslips.reduce((s, p) => s + Number(p.salaryAmount ?? p.gross ?? 0), 0));
+        const payslipReimbPaid = round2(
+          activeEmpPayslips.reduce((s, p) => s + Number(p.reimbursementAmount ?? 0), 0),
+        );
+        const linkedIds = new Set<string>(
+          activeEmpPayslips.flatMap((p: any) => (Array.isArray(p.linkedExpenseIds) ? p.linkedExpenseIds : [])),
+        );
+
+        const matchedExpenses = rawPayableExpenses.filter(
+          (e: any) =>
+            String(e.user_id) === m.userId &&
+            normalizePeriodKey(extractPeriodFromTxn({ date: e.date, description: e.description }, targetPeriod)) === normP,
+        );
+        const expectedReimbursements = round2(
+          matchedExpenses.reduce((s: number, e: any) => s + Number(e.amount || 0), 0),
+        );
+        // Also check ledger debit transactions matched by AI to this employee as reimbursements in this period (if not yet allocated to a payslip)
+        const unallocatedLedgerReimbs = debitTransactions.filter(t => {
+          if (t.type !== 'debit' || !t.isReimbursementCandidate || t.remainingAmount <= 0.01) return false;
+          const tPeriod = normalizePeriodKey(extractPeriodFromTxn(t, targetPeriod));
+          if (tPeriod !== normP) return false;
+          const sug = aiSuggestions.find(s => s.transactionId === t.id);
+          return sug?.suggestedAllocations?.some((a: any) => a.userId === m.userId && (a.kind === 'reimbursement' || t.isReimbursementCandidate));
+        });
+        const ledgerReimbSum = round2(unallocatedLedgerReimbs.reduce((s, t) => s + Number(t.remainingAmount || 0), 0));
+
+        // Include manually-marked `reimbursed` claims that aren't already counted inside a payslip's reimbursementAmount
+        const unlinkedReimbursedPaid =
+          payslipReimbPaid > 0
+            ? 0
+            : round2(
+                matchedExpenses
+                  .filter((e: any) => e.status === 'reimbursed' && !linkedIds.has(String(e.id)))
+                  .reduce((s: number, e: any) => s + Number(e.amount || 0), 0),
+              );
+        const effectiveExpectedReimb = round2(Math.max(expectedReimbursements, ledgerReimbSum));
+        const reimbursementPaid = round2(payslipReimbPaid + Math.max(unlinkedReimbursedPaid, ledgerReimbSum));
+        const totalPaid = round2(salaryPaid + reimbursementPaid);
+        const variance = computePayslipVariance(totalPaid, m.fixedSalary, effectiveExpectedReimb);
+
+        return {
+          userId: m.userId,
+          employeeName: m.name,
+          employeeEmail: m.email,
+          departmentName: m.departmentName,
+          period: targetPeriod,
+          expectedSalary: variance.expectedSalary,
+          expectedReimbursements: variance.expectedReimbursements,
+          expectedTotal: variance.expectedTotal,
+          salaryPaid,
+          reimbursementPaid,
+          totalPaid,
+          varianceAmount: variance.varianceAmount,
+          varianceStatus: variance.varianceStatus,
+          expenseCount: matchedExpenses.length,
+        };
+      });
+    };
+
+    const reconciliationPeriods = Array.from(periodMap.values());
+    const reconciliationsByPeriod: Record<string, any[]> = {};
+    for (const pLabel of reconciliationPeriods) {
+      reconciliationsByPeriod[pLabel] = buildReconciliationForPeriod(pLabel);
+    }
+    const activePeriod = defaultPeriod;
+    const reconciliationSummary = reconciliationsByPeriod[activePeriod] || [];
+
     ok(res, {
       members,
       departments,
       debitTransactions,
       payslips,
       aiSuggestions,
+      reconciliationSummary,
+      reconciliationPeriods,
+      reconciliationsByPeriod,
+      activePeriod,
     });
   });
 
@@ -2743,6 +2962,7 @@ export function createEmployeeMeRouter(): Router {
 
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
+    const idempotencyKey = (req.header('idempotency-key') || req.header('x-idempotency-key') || '').trim() || undefined;
     const {
       sourceTransactionId,
       period,
@@ -2772,6 +2992,51 @@ export function createEmployeeMeRouter(): Router {
     const cleanAllocations = allocations.filter(a => a && a.userId && Number(a.gross) > 0);
     if (cleanAllocations.length === 0) {
       return fail(res, 400, 'Valid employee allocations with gross amount > 0 are required');
+    }
+
+    // 0. Idempotency replay check (§17, §33 #7)
+    if (sb && idempotencyKey) {
+      try {
+        const { data: existingIdem } = await sb
+          .from('employee_payslips')
+          .select('*')
+          .eq('organization_id', orgId)
+          .eq('idempotency_key', idempotencyKey);
+        if (existingIdem && existingIdem.length > 0) {
+          const replayed = existingIdem.map((p: any) => ({
+            id: p.id,
+            organizationId: p.organization_id,
+            userId: p.user_id,
+            period: p.period,
+            issueDate: p.issue_date,
+            gross: Number(p.gross || p.net || 0),
+            deductions: Array.isArray(p.deductions) ? p.deductions : [],
+            net: Number(p.net || 0),
+            currency: p.currency || 'USD',
+            status: p.status || 'paid',
+          }));
+          return ok(res, { issuedPayslips: replayed, idempotentReplay: true }, `Idempotent replay: ${replayed.length} payslip(s)`);
+        }
+      } catch {
+        // Non-fatal if migration 0042 not yet applied
+      }
+    }
+
+    // 0b. Verify every target userId is an active member of this organization (§5, §33 #11)
+    if (sb) {
+      const targetUserIds = Array.from(new Set(cleanAllocations.map(a => a.userId)));
+      const { data: validMembers, error: memCheckErr } = await sb
+        .from('organization_members')
+        .select('user_id')
+        .eq('organization_id', orgId)
+        .in('user_id', targetUserIds);
+      if (!memCheckErr && Array.isArray(validMembers)) {
+        const validSet = new Set(validMembers.map((m: any) => String(m.user_id)));
+        const invalidUid = targetUserIds.find(uid => !validSet.has(uid));
+        if (invalidUid) {
+          return fail(res, 403, `Forbidden: User ${invalidUid} is not a member of organization ${orgId}`);
+        }
+      }
     }
 
     const periodClean = period.trim();
@@ -2827,61 +3092,195 @@ export function createEmployeeMeRouter(): Router {
       }
     }
 
-    // 2. Create/upsert payslips in Supabase public.employee_payslips (and in-memory store)
+    // 2. Create/upsert payslips in Supabase public.employee_payslips with salary+expense reconciliation
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const issuedPayslips: any[] = [];
     const newAllocTags: string[] = [];
+    const normTargetPeriod = normalizePeriodKey(periodClean);
+
+    // Fetch member fixed salaries & period approved/reimbursed expenses for variance calculation
+    const memberSalaryMap = new Map<string, number>();
+    const periodExpenseMap = new Map<string, any[]>();
+    const existingActiveByUser = new Map<string, any>();
+
+    if (sb) {
+      try {
+        const targetUids = Array.from(new Set(cleanAllocations.map(a => a.userId)));
+        const [memSalRes, expRes, existingPsRes] = await Promise.all([
+          sb.from('organization_members').select('user_id, fixed_salary').eq('organization_id', orgId).in('user_id', targetUids),
+          sb.from('employee_expenses').select('*').eq('organization_id', orgId).in('user_id', targetUids).in('status', ['approved', 'reimbursed']),
+          sb.from('employee_payslips').select('*').eq('organization_id', orgId).in('user_id', targetUids).neq('status', 'voided'),
+        ]);
+        for (const m of memSalRes?.data || []) {
+          memberSalaryMap.set(String(m.user_id), round2(m.fixed_salary || 0));
+        }
+        for (const e of expRes?.data || []) {
+          const expNorm = normalizePeriodKey(extractPeriodFromTxn({ date: e.date, description: e.description }).periodStr);
+          if (expNorm === normTargetPeriod) {
+            const list = periodExpenseMap.get(String(e.user_id)) || [];
+            list.push(e);
+            periodExpenseMap.set(String(e.user_id), list);
+          }
+        }
+        for (const p of existingPsRes?.data || []) {
+          if (normalizePeriodKey(p.period) === normTargetPeriod) {
+            existingActiveByUser.set(String(p.user_id), p);
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }
 
     for (const alloc of cleanAllocations) {
-      const gross = Math.round(Number(alloc.gross) * 100) / 100;
+      const allocAmt = round2(alloc.gross);
+      const allocKind: 'salary' | 'reimbursement' = (alloc as any).kind === 'reimbursement' ? 'reimbursement' : 'salary';
+      const existing = existingActiveByUser.get(alloc.userId);
+
       // Keep deductions strictly as Array<{ label, amount }> (Flaw #5 safeguard)
       const pureDeductions = Array.isArray(alloc.deductions)
         ? alloc.deductions
           .filter((d: any) => d && (typeof d.label === 'string' || typeof d.name === 'string') && Number(d.amount) > 0)
           .map((d: any) => {
             const lbl = String(d.name || d.label || 'Deduction').trim();
-            const amt = Math.round(Number(d.amount) * 100) / 100;
+            const amt = round2(d.amount);
             return { name: lbl, label: lbl, amount: amt };
           })
         : [];
-      const totalDed = pureDeductions.reduce((s, d) => s + d.amount, 0);
-      const net = Math.max(0, Math.round((gross - totalDed) * 100) / 100);
-      const currency = alloc.currency || sourceTxn?.currency || 'USD';
-      const payslipId = `ps-${sourceTransactionId || 'manual'}-${alloc.userId}-${periodSlug}`;
+
+      const prevSal = existing && existing.source_transaction_id !== sourceTransactionId
+        ? round2(existing.salary_amount ?? (Number(existing.reimbursement_amount || 0) === 0 ? existing.gross : 0))
+        : 0;
+      const prevReimb = existing && existing.source_transaction_id !== sourceTransactionId
+        ? round2(existing.reimbursement_amount || 0)
+        : 0;
+
+      const salaryAmount = allocKind === 'salary' ? round2(prevSal + allocAmt) : prevSal;
+      const reimbursementAmount = allocKind === 'reimbursement' ? round2(prevReimb + allocAmt) : prevReimb;
+      const gross = round2(salaryAmount + reimbursementAmount);
+
+      const mergedDeductions = pureDeductions.length > 0
+        ? pureDeductions
+        : (Array.isArray(existing?.deductions) ? existing.deductions : []);
+      const totalDed = round2(mergedDeductions.reduce((s: number, d: any) => s + Number(d?.amount || 0), 0));
+      const net = Math.max(0, round2(gross - totalDed));
+      const currency = alloc.currency || sourceTxn?.currency || existing?.currency || 'USD';
+      const payslipId = existing?.id || `ps-${sourceTransactionId || 'manual'}-${alloc.userId}-${periodSlug}`;
+
+      const expSalary = memberSalaryMap.get(alloc.userId) ?? 0;
+      const userPeriodExps = periodExpenseMap.get(alloc.userId) || [];
+      const expReimb = round2(userPeriodExps.reduce((s: number, e: any) => s + Number(e.amount || 0), 0));
+      const variance = computePayslipVariance(net, expSalary, expReimb);
 
       const payslipObj = {
         id: payslipId,
         organizationId: orgId,
         userId: alloc.userId,
-        period: periodClean,
+        period: existing?.period || periodClean,
         issueDate: effIssueDate,
         gross,
-        deductions: pureDeductions,
+        deductions: mergedDeductions,
         net,
         currency,
         status: 'paid' as const,
+        salaryAmount,
+        reimbursementAmount,
+        expectedSalary: variance.expectedSalary,
+        expectedReimbursements: variance.expectedReimbursements,
+        expectedTotal: variance.expectedTotal,
+        varianceAmount: variance.varianceAmount,
+        varianceStatus: variance.varianceStatus,
       };
 
       // Upsert into Supabase if userId is a valid UUID (Flaw #6 safeguard)
       if (sb && uuidRegex.test(alloc.userId)) {
         try {
-          const { error: psErr } = await sb.from('employee_payslips').upsert({
+          const upsertRow: Record<string, any> = {
             id: payslipId,
             organization_id: orgId,
             user_id: alloc.userId,
-            period: periodClean,
+            period: existing?.period || periodClean,
             issue_date: effIssueDate,
             gross,
-            deductions: pureDeductions,
+            deductions: mergedDeductions,
             net,
             currency,
             status: 'paid',
-          });
+            source_transaction_id: existing?.source_transaction_id || sourceTransactionId || null,
+            department_id: alloc.departmentId || null,
+            salary_amount: salaryAmount,
+            reimbursement_amount: reimbursementAmount,
+            expected_salary: variance.expectedSalary,
+            expected_reimbursements: variance.expectedReimbursements,
+            expected_total: variance.expectedTotal,
+            variance_amount: variance.varianceAmount,
+            variance_status: variance.varianceStatus,
+            issued_by: req.authUser?.id || null,
+            ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+          };
+          let { error: psErr } = await sb.from('employee_payslips').upsert(upsertRow);
+          if (
+            psErr &&
+            (psErr.message?.includes('issued_by') ||
+              psErr.message?.includes('idempotency_key') ||
+              psErr.message?.includes('salary_amount') ||
+              psErr.message?.includes('variance_status'))
+          ) {
+            delete upsertRow.issued_by;
+            delete upsertRow.idempotency_key;
+            delete upsertRow.salary_amount;
+            delete upsertRow.reimbursement_amount;
+            delete upsertRow.expected_salary;
+            delete upsertRow.expected_reimbursements;
+            delete upsertRow.expected_total;
+            delete upsertRow.variance_amount;
+            delete upsertRow.variance_status;
+            const retry = await sb.from('employee_payslips').upsert(upsertRow);
+            psErr = retry.error;
+          }
           if (psErr) {
             console.warn('[payslips.issue] Supabase employee_payslips upsert warning:', psErr.message);
+          } else if (sourceTransactionId) {
+            try {
+              await sb.from('payslip_allocations').upsert({
+                id: `pa-${payslipId}-${sourceTransactionId}-${allocKind}`,
+                organization_id: orgId,
+                payslip_id: payslipId,
+                transaction_id: sourceTransactionId,
+                department_id: alloc.departmentId || null,
+                allocated_amount: allocAmt,
+                allocation_kind: allocKind,
+              });
+            } catch {
+              // non-fatal if migration 0042/0043 not yet applied
+            }
           }
         } catch (err) {
           console.warn('[payslips.issue] Supabase upsert error:', err);
+        }
+      }
+
+      // Emit transactional outbox event (§19, §33 #7)
+      if (sb) {
+        try {
+          const { emitOutboxEvent } = await import('../lib/outboxService.js');
+          void emitOutboxEvent(sb, {
+            organizationId: orgId,
+            eventType: 'payslip.issued',
+            resourceType: 'employee_payslip',
+            resourceId: payslipId,
+            payload: {
+              userId: alloc.userId,
+              period: periodClean,
+              gross,
+              net,
+              currency,
+              sourceTransactionId: sourceTransactionId || null,
+              issuedBy: req.authUser?.id || null,
+            },
+          });
+        } catch {
+          // non-fatal
         }
       }
 
@@ -2899,7 +3298,7 @@ export function createEmployeeMeRouter(): Router {
           period: periodClean,
           issueDate: effIssueDate,
           gross,
-          deductions: pureDeductions,
+          deductions: mergedDeductions,
           net,
           currency,
           employeeName: alloc.employeeName,
@@ -2909,7 +3308,7 @@ export function createEmployeeMeRouter(): Router {
 
       if (sourceTransactionId) {
         const safeDept = (alloc.departmentId || 'dept').replace(/:/g, '-');
-        newAllocTags.push(`payslip_alloc:${payslipId}:${alloc.userId}:${safeDept}:${gross}:${periodSlug}`);
+        newAllocTags.push(`payslip_alloc:${payslipId}:${alloc.userId}:${safeDept}:${allocAmt}:${periodSlug}:${allocKind}`);
       }
     }
 
@@ -2940,6 +3339,15 @@ export function createEmployeeMeRouter(): Router {
         }
       }
     }
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'issue_payslips',
+      entityType: 'employee_payslip',
+      entityId: issuedPayslips.map(p => p.id).join(','),
+      description: `Issued ${issuedPayslips.length} payslip(s) for ${periodClean}${sourceTransactionId ? ` linked to txn ${sourceTransactionId}` : ''}`,
+      afterState: { issuedPayslips, sourceTransactionId: sourceTransactionId || null },
+    }).catch(() => {});
+
     created(res, { issuedPayslips }, `Successfully issued ${issuedPayslips.length} payslip(s)`);
   });
 
@@ -2948,6 +3356,10 @@ export function createEmployeeMeRouter(): Router {
    * Scan unallocated statement transactions and automatically detect/issue payslips.
    */
   r.post('/payroll/auto-detect', async (req: Request, res: Response) => {
+    if (!canViewConfidentialPayroll(req)) {
+      return fail(res, 403, 'Forbidden: Confidential payroll access required');
+    }
+
     const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
     const sb = getSupabaseAdminClient();
     if (!sb || !orgId) {
@@ -2968,7 +3380,19 @@ export function createEmployeeMeRouter(): Router {
         return fail(res, 500, txnErr.message);
       }
 
-      const result = await detectAndIssuePayslipsForTransactions(sb, orgId, txns || []);
+      const result = await detectAndIssuePayslipsForTransactions(sb, orgId, txns || [], {
+        authUserId: req.authUser?.id,
+      });
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'auto_detect_payroll',
+        entityType: 'employee_payslip',
+        entityId: result.details.map(d => d.transactionId).join(',') || 'none',
+        description: `Auto-detected payroll across ${result.processedTransactions} transactions; issued ${result.autoIssuedCount} payslip(s)`,
+        afterState: { autoIssuedCount: result.autoIssuedCount, autoAllocatedAmount: result.autoAllocatedAmount },
+      }).catch(() => {});
+
       ok(res, result, `Auto-detection completed. Issued ${result.autoIssuedCount} payslip(s).`);
     } catch (err: any) {
       console.error('[payroll.auto-detect] Error:', err);
@@ -2978,7 +3402,7 @@ export function createEmployeeMeRouter(): Router {
 
   /**
    * POST /organizations/:organizationId/me/payslips/void
-   * Safely void/cancel an issued payslip and clean up source transaction allocation tags.
+   * Safely void/cancel an issued payslip (immutable soft-void) and clean up source transaction allocation tags.
    */
   r.post('/payslips/void', async (req: Request, res: Response) => {
     if (!canViewConfidentialPayroll(req)) {
@@ -2986,7 +3410,7 @@ export function createEmployeeMeRouter(): Router {
     }
 
     const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
-    const { payslipId } = req.body || {};
+    const { payslipId, reason } = req.body || {};
     if (!payslipId) {
       return fail(res, 400, 'payslipId is required');
     }
@@ -2997,10 +3421,21 @@ export function createEmployeeMeRouter(): Router {
     }
 
     try {
-      const voidRes = await voidPayslip(sb, orgId, payslipId);
+      const voidRes = await voidPayslip(sb, orgId, payslipId, req.authUser?.id, reason);
       if (!voidRes.success) {
         return fail(res, 400, voidRes.message);
       }
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'void_payslip',
+        entityType: 'employee_payslip',
+        entityId: payslipId,
+        description: `Voided payslip ${payslipId}${reason ? `: ${reason}` : ''}`,
+        beforeState: voidRes.beforeState || null,
+        afterState: { status: 'voided', reason: reason || 'Voided by payroll administrator' },
+      }).catch(() => {});
+
       ok(res, voidRes, voidRes.message);
     } catch (err: any) {
       console.error('[payslips.void] Error:', err);

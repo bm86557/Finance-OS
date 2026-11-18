@@ -4,6 +4,17 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 
 import { canViewConfidentialPayroll } from '../middleware/auth.js';
+import {
+  computeBalanceSheetSnapshot,
+  computeCashFlowSnapshot,
+  computeProfitLossSnapshot,
+  filterAccessibleBanks,
+  isLoanRepaymentTxn as isLoanRepaymentShared,
+  isTransferTxn as isTransferShared,
+  mapAndFilterWorldTransactions,
+  NON_POSTED_STATUSES,
+  type WorldFilter,
+} from '../services/financialTruthService.js';
 
 function getOrgId(req: Request): string {
   return req.orgMembership?.organizationId ?? (Array.isArray(req.params.organizationId) ? String(req.params.organizationId[0]) : String(req.params.organizationId ?? ''));
@@ -70,36 +81,15 @@ export function createReportsRouter(): Router {
     }
 
     // ── World Isolation Map for Bank Accounts (§1, §5, §8, §33) ──────────────
-    const allBanks = (bankAccounts ?? []).filter((b: any) => {
-      const usage = b.usage === 'personal' ? 'personal' : 'business';
-      // Enforce personal account privacy: only owner_user_id or org owner can see personal accounts
-      if (usage === 'personal' && b.owner_user_id && b.owner_user_id !== callerUserId && !isOrgOwner) {
-        return false;
-      }
-      return true;
-    });
+    const { allAccessibleBanks: allBanks, worldBanks: banks, bankWorldMap } = filterAccessibleBanks(
+      bankAccounts ?? [],
+      worldFilter,
+      callerUserId,
+      isOrgOwner,
+    );
 
-    const bankWorldMap = new Map<string, 'business' | 'personal'>();
-    for (const b of allBanks) {
-      bankWorldMap.set(String(b.id), b.usage === 'personal' ? 'personal' : 'business');
-    }
-
-    const banks = allBanks.filter((b: any) => {
-      const bWorld = b.usage === 'personal' ? 'personal' : 'business';
-      if (worldFilter === 'all') return true;
-      return bWorld === worldFilter;
-    });
-
-    const isLoanRepaymentTxn = (t: { categoryId?: string; description?: string; narration?: string }) => {
-      const cName = (t.categoryId ? catMap.get(t.categoryId) : '') || '';
-      const desc = (t.description || '').toLowerCase();
-      const narr = (t.narration || '').toLowerCase();
-      return (
-        cName.toLowerCase().includes('loan repayment') ||
-        desc.includes('loan repayment') ||
-        (narr.includes('monthly installment') && narr.includes('loan'))
-      );
-    };
+    const isLoanRepaymentTxn = (t: { categoryId?: string; description?: string; narration?: string }) =>
+      isLoanRepaymentShared(t, catMap);
 
     // ── Internal Transfer Detection (§1, §8, §23 F-01, §33) ──────────────────
     const isTransferTxn = (t: {
@@ -109,79 +99,17 @@ export function createReportsRouter(): Router {
       categoryId?: string;
       description?: string;
       narration?: string;
-    }) => {
-      if (t.isTransfer || t.transferGroupId) return true;
-      const tags = t.tags || [];
-      if (tags.includes('transfer')) return true;
-      const cName = ((t.categoryId ? catMap.get(t.categoryId) : '') || '').toLowerCase();
-      if (cName === 'transfer' || cName === 'internal transfer' || cName === 'cash withdrawal') return true;
-      const desc = (t.description || '').toLowerCase();
-      const narr = (t.narration || '').toLowerCase();
-      return (
-        desc.startsWith('transfer to ') ||
-        desc.startsWith('transfer from ') ||
-        desc.includes('internal transfer') ||
-        desc.includes('atm withdrawal') ||
-        narr.includes('internal transfer')
-      );
-    };
-
-    const allMappedTransactions = (txns ?? []).map((row: any) => {
-      const rawAmt = Number(row.amount);
-      const rawCurr = String(row.currency ?? orgCurrency);
-      let fxRate: number | undefined = row.fx_rate_to_base ? Number(row.fx_rate_to_base) : undefined;
-      const tags: string[] = Array.isArray(row.tags) ? row.tags.map(String) : [];
-      if (!fxRate && tags.length > 0) {
-        const rTag = tags.find((tag: string) => tag.startsWith('fx:rate:'));
-        if (rTag) fxRate = Number(rTag.slice(8));
-      }
-      const convertedAmt =
-        row.base_amount != null && Number(row.base_amount) > 0 && String(row.base_currency || orgCurrency).toUpperCase() === orgCurrency
-          ? Number(row.base_amount)
-          : convertCurrency(rawAmt, rawCurr, orgCurrency, fxRate);
-
-      const bankId = String(row.bank_account_id);
-      const inferredWorld: 'business' | 'personal' =
-        row.world_scope === 'personal' ||
-        tags.includes('personal') ||
-        bankWorldMap.get(bankId) === 'personal'
-          ? 'personal'
-          : 'business';
-
-      return {
-        id: String(row.id),
-        organizationId: String(row.organization_id),
-        bankAccountId: bankId,
-        date: String(row.date),
-        description: String(row.description ?? ''),
-        narration: String(row.narration ?? ''),
-        amount: convertedAmt,
-        rawAmount: rawAmt,
-        currency: rawCurr,
-        convertedCurrency: orgCurrency,
-        type: row.type === 'credit' ? ('credit' as const) : ('debit' as const),
-        categoryId: row.category_id ? String(row.category_id) : undefined,
-        departmentId: row.department_id ? String(row.department_id) : undefined,
-        projectId: row.project_id ? String(row.project_id) : undefined,
-        status: String(row.status || 'classified'),
-        worldScope: inferredWorld,
-        ownerUserId: row.owner_user_id ? String(row.owner_user_id) : undefined,
-        isTransfer: Boolean(row.is_transfer),
-        transferGroupId: row.transfer_group_id ? String(row.transfer_group_id) : undefined,
-        tags,
-        attachments: Array.isArray(row.attachments) ? row.attachments : [],
-        createdAt: String(row.created_at || new Date().toISOString()),
-      };
-    });
+    }) => isTransferShared(t, catMap);
 
     // Apply World Isolation filter (§1, §5, §33)
-    const worldTransactions = allMappedTransactions.filter(t => {
-      if (t.worldScope === 'personal' && t.ownerUserId && t.ownerUserId !== callerUserId && !isOrgOwner) {
-        return false;
-      }
-      if (worldFilter === 'all') return true;
-      return t.worldScope === worldFilter;
-    });
+    const worldTransactions = mapAndFilterWorldTransactions(
+      txns ?? [],
+      orgCurrency,
+      bankWorldMap,
+      worldFilter,
+      callerUserId,
+      isOrgOwner,
+    );
 
     // Separate Pending / Unapproved rows from Committed / Posted rows (§8, §33)
     const pendingList = worldTransactions.filter(t => t.status === 'pending' || t.status === 'draft');
@@ -263,184 +191,37 @@ export function createReportsRouter(): Router {
           );
     const monthlyPayroll = includePayrollConfidential ? rawMonthlyPayroll : 0;
 
-    // 1. Bank & Cash Account Live Balances (includes posted transfers so Bank <-> Cash balances move accurately)
-    const getLiveBankBalance = (b: any): number => {
-      // In FINANCE OS, bank_accounts.balance / current_balance is the authoritative source of truth (§1, §8, §33 #1).
-      const storedBal = b.current_balance ?? b.balance;
-      if (storedBal != null && Number(storedBal) !== 0) {
-        return Math.round(Number(storedBal) * 100) / 100;
-      }
-      const accountTxns = (txns ?? []).filter(
-        (t: any) =>
-          t.bank_account_id === b.id &&
-          !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
-      );
-      const bankCurrency = b.currency || orgCurrency;
-      if (accountTxns.length > 0) {
-        const rawOpening = b.opening_balance;
-        const openingBal = rawOpening != null
-          ? Number(rawOpening)
-          : (storedBal != null ? Number(storedBal) : 0);
-        const live = accountTxns.reduce((sum: number, t: any) => {
-          const rawAmt = Number(t.amount || 0);
-          const txnCurrency = t.currency || bankCurrency;
-          let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-          if (!fxRate && Array.isArray(t.tags)) {
-            const rTag = t.tags.find((tag: string) => tag.startsWith('fx:rate:'));
-            if (rTag) fxRate = Number(rTag.slice(8));
-          }
-          const convertedAmt = convertCurrency(rawAmt, txnCurrency, bankCurrency, fxRate);
-          return t.type === 'credit' ? sum + Math.abs(convertedAmt) : sum - Math.abs(convertedAmt);
-        }, openingBal);
-        return Math.round(live * 100) / 100;
-      }
-      return Number(b.current_balance ?? b.balance ?? 0);
-    };
+    // 1–7. Authoritative Balance Sheet & Net Worth Snapshot (shared with /balance-sheet & /bank-accounts)
+    const bsSnapshot = computeBalanceSheetSnapshot({
+      orgCurrency,
+      worldFilter,
+      allAccessibleBanks: allBanks,
+      worldBanks: banks,
+      rawTxns: txns ?? [],
+      accounts: accounts ?? [],
+      loanRows: loanRows ?? [],
+      assetRows: assetRows ?? [],
+      invRows: invRows ?? [],
+    });
 
-    // Separate Bank/Wallet Accounts from Physical Cash Accounts and Credit Facilities (§1, §8, §23 F-01)
-    const nonCashBankAccounts = banks.filter(
-      (b: any) => !['credit_card', 'line_of_credit', 'credit', 'cash'].includes(String(b.account_type || ''))
-    );
+    const {
+      cashInBank,
+      cashOnHand,
+      totalBankBalanceBase,
+      totalLiquidCash,
+      accountsReceivable,
+      accountsPayable,
+      loansReceivable,
+      loansPayable,
+      totalInventory,
+      totalFixedAssets,
+      totalAssets,
+      totalLiabilities,
+      netWorth,
+      liquidNetWorth,
+    } = bsSnapshot;
+
     const cashTypeBankAccounts = banks.filter((b: any) => String(b.account_type || '') === 'cash');
-    const creditFacilityAccounts = banks.filter((b: any) =>
-      ['credit_card', 'line_of_credit', 'credit'].includes(String(b.account_type || ''))
-    );
-
-    const cashInBank = nonCashBankAccounts.reduce(
-      (s: number, b: any) => s + convertCurrency(getLiveBankBalance(b), b.currency || orgCurrency, orgCurrency),
-      0
-    );
-    const physicalCashFromBankAccounts = cashTypeBankAccounts.reduce(
-      (s: number, b: any) => s + convertCurrency(getLiveBankBalance(b), b.currency || orgCurrency, orgCurrency),
-      0
-    );
-    const creditFromBanks = creditFacilityAccounts.reduce(
-      (s: number, b: any) => s + Math.abs(convertCurrency(getLiveBankBalance(b), b.currency || orgCurrency, orgCurrency)),
-      0
-    );
-
-    const accountsList = (accounts ?? []).map((row: any) => ({
-      id: String(row.id),
-      organizationId: String(row.organization_id),
-      name: String(row.name),
-      type: String(row.type),
-      subtype: String(row.subtype),
-      balance: convertCurrency(Number(row.balance ?? 0), row.currency || orgCurrency, orgCurrency),
-      currency: orgCurrency,
-      isActive: Boolean(row.is_active),
-    }));
-
-    // 2. Physical Cash in Hand (Cash-type bank_accounts + unlinked Chart of Accounts subtype='cash')
-    const linkedCashCoAIds = new Set(cashTypeBankAccounts.map((b: any) => String(b.account_id || '')).filter(Boolean));
-    const physicalCashFromCoA =
-      worldFilter === 'personal'
-        ? 0
-        : accountsList
-            .filter(a => a.type === 'asset' && a.subtype === 'cash' && !linkedCashCoAIds.has(a.id))
-            .reduce((s, a) => s + a.balance, 0);
-
-    const cashOnHand = Math.round((physicalCashFromBankAccounts + physicalCashFromCoA) * 100) / 100;
-    // Total Bank & Cash Balance: Cash in Bank + Cash in Hand minus revolving credit facilities (§1, §8, §15, §33)
-    const totalBankBalanceBase = Math.round((cashInBank + cashOnHand - creditFromBanks) * 100) / 100;
-    // Total Liquid Cash (strictly avoiding double attribution of physical cash)
-    const totalLiquidCash = Math.max(0, Math.round((cashInBank + cashOnHand) * 100) / 100);
-
-    // 3. Real Fixed Assets Net Book Value (Purchase Price minus Accumulated Depreciation)
-    const fixedAssets = worldFilter === 'personal' ? [] : (assetRows || []);
-    const totalFixedAssets = fixedAssets
-      .filter((a: any) => a.status !== 'disposed')
-      .reduce((s: number, a: any) => {
-        const p = Number(a.purchase_price || 0);
-        let acc = Number(a.accumulated_depreciation || 0);
-        const salv = Number(a.salvage_value || 0);
-        const useful = Number(a.useful_life_years || 5);
-        if (acc === 0 && a.purchase_date && useful > 0) {
-          const pDate = new Date(a.purchase_date);
-          const elapsedMonths = Math.max(0, (now.getFullYear() - pDate.getFullYear()) * 12 + (now.getMonth() - pDate.getMonth()));
-          const deprAmount = Math.max(0, p - salv);
-          acc = Math.min(deprAmount, (deprAmount / (useful * 12)) * elapsedMonths);
-        }
-        const cur = a.current_value != null ? Number(a.current_value) : Math.max(salv, p - acc);
-        const convCur = convertCurrency(cur, a.currency || orgCurrency, orgCurrency);
-        return s + convCur;
-      }, 0);
-
-    // 4. Real Inventory Valuation (current_stock * average_cost)
-    const inventory = worldFilter === 'personal' ? [] : (invRows || []);
-    const totalInventory = inventory
-      .filter((i: any) => i.is_active !== false)
-      .reduce((s: number, i: any) => {
-        const stock = Number(i.current_stock || 0);
-        const cost = Number(i.average_cost || i.unit_cost || 0);
-        const val = stock * cost;
-        return s + convertCurrency(val, i.currency || orgCurrency, orgCurrency);
-      }, 0);
-
-    // 5. Active Loans Receivable and Payable
-    const activeLoans = worldFilter === 'personal' ? [] : (loanRows || []);
-    const loansReceivable = activeLoans
-      .filter((l: any) => l.type === 'to_receive' && l.status !== 'paid')
-      .reduce((s: number, l: any) => s + convertCurrency(Number(l.remaining_balance ?? l.amount ?? l.principal) || 0, l.currency || orgCurrency, orgCurrency), 0);
-    const loansPayable = activeLoans
-      .filter((l: any) => l.type === 'to_pay' && l.status !== 'paid')
-      .reduce((s: number, l: any) => s + convertCurrency(Number(l.remaining_balance ?? l.amount ?? l.principal) || 0, l.currency || orgCurrency, orgCurrency), 0);
-
-    const arAccounts =
-      worldFilter === 'personal'
-        ? []
-        : accountsList.filter(
-            a => a.type === 'asset' && (a.subtype === 'accounts_receivable' || a.name.toLowerCase().includes('receivable'))
-          );
-    const accountsReceivable = arAccounts.reduce((s, a) => s + a.balance, 0) + loansReceivable;
-
-    // 6. Accounts Payable / Loans (Deduplicating if loan already exists in Accounts Payable chart of accounts)
-    const apAccounts =
-      worldFilter === 'personal'
-        ? []
-        : accountsList.filter(
-            a => a.type === 'liability' && (a.subtype === 'accounts_payable' || a.name.toLowerCase().includes('payable'))
-          );
-    const apBalance = apAccounts.reduce((s, a) => s + a.balance, 0);
-    // Deduplicate if the accounts payable ledger line represents the existing loan liability
-    const accountsPayable = Math.abs(apBalance - loansPayable) < 2000
-      ? Math.max(apBalance, loansPayable)
-      : (apBalance + loansPayable);
-
-    // 7. Other Assets & Liabilities (Strictly deduplicating Bank, Cash, Receivables, Inventory and Fixed Assets)
-    const allBankCoAIds = new Set(allBanks.map((b: any) => String(b.account_id || '')).filter(Boolean));
-    const otherAssets =
-      worldFilter === 'personal'
-        ? 0
-        : accountsList
-            .filter(
-              a =>
-                a.type === 'asset' &&
-                !allBankCoAIds.has(a.id) &&
-                !['cash', 'bank_account', 'current_asset', 'accounts_receivable', 'inventory', 'fixed_asset'].includes(a.subtype) &&
-                !a.name.toLowerCase().includes('receivable') &&
-                !a.name.toLowerCase().includes('inventory') &&
-                !a.name.toLowerCase().includes('fixed asset') &&
-                !a.name.toLowerCase().includes('bank') &&
-                !a.name.toLowerCase().includes('cash')
-            )
-            .reduce((s, a) => s + a.balance, 0);
-
-    const otherLiabilities =
-      worldFilter === 'personal'
-        ? 0
-        : accountsList
-            .filter(
-              a =>
-                a.type === 'liability' &&
-                !['accounts_payable', 'credit_card', 'line_of_credit'].includes(a.subtype) &&
-                !a.name.toLowerCase().includes('payable')
-            )
-            .reduce((s, a) => s + a.balance, 0);
-
-    const totalAssets = Math.round((cashInBank + cashOnHand + accountsReceivable + totalInventory + totalFixedAssets + otherAssets) * 100) / 100;
-    const totalLiabilities = Math.round((creditFromBanks + accountsPayable + otherLiabilities) * 100) / 100;
-    const netWorth = Math.round((totalAssets - totalLiabilities) * 100) / 100;
-    const liquidNetWorth = Math.round(((cashInBank + cashOnHand) - totalLiabilities) * 100) / 100;
 
     // 8. Dynamic MoM Trend Percentages for Total Balance, Cash in Hand, and Net Worth
     const cashBankIds = new Set(cashTypeBankAccounts.map((b: any) => String(b.id)));
@@ -642,6 +423,7 @@ export function createReportsRouter(): Router {
     }
 
     // 2. Active loan installments (due within next 30 days; require declared installment_amount per §33 #5)
+    const activeLoans = worldFilter === 'personal' ? [] : (loanRows || []);
     for (const loan of activeLoans) {
       if (loan.status === 'paid') continue;
       const rem = Number(loan.remaining_balance ?? loan.amount ?? 0);
@@ -775,6 +557,11 @@ export function createReportsRouter(): Router {
   r.get('/profit-loss', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
+    const rawWorld = String(req.query.world || 'business').toLowerCase();
+    const worldFilter: WorldFilter =
+      rawWorld === 'personal' || rawWorld === 'all' ? rawWorld : 'business';
+    const callerUserId = req.authUser?.id;
+    const isOrgOwner = req.orgMembership?.role === 'owner';
 
     const sb = getSupabaseAdminClient();
     if (!sb) {
@@ -782,204 +569,61 @@ export function createReportsRouter(): Router {
     }
 
     try {
-      const { data, error } = await sb.rpc('get_profit_loss_report', {
-        p_organization_id: orgId,
-        p_date_from: dateFrom || null,
-        p_date_to: dateTo || null,
-      });
+      const [{ data: orgRow }, { data: bankAccounts }, { data: catRows }, { data: txns, error: qErr }] = await Promise.all([
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
+        sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
+        sb.from('categories').select('id, name').eq('organization_id', orgId),
+        sb.from('transactions').select('*, categories:category_id(id, name, type)').eq('organization_id', orgId),
+      ]);
 
-      if (!error && data && (
-        Number(data.totalRevenue) > 0 ||
-        Number(data.totalOperatingExpenses) > 0 ||
-        Number(data.totalCOGS) > 0 ||
-        (Array.isArray(data.revenue) && data.revenue.length > 0)
-      )) {
-        if (data.period && typeof data.period === 'object') {
-          const p = data.period as any;
-          data.period = `${p.from || p.startDate || dateFrom || ''} to ${p.to || p.endDate || dateTo || ''}`.trim();
-        }
-        return ok(res, data);
+      if (qErr) {
+        return res.status(500).json({ error: qErr.message });
       }
-    } catch (err) {
-      console.warn('[reports.profit-loss] Supabase RPC error, calculating directly:', err);
-    }
 
-    // Direct calculation from transactions and categories
-    try {
-      const { data: orgRow } = await sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle();
       const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
-
-      let q = sb.from('transactions').select('*, categories:category_id(id, name, type)').eq('organization_id', orgId);
-      if (dateFrom) q = q.gte('date', dateFrom);
-      if (dateTo) q = q.lte('date', dateTo);
-      const { data: txns, error: qErr } = await q;
-
-      if (!qErr && txns && txns.length > 0) {
-        const revMap = new Map<string, number>();
-        const expMap = new Map<string, number>();
-        const cogsMap = new Map<string, number>();
-        const taxMap = new Map<string, number>();
-        const interestMap = new Map<string, number>();
-
-        for (const t of txns) {
-          const tags: string[] = Array.isArray(t.tags) ? t.tags.map(String) : [];
-          if (tags.includes('transfer')) continue;
-
-          const catName = t.categories?.name || t.category_id || 'General';
-          const catType = String(t.categories?.type || '').toLowerCase();
-          const rawAmt = Math.abs(Number(t.amount || 0));
-          const rawCurr = String(t.currency || orgCurrency).toUpperCase().trim();
-          let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-          if (!fxRate && tags.length > 0) {
-            const rTag = tags.find((tag: string) => tag.startsWith('fx:rate:'));
-            if (rTag) fxRate = Number(rTag.slice(8));
-          }
-          const amt =
-            t.base_amount != null && Number(t.base_amount) > 0 && String(t.base_currency || orgCurrency).toUpperCase() === orgCurrency
-              ? Number(t.base_amount)
-              : convertCurrency(rawAmt, rawCurr, orgCurrency, fxRate);
-          const desc = String(t.description || '').toLowerCase();
-          const narr = String(t.narration || '').toLowerCase();
-
-          if (t.type === 'credit') {
-            let label = catName;
-            const isExpenseCategoryName =
-              catType === 'expense' ||
-              /software|tools|supplies|rent|maintenance|travel|tax|payroll|salary|marketing|debit/i.test(label);
-
-            if (desc.includes('inventory sale') || narr.includes('sale:')) {
-              label = 'Product & Inventory Sales';
-            } else if (desc.includes('refund') || narr.includes('refund')) {
-              label = 'Vendor Refunds & Rebates';
-            } else if (label === 'General' || isExpenseCategoryName) {
-              label = 'Client Revenue & Sales';
-            }
-            revMap.set(label, (revMap.get(label) || 0) + amt);
-          } else {
-            // Exclude loan principal repayments from P&L operating expenses
-            if (
-              catName.toLowerCase().includes('loan repayment') ||
-              desc.includes('loan repayment') ||
-              (narr.includes('monthly installment') && narr.includes('loan'))
-            ) {
-              continue; // Financing outflow - excluded from P&L operating expenses
-            }
-
-            // Separate Loan Interest Expense (§33 #4)
-            const isInterest = (
-              catName.toLowerCase().includes('interest') ||
-              desc.includes('loan interest') ||
-              desc.includes('interest expense') ||
-              narr.includes('interest expense') ||
-              tags.includes('interest')
-            );
-            if (isInterest) {
-              interestMap.set(catName || 'Loan Interest Expense', (interestMap.get(catName || 'Loan Interest Expense') || 0) + amt);
-              continue;
-            }
-
-            // Separate Corporate / Business Tax Expense (§33 #4, §32)
-            const isTax = (
-              catType === 'tax' ||
-              tags.includes('tax') ||
-              tags.includes('corporate-tax') ||
-              /^(tax|corporate tax|income tax|sales tax|vat expense)\b/i.test(catName) ||
-              desc.includes('tax payment') ||
-              narr.includes('tax payment')
-            );
-            if (isTax) {
-              taxMap.set(catName || 'Tax Expense', (taxMap.get(catName || 'Tax Expense') || 0) + amt);
-              continue;
-            }
-
-            // Determine if direct cost (COGS)
-            const isDirectCost = (
-              desc.includes('inventory purchase') ||
-              narr.includes('purchase:') ||
-              Boolean(t.project_id) ||
-              catName.toLowerCase().includes('cogs') ||
-              catName.toLowerCase().includes('cost of goods') ||
-              catName.toLowerCase().includes('software & tools') ||
-              catName.toLowerCase().includes('debit purchase')
-            );
-
-            if (isDirectCost) {
-              let cogsLabel = catName;
-              if (desc.includes('inventory purchase') || narr.includes('purchase:')) {
-                cogsLabel = 'Inventory Purchases & Direct Materials';
-              } else if (catName === 'General') {
-                cogsLabel = 'Direct Delivery Costs';
-              }
-              cogsMap.set(cogsLabel, (cogsMap.get(cogsLabel) || 0) + amt);
-            } else {
-              let expLabel = catName.trim();
-              if (
-                expLabel === 'General' &&
-                (desc.includes('salary') || desc.includes('payroll') || tags.includes('salary') || tags.includes('payroll-slip'))
-              ) {
-                expLabel = 'Payroll & Salaries';
-              }
-              expMap.set(expLabel, (expMap.get(expLabel) || 0) + amt);
-            }
-          }
-        }
-
-        const revenue = Array.from(revMap.entries()).map(([name, amount], idx) => ({ accountId: `rev-${idx}`, name, amount: Math.round(amount * 100) / 100 }));
-        const cogs = Array.from(cogsMap.entries()).map(([name, amount], idx) => ({ accountId: `cogs-${idx}`, name, amount: Math.round(amount * 100) / 100 }));
-        const operatingExpenses = Array.from(expMap.entries()).map(([name, amount], idx) => ({ accountId: `opex-${idx}`, name, amount: Math.round(amount * 100) / 100 }));
-        const taxes = Array.from(taxMap.entries()).map(([name, amount], idx) => ({ accountId: `tax-${idx}`, name, amount: Math.round(amount * 100) / 100 }));
-        const interest = Array.from(interestMap.entries()).map(([name, amount], idx) => ({ accountId: `int-${idx}`, name, amount: Math.round(amount * 100) / 100 }));
-
-        const totalRevenue = Math.round(revenue.reduce((s, r) => s + r.amount, 0) * 100) / 100;
-        const totalCOGS = Math.round(cogs.reduce((s, c) => s + c.amount, 0) * 100) / 100;
-        const grossProfit = Math.round((totalRevenue - totalCOGS) * 100) / 100;
-        const totalOperatingExpenses = Math.round(operatingExpenses.reduce((s, e) => s + e.amount, 0) * 100) / 100;
-        const operatingIncome = Math.round((grossProfit - totalOperatingExpenses) * 100) / 100;
-        const totalTaxExpense = Math.round(taxes.reduce((s, t) => s + t.amount, 0) * 100) / 100;
-        const totalInterestExpense = Math.round(interest.reduce((s, i) => s + i.amount, 0) * 100) / 100;
-        const netIncome = Math.round((operatingIncome - totalTaxExpense - totalInterestExpense) * 100) / 100;
-
-        return ok(res, {
-          period: dateFrom && dateTo ? `${dateFrom} to ${dateTo}` : 'All Time',
-          basis: 'cash',
-          revenue,
-          cogs,
-          operatingExpenses,
-          taxes,
-          interest,
-          totalRevenue,
-          totalCOGS,
-          grossProfit,
-          totalOperatingExpenses,
-          operatingIncome,
-          taxExpense: totalTaxExpense,
-          interestExpense: totalInterestExpense,
-          netIncome,
-        });
+      const catMap = new Map<string, string>();
+      for (const c of (catRows || [])) {
+        catMap.set(String(c.id), String(c.name));
       }
+
+      const { bankWorldMap } = filterAccessibleBanks(bankAccounts ?? [], worldFilter, callerUserId, isOrgOwner);
+      const worldTransactions = mapAndFilterWorldTransactions(
+        txns ?? [],
+        orgCurrency,
+        bankWorldMap,
+        worldFilter,
+        callerUserId,
+        isOrgOwner,
+      );
+
+      const committedPlTransactions = worldTransactions.filter(
+        (t) => !NON_POSTED_STATUSES.has(t.status) && !isTransferShared(t, catMap),
+      );
+
+      return ok(
+        res,
+        computeProfitLossSnapshot({
+          committedPlTransactions,
+          catMap,
+          dateFrom,
+          dateTo,
+        }),
+      );
     } catch (directErr) {
-      console.error('[reports.profit-loss] direct calculation error:', directErr);
+      console.error('[reports.profit-loss] calculation error:', directErr);
       return res.status(500).json({ error: (directErr as any)?.message || 'Failed to calculate profit & loss report.' });
     }
-
-    ok(res, {
-      period: dateFrom && dateTo ? `${dateFrom} to ${dateTo}` : 'All Time',
-      revenue: [],
-      cogs: [],
-      operatingExpenses: [],
-      totalRevenue: 0,
-      totalCOGS: 0,
-      grossProfit: 0,
-      totalOperatingExpenses: 0,
-      operatingIncome: 0,
-      netIncome: 0,
-    });
   });
 
   r.get('/cash-flow', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const months = Number(req.query.months ?? 6) || 6;
     const { dateFrom, dateTo } = req.query as { dateFrom?: string; dateTo?: string };
+    const rawWorld = String(req.query.world || 'business').toLowerCase();
+    const worldFilter: WorldFilter =
+      rawWorld === 'personal' || rawWorld === 'all' ? rawWorld : 'business';
+    const callerUserId = req.authUser?.id;
+    const isOrgOwner = req.orgMembership?.role === 'owner';
 
     const sb = getSupabaseAdminClient();
     if (!sb) {
@@ -987,67 +631,45 @@ export function createReportsRouter(): Router {
     }
 
     try {
-      const { data, error } = await sb.rpc('get_cash_flow_statement', {
-        p_organization_id: orgId,
-        p_date_from: dateFrom || null,
-        p_date_to: dateTo || null,
-        p_months: months,
-      });
+      const [{ data: orgRow }, { data: bankAccounts }, { data: catRows }, { data: txns, error: qErr }] = await Promise.all([
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
+        sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
+        sb.from('categories').select('id, name').eq('organization_id', orgId),
+        sb.from('transactions').select('*, categories:category_id(id, name, type)').eq('organization_id', orgId),
+      ]);
 
-      if (!error && data && Array.isArray(data.monthlyData) && data.monthlyData.length > 0) {
-        return ok(res, data.monthlyData);
+      if (qErr) {
+        return res.status(500).json({ error: qErr.message });
       }
-    } catch (err) {
-      console.warn('[reports.cash-flow] Supabase RPC error, calculating directly:', err);
-    }
 
-    // Direct calculation from transactions
-    try {
-      const { data: orgRow } = await sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle();
       const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
-
-      let q = sb.from('transactions').select('date, amount, type, currency, fx_rate_to_base, base_amount, base_currency, tags').eq('organization_id', orgId);
-      if (dateFrom) q = q.gte('date', dateFrom);
-      if (dateTo) q = q.lte('date', dateTo);
-      const { data: txns, error: qErr } = await q;
-
-      if (!qErr && txns && txns.length > 0) {
-        const monthMap = new Map<string, { inflow: number; outflow: number }>();
-        for (const t of txns) {
-          const m = String(t.date || '').slice(0, 7); // YYYY-MM
-          if (!m) continue;
-          if (!monthMap.has(m)) monthMap.set(m, { inflow: 0, outflow: 0 });
-          const entry = monthMap.get(m)!;
-          const rawAmt = Math.abs(Number(t.amount || 0));
-          const rawCurr = String(t.currency || orgCurrency).toUpperCase().trim();
-          let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-          if (!fxRate && Array.isArray(t.tags)) {
-            const rTag = t.tags.find((tag: string) => tag.startsWith('fx:rate:'));
-            if (rTag) fxRate = Number(rTag.slice(8));
-          }
-          const amt =
-            t.base_amount != null && Number(t.base_amount) > 0 && String(t.base_currency || orgCurrency).toUpperCase() === orgCurrency
-              ? Number(t.base_amount)
-              : convertCurrency(rawAmt, rawCurr, orgCurrency, fxRate);
-          if (t.type === 'credit') entry.inflow += amt;
-          else entry.outflow += amt;
-        }
-
-        const sortedMonths = Array.from(monthMap.keys()).sort();
-        const monthlyData = sortedMonths.slice(-months).map(month => {
-          const d = monthMap.get(month)!;
-          return {
-            month,
-            inflow: Math.round(d.inflow * 100) / 100,
-            outflow: Math.round(d.outflow * 100) / 100,
-            net: Math.round((d.inflow - d.outflow) * 100) / 100,
-          };
-        });
-
-        return ok(res, monthlyData);
+      const catMap = new Map<string, string>();
+      for (const c of (catRows || [])) {
+        catMap.set(String(c.id), String(c.name));
       }
+
+      const { bankWorldMap } = filterAccessibleBanks(bankAccounts ?? [], worldFilter, callerUserId, isOrgOwner);
+      const worldTransactions = mapAndFilterWorldTransactions(
+        txns ?? [],
+        orgCurrency,
+        bankWorldMap,
+        worldFilter,
+        callerUserId,
+        isOrgOwner,
+      );
+
+      return ok(
+        res,
+        computeCashFlowSnapshot({
+          worldTransactions,
+          catMap,
+          months,
+          dateFrom,
+          dateTo,
+        }),
+      );
     } catch (directErr) {
-      console.error('[reports.cash-flow] direct calculation error:', directErr);
+      console.error('[reports.cash-flow] calculation error:', directErr);
     }
 
     ok(res, []);
@@ -1938,6 +1560,11 @@ export function createReportsRouter(): Router {
   r.get('/balance-sheet', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const asOfDate = req.query.asOfDate as string | undefined;
+    const rawWorld = String(req.query.world || 'business').toLowerCase();
+    const worldFilter: WorldFilter =
+      rawWorld === 'personal' || rawWorld === 'all' ? rawWorld : 'business';
+    const callerUserId = req.authUser?.id;
+    const isOrgOwner = req.orgMembership?.role === 'owner';
 
     const sb = getSupabaseAdminClient();
     if (!sb) {
@@ -1945,172 +1572,48 @@ export function createReportsRouter(): Router {
     }
 
     try {
-      const { data, error } = await sb.rpc('get_balance_sheet', {
-        p_organization_id: orgId,
-        p_as_of_date: asOfDate || null,
-      });
-
-      const hasRealRpcData = !error && data && (
-        Number(data.totalAssets) > 0 ||
-        Number(data.totalLiabilities) > 0 ||
-        (Array.isArray(data.assets) && data.assets.some((a: any) => Number(a.balance) !== 0)) ||
-        (Array.isArray(data.liabilities) && data.liabilities.some((l: any) => Number(l.balance) !== 0))
-      );
-
-      if (hasRealRpcData) {
-        return ok(res, data);
-      }
-    } catch (err) {
-      console.warn('[reports.balance-sheet] Supabase RPC error, calculating directly:', err);
-    }
-
-    // Direct calculation from bank_accounts, loans, inventory_items, assets, and chart of accounts
-    try {
-      const [{ data: bankAccounts }, { data: accounts }, { data: loanRows }, { data: assetRows }, { data: invRows }] = await Promise.all([
+      const [
+        { data: orgRow },
+        { data: bankAccounts },
+        { data: accounts },
+        { data: txns },
+        { data: loanRows },
+        { data: assetRows },
+        { data: invRows },
+      ] = await Promise.all([
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
         sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
         sb.from('accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
+        sb.from('transactions').select('*').eq('organization_id', orgId),
         sb.from('loans').select('*').eq('organization_id', orgId),
         sb.from('assets').select('*').eq('organization_id', orgId),
         sb.from('inventory_items').select('*').eq('organization_id', orgId),
       ]);
 
-      const assets: { accountId: string; name: string; balance: number; type: string }[] = [];
-      const liabilities: { accountId: string; name: string; balance: number; type: string }[] = [];
-      const equity: { accountId: string; name: string; balance: number; type: string }[] = [];
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
+      const { allAccessibleBanks, worldBanks } = filterAccessibleBanks(
+        bankAccounts ?? [],
+        worldFilter,
+        callerUserId,
+        isOrgOwner,
+      );
 
-      const banks = bankAccounts || [];
-      const cashBanks = banks.filter((b: any) => !['credit_card', 'line_of_credit'].includes(b.account_type));
-      const creditBanks = banks.filter((b: any) => b.account_type === 'credit_card');
-      const creditLines = banks.filter((b: any) => b.account_type === 'line_of_credit');
-
-      // 1. Bank Accounts (Cash & Cash Equivalents)
-      for (const b of cashBanks) {
-        const bal = Math.round(Number(b.balance || 0) * 100) / 100;
-        const name = (b.bank_name || 'Bank Account') + (b.account_number ? ` · ${b.account_number.slice(-4)}` : '');
-        assets.push({ accountId: b.id, name, balance: bal, type: 'current' });
-      }
-
-      // 2. Chart of Accounts non-bank items
-      const cashBankAccIds = new Set(cashBanks.map(b => b.account_id).filter(Boolean));
-      for (const a of (accounts || [])) {
-        if (cashBanks.length > 0 && (cashBankAccIds.has(a.id) || a.subtype === 'bank_account')) {
-          continue;
-        }
-        if (a.subtype === 'accounts_payable' && (loanRows || []).length > 0) {
-          continue;
-        }
-        // Deduplicate inventory if inventory_items has active rows
-        if ((invRows || []).length > 0 && (a.subtype === 'inventory' || a.name.toLowerCase().includes('inventory'))) {
-          continue;
-        }
-        // Deduplicate fixed assets if assets has active rows
-        if ((assetRows || []).length > 0 && (a.subtype === 'fixed_asset' || a.name.toLowerCase().includes('fixed asset'))) {
-          continue;
-        }
-
-        const bal = Math.round(Number(a.balance || 0) * 100) / 100;
-        if (a.type === 'asset') {
-          const subtype = a.subtype === 'fixed_asset' ? 'fixed' : 'current';
-          assets.push({ accountId: a.id, name: a.name, balance: bal, type: subtype });
-        } else if (a.type === 'liability') {
-          const subtype = a.subtype === 'long_term' ? 'longTerm' : 'current';
-          liabilities.push({ accountId: a.id, name: a.name, balance: bal, type: subtype });
-        }
-      }
-
-      // 3. Loans (Receivables and Payables)
-      for (const l of (loanRows || [])) {
-        if (l.status === 'paid') continue;
-        const bal = Math.round(Number(l.remaining_balance ?? l.amount ?? l.principal ?? 0) * 100) / 100;
-        if (bal <= 0) continue;
-        const loanDesc = l.description ? `${l.description} (${l.party})` : `Loan: ${l.party || 'Obligation'}`;
-        if (l.type === 'to_receive') {
-          assets.push({ accountId: l.id, name: `Loan Receivable: ${loanDesc}`, balance: bal, type: 'current' });
-        } else {
-          const isLongTerm = (l.term_months && l.term_months > 12) || l.frequency === 'annual';
-          liabilities.push({ accountId: l.id, name: `Loan Payable: ${loanDesc}`, balance: bal, type: isLongTerm ? 'longTerm' : 'current' });
-        }
-      }
-
-      // 4. Inventory Items (Valuation = current_stock * average_cost)
-      for (const item of (invRows || [])) {
-        if (item.is_active === false) continue;
-        const stock = Number(item.current_stock || 0);
-        const cost = Number(item.average_cost || item.unit_price || 0);
-        const val = Math.round(stock * cost * 100) / 100;
-        if (val > 0) {
-          assets.push({ accountId: item.id, name: `Inventory: ${item.name}`, balance: val, type: 'current' });
-        }
-      }
-
-      // 5. Fixed Assets Net Book Value (Purchase Price less Accumulated Depreciation)
-      for (const a of (assetRows || [])) {
-        if (a.status === 'disposed') continue;
-        const p = Number(a.purchase_price || 0);
-        let acc = Number(a.accumulated_depreciation || 0);
-        const salv = Number(a.salvage_value || 0);
-        const useful = Number(a.useful_life_years || 5);
-        if (acc === 0 && a.purchase_date && useful > 0) {
-          const pDate = new Date(a.purchase_date);
-          const elapsedMonths = Math.max(0, (new Date().getFullYear() - pDate.getFullYear()) * 12 + (new Date().getMonth() - pDate.getMonth()));
-          const deprAmount = Math.max(0, p - salv);
-          acc = Math.min(deprAmount, (deprAmount / (useful * 12)) * elapsedMonths);
-        }
-        const cur = a.current_value != null ? Number(a.current_value) : Math.max(salv, p - acc);
-        const netVal = Math.round(cur * 100) / 100;
-        if (netVal > 0) {
-          assets.push({ accountId: a.id, name: `Fixed Asset: ${a.name || 'Equipment'}`, balance: netVal, type: 'fixed' });
-        }
-      }
-
-      // 6. Credit cards & Credit lines
-      for (const b of creditBanks) {
-        const bal = Math.round(Math.abs(Number(b.balance || 0)) * 100) / 100;
-        liabilities.push({ accountId: b.id, name: `${b.bank_name || 'Credit Card'} (${b.account_type})`, balance: bal, type: 'current' });
-      }
-
-      for (const b of creditLines) {
-        const bal = Math.round(Math.abs(Number(b.balance || 0)) * 100) / 100;
-        liabilities.push({ accountId: b.id, name: `${b.bank_name || 'Line of Credit'} (${b.account_type})`, balance: bal, type: 'longTerm' });
-      }
-
-      const currentAssets = Math.round(assets.filter(a => a.type === 'current').reduce((s, a) => s + a.balance, 0) * 100) / 100;
-      const fixedAssets = Math.round(assets.filter(a => a.type === 'fixed').reduce((s, a) => s + a.balance, 0) * 100) / 100;
-      const totalAssets = Math.round((currentAssets + fixedAssets) * 100) / 100;
-
-      const currentLiabilities = Math.round(liabilities.filter(l => l.type === 'current').reduce((s, l) => s + l.balance, 0) * 100) / 100;
-      const longTermLiabilities = Math.round(liabilities.filter(l => l.type === 'longTerm').reduce((s, l) => s + l.balance, 0) * 100) / 100;
-      const totalLiabilities = Math.round((currentLiabilities + longTermLiabilities) * 100) / 100;
-
-      const calculatedNetWorth = Math.round((totalAssets - totalLiabilities) * 100) / 100;
-      const totalBankCash = cashBanks.reduce((s: number, b: any) => s + Number(b.balance || 0), 0);
-      const liquidNetWorth = Math.round((totalBankCash - totalLiabilities) * 100) / 100;
-
-      equity.push({
-        accountId: 'retained-earnings',
-        name: "Owner's Equity & Retained Earnings",
-        balance: calculatedNetWorth,
-        type: 'equity',
+      const snapshot = computeBalanceSheetSnapshot({
+        orgCurrency,
+        worldFilter,
+        allAccessibleBanks,
+        worldBanks,
+        rawTxns: txns ?? [],
+        accounts: accounts ?? [],
+        loanRows: loanRows ?? [],
+        assetRows: assetRows ?? [],
+        invRows: invRows ?? [],
+        asOfDate,
       });
-      const totalEquity = calculatedNetWorth;
 
-      return ok(res, {
-        asOfDate: asOfDate || new Date().toISOString().split('T')[0],
-        assets,
-        liabilities,
-        equity,
-        totalAssets,
-        totalLiabilities,
-        totalEquity,
-        currentAssets,
-        fixedAssets,
-        currentLiabilities,
-        longTermLiabilities,
-        liquidNetWorth,
-        netWorth: calculatedNetWorth,
-      });
+      return ok(res, snapshot);
     } catch (directErr) {
-      console.error('[reports.balance-sheet] direct calculation error:', directErr);
+      console.error('[reports.balance-sheet] calculation error:', directErr);
     }
 
     ok(res, {
@@ -2121,6 +1624,8 @@ export function createReportsRouter(): Router {
       totalAssets: 0,
       totalLiabilities: 0,
       totalEquity: 0,
+      liquidNetWorth: 0,
+      netWorth: 0,
     });
   });
 

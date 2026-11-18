@@ -21,10 +21,17 @@ function downloadPayslip(p: EmployeePayslip, employeeName: string): void {
     `Issue date: ${p.issueDate}`,
     `Status: ${p.status}`,
     '',
+    ...(p.salaryAmount != null ? [`Base salary paid: ${p.currency} ${p.salaryAmount.toLocaleString()}`] : []),
+    ...(p.reimbursementAmount ? [`Expense reimbursements paid: ${p.currency} ${p.reimbursementAmount.toLocaleString()}`] : []),
     `Gross pay: ${p.currency} ${p.gross.toLocaleString()}`,
     'Deductions:',
     ...(p.deductions || []).map((d: any) => `  - ${d.name || d.label || 'Deduction'}: ${p.currency} ${Number(d.amount || 0).toLocaleString()}`),
     `Net pay: ${p.currency} ${p.net.toLocaleString()}`,
+    ...(p.expectedTotal != null ? [
+      '',
+      `Expected payable (Salary + Approved Expenses): ${p.currency} ${p.expectedTotal.toLocaleString()}`,
+      `Variance: ${p.varianceStatus === 'overpaid' ? `Paid More (+${p.currency} ${Math.abs(p.varianceAmount || 0).toLocaleString()})` : p.varianceStatus === 'underpaid' ? `Paid Less (-${p.currency} ${Math.abs(p.varianceAmount || 0).toLocaleString()})` : 'Exact Match'}`,
+    ] : []),
   ];
   const blob = new Blob([lines.join('\n')], { type: 'text/plain' });
   const url = URL.createObjectURL(blob);
@@ -59,10 +66,12 @@ export function MyPayslips() {
       gross: p.gross,
       deductions: (p.deductions || []).reduce((s, d: any) => s + Number(d?.amount || 0), 0),
       net: p.net,
+      currency: p.currency || 'USD',
       status: p.status,
     }));
   }, [rows]);
 
+  const primaryCurrency = payslips[0]?.currency || currentOrganization?.currency || 'USD';
   const ytdGross = payslips.reduce((s, p) => s + p.gross, 0);
   const ytdNet = payslips.reduce((s, p) => s + p.net, 0);
 
@@ -84,9 +93,9 @@ export function MyPayslips() {
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {[
-          { label: 'LAST NET PAY', value: `$${(payslips[0]?.net ?? 0).toLocaleString()}`, sub: payslips[0]?.period || 'N/A', color: 'green', icon: DollarSign },
-          { label: 'YTD GROSS', value: `$${ytdGross.toLocaleString()}`, sub: `${payslips.length} payslips`, color: 'blue', icon: TrendingUp },
-          { label: 'YTD NET', value: `$${ytdNet.toLocaleString()}`, sub: 'After deductions', color: 'purple', icon: FileText },
+          { label: 'LAST NET PAY', value: `${primaryCurrency} ${(payslips[0]?.net ?? 0).toLocaleString()}`, sub: payslips[0]?.period || 'N/A', color: 'green', icon: DollarSign },
+          { label: 'YTD GROSS', value: `${primaryCurrency} ${ytdGross.toLocaleString()}`, sub: `${payslips.length} payslips`, color: 'blue', icon: TrendingUp },
+          { label: 'YTD NET', value: `${primaryCurrency} ${ytdNet.toLocaleString()}`, sub: 'After deductions', color: 'purple', icon: FileText },
         ].map((item, i) => (
           <motion.div
             key={item.label}
@@ -163,15 +172,15 @@ export function MyPayslips() {
               <div className="grid grid-cols-3 gap-8 text-right">
                 <div>
                   <p className="text-xs text-slate-400 font-mono">Gross</p>
-                  <p className="text-sm text-white font-mono">${payslip.gross.toLocaleString()}</p>
+                  <p className="text-sm text-white font-mono">{payslip.currency} {payslip.gross.toLocaleString()}</p>
                 </div>
                 <div>
                   <p className="text-xs text-slate-400 font-mono">Deductions</p>
-                  <p className="text-sm text-red-400 font-mono">-${payslip.deductions.toLocaleString()}</p>
+                  <p className="text-sm text-red-400 font-mono">-{payslip.currency} {payslip.deductions.toLocaleString()}</p>
                 </div>
                 <div>
                   <p className="text-xs text-slate-400 font-mono">Net Pay</p>
-                  <p className="text-sm text-green-400 font-bold font-mono">${payslip.net.toLocaleString()}</p>
+                  <p className="text-sm text-green-400 font-bold font-mono">{payslip.currency} {payslip.net.toLocaleString()}</p>
                 </div>
               </div>
 
@@ -209,6 +218,18 @@ export function MyPayslips() {
           </DialogHeader>
           {viewingPayslip && (
             <div className="space-y-3 py-2 font-mono text-sm">
+              {viewingPayslip.salaryAmount != null && (
+                <div className="flex justify-between text-slate-300">
+                  <span>Base salary paid</span>
+                  <span>{viewingPayslip.currency} {viewingPayslip.salaryAmount.toLocaleString()}</span>
+                </div>
+              )}
+              {Number(viewingPayslip.reimbursementAmount || 0) > 0 && (
+                <div className="flex justify-between text-cyan-300">
+                  <span>Expense reimbursements</span>
+                  <span>+{viewingPayslip.currency} {Number(viewingPayslip.reimbursementAmount).toLocaleString()}</span>
+                </div>
+              )}
               <div className="flex justify-between text-white">
                 <span>Gross pay</span>
                 <span>{viewingPayslip.currency} {viewingPayslip.gross.toLocaleString()}</span>
@@ -232,6 +253,24 @@ export function MyPayslips() {
                 <span>Net pay</span>
                 <span>{viewingPayslip.currency} {viewingPayslip.net.toLocaleString()}</span>
               </div>
+              {viewingPayslip.expectedTotal != null && (
+                <div className="space-y-1 border-t border-white/10 pt-2 text-xs">
+                  <div className="flex justify-between text-slate-400">
+                    <span>Expected payable (Salary + Expenses)</span>
+                    <span>{viewingPayslip.currency} {viewingPayslip.expectedTotal.toLocaleString()}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">Reconciliation</span>
+                    {viewingPayslip.varianceStatus === 'overpaid' ? (
+                      <span className="text-amber-300">Paid More (+{viewingPayslip.currency} {Math.abs(viewingPayslip.varianceAmount || 0).toLocaleString()})</span>
+                    ) : viewingPayslip.varianceStatus === 'underpaid' ? (
+                      <span className="text-red-400">Paid Less (-{viewingPayslip.currency} {Math.abs(viewingPayslip.varianceAmount || 0).toLocaleString()})</span>
+                    ) : (
+                      <span className="text-emerald-400">Exact Match</span>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </DialogContent>

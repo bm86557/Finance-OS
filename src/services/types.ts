@@ -616,7 +616,21 @@ export interface EmployeePayslip {
   deductions: { name: string; amount: number }[];
   net: number;
   currency: string;
-  status: 'draft' | 'issued' | 'paid';
+  status: 'draft' | 'pending' | 'processing' | 'issued' | 'paid' | 'voided';
+  salaryAmount?: number;
+  reimbursementAmount?: number;
+  expectedSalary?: number;
+  expectedReimbursements?: number;
+  expectedTotal?: number;
+  varianceAmount?: number;
+  varianceStatus?: 'exact' | 'overpaid' | 'underpaid' | 'unpaid';
+  reimbursementDetails?: Array<{
+    expenseId?: string;
+    description: string;
+    amount: number;
+    transactionId?: string;
+  }>;
+  linkedExpenseIds?: string[];
 }
 
 export interface TimesheetEntry {
@@ -798,6 +812,15 @@ export interface BalanceSheetReport {
   totalAssets: number;
   totalLiabilities: number;
   totalEquity: number;
+  currentAssets?: number;
+  fixedAssets?: number;
+  currentLiabilities?: number;
+  longTermLiabilities?: number;
+  netWorth?: number;
+  liquidNetWorth?: number;
+  cashInBank?: number;
+  cashOnHand?: number;
+  totalBankBalanceBase?: number;
 }
 
 export interface DepartmentProfitability {

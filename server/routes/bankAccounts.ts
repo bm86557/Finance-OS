@@ -12,6 +12,7 @@ import { DEFAULT_RATES_TO_USD, convertCurrency, getEstimatedFxRate } from '../li
 export { DEFAULT_RATES_TO_USD, convertCurrency, getEstimatedFxRate };
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { isCurrencyEnabledGlobally } from './platformSettings.js';
+import { computeLiveBankBalance, convertTxnAmountToCurrency, NON_POSTED_STATUSES } from '../services/financialTruthService.js';
 
 import { ensureDefaultAccounts } from './accounts.js';
 
@@ -114,30 +115,15 @@ export function createBankAccountsRouter(): Router {
         const accountTxns = (txns || []).filter(
           (t: any) =>
             t.bank_account_id === domain.id &&
-            !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
+            !NON_POSTED_STATUSES.has(String(t.status || 'classified').toLowerCase())
         );
+
+        domain.balance = computeLiveBankBalance(row, txns || [], bankCurrency);
 
         const rawOpening = row.opening_balance;
         const openingBal = rawOpening != null
           ? Number(rawOpening)
-          : (accountTxns.length > 0 ? 0 : Number(row.balance ?? 0));
-
-        let liveBalance = openingBal;
-        if (accountTxns.length > 0) {
-          liveBalance = accountTxns.reduce((sum: number, t: any) => {
-            const rawAmt = Number(t.amount || 0);
-            const txnCurrency = t.currency || bankCurrency;
-            let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-            if (!fxRate && Array.isArray(t.tags)) {
-              const rTag = t.tags.find((tag: string) => tag.startsWith('fx:rate:'));
-              if (rTag) fxRate = Number(rTag.slice(8));
-            }
-            const convertedAmt = convertCurrency(rawAmt, txnCurrency, bankCurrency, fxRate);
-            return t.type === 'credit' ? sum + convertedAmt : sum - Math.abs(convertedAmt);
-          }, openingBal);
-
-          domain.balance = Math.round(liveBalance * 100) / 100;
-        }
+          : (accountTxns.length > 0 ? 0 : Number(row.current_balance ?? row.balance ?? 0));
 
         // Generate 7 trailing periodic points for real account sparklines (§21, §30)
         const balanceHistory: number[] = [];
@@ -145,10 +131,7 @@ export function createBankAccountsRouter(): Router {
           const pointDate = new Date(now.getTime() - p * 5 * 24 * 60 * 60 * 1000);
           const txnsUpToPoint = accountTxns.filter((t: any) => t.date && new Date(t.date) <= pointDate);
           const pointBal = txnsUpToPoint.reduce((sum: number, t: any) => {
-            const rawAmt = Number(t.amount || 0);
-            const txnCurrency = t.currency || bankCurrency;
-            let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-            const convertedAmt = convertCurrency(rawAmt, txnCurrency, bankCurrency, fxRate);
+            const convertedAmt = convertTxnAmountToCurrency(t, bankCurrency, bankCurrency);
             return t.type === 'credit' ? sum + convertedAmt : sum - Math.abs(convertedAmt);
           }, openingBal);
           balanceHistory.push(Math.round(pointBal * 100) / 100);

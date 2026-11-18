@@ -95,6 +95,10 @@ export function PayrollPayslipsAI() {
   const [allTransactions, setAllTransactions] = useState<any[]>([]);
   const [payslips, setPayslips] = useState<any[]>([]);
   const [aiSuggestions, setAiSuggestions] = useState<any[]>([]);
+  const [reconciliationSummary, setReconciliationSummary] = useState<any[]>([]);
+  const [reconciliationPeriods, setReconciliationPeriods] = useState<string[]>([]);
+  const [reconciliationsByPeriod, setReconciliationsByPeriod] = useState<Record<string, any[]>>({});
+  const [activePeriod, setActivePeriod] = useState<string>('');
   const [filterMode, setFilterMode] = useState<TxnFilterMode>('salary');
   const [adminExpenses, setAdminExpenses] = useState<any[]>([]);
   const [expenseFilter, setExpenseFilter] = useState<'all' | 'submitted' | 'approved' | 'rejected' | 'reimbursed'>('all');
@@ -124,6 +128,10 @@ export function PayrollPayslipsAI() {
         setAllTransactions(d.debitTransactions || []);
         setPayslips(d.payslips || []);
         setAiSuggestions(d.aiSuggestions || []);
+        setReconciliationSummary(d.reconciliationSummary || []);
+        setReconciliationPeriods(d.reconciliationPeriods || []);
+        setReconciliationsByPeriod(d.reconciliationsByPeriod || {});
+        setActivePeriod(d.activePeriod || '');
       }
 
       const expQueueRes = await employeeService.getAdminExpenseQueue(orgId);
@@ -263,6 +271,7 @@ export function PayrollPayslipsAI() {
             gross: Number(alloc.gross || txn.remainingAmount),
             deductions: [],
             currency,
+            ...(alloc.kind ? { kind: alloc.kind } : {}),
           },
         ],
       });
@@ -590,6 +599,106 @@ export function PayrollPayslipsAI() {
         </Card>
       </div>
 
+      {/* Monthly Pay & Expense Reconciliation (Salary + Expenses vs. Paid Variance) */}
+      {(() => {
+        const displayedRec =
+          (activePeriod && reconciliationsByPeriod[activePeriod]) || reconciliationSummary;
+        if (!displayedRec || displayedRec.length === 0) return null;
+        return (
+          <Card className="p-6 bg-[#0f172a]/90 border-white/10 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                  <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                  Monthly Pay &amp; Expense Reconciliation ({activePeriod || period})
+                </h2>
+                <p className="text-xs text-gray-400">
+                  Compares each employee&apos;s expected payable (Base Salary + Approved/Reimbursed Expenses) against actual statement payouts and flags overpayments or underpayments.
+                </p>
+              </div>
+              {reconciliationPeriods.length > 0 && (
+                <select
+                  value={activePeriod}
+                  onChange={e => setActivePeriod(e.target.value)}
+                  className="bg-slate-900 border border-white/15 text-white text-xs rounded-lg px-3 py-1.5"
+                >
+                  {reconciliationPeriods.map(pLabel => (
+                    <option key={pLabel} value={pLabel}>
+                      {pLabel}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm text-left">
+                <thead>
+                  <tr className="border-b border-white/10 text-xs uppercase text-gray-400">
+                    <th className="py-3 px-3">Employee</th>
+                    <th className="py-3 px-3 text-right">Base Salary (Exp / Paid)</th>
+                    <th className="py-3 px-3 text-right">Expenses (Exp / Paid)</th>
+                    <th className="py-3 px-3 text-right">Overall Payable</th>
+                    <th className="py-3 px-3 text-right">Overall Paid</th>
+                    <th className="py-3 px-3 text-right">Variance Check</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {displayedRec.map((row: any) => {
+                    const vStatus = row.varianceStatus || 'exact';
+                    const vAmt = Number(row.varianceAmount || 0);
+                    return (
+                      <tr key={row.userId} className="hover:bg-white/[0.02]">
+                        <td className="py-3 px-3">
+                          <div className="text-white font-medium">{row.employeeName}</div>
+                          <div className="text-xs text-gray-400">{row.departmentName}</div>
+                        </td>
+                        <td className="py-3 px-3 text-right font-mono text-xs text-gray-300">
+                          ${Number(row.expectedSalary || 0).toLocaleString()} /{' '}
+                          <span className="text-white font-semibold">${Number(row.salaryPaid || 0).toLocaleString()}</span>
+                        </td>
+                        <td className="py-3 px-3 text-right font-mono text-xs text-gray-300">
+                          ${Number(row.expectedReimbursements || 0).toLocaleString()} /{' '}
+                          <span className="text-cyan-300 font-semibold">${Number(row.reimbursementPaid || 0).toLocaleString()}</span>
+                        </td>
+                        <td className="py-3 px-3 text-right font-semibold text-white">
+                          ${Number(row.expectedTotal || 0).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-emerald-400">
+                          ${Number(row.totalPaid || 0).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-3 text-right whitespace-nowrap">
+                          {vStatus === 'overpaid' && (
+                            <Badge className="bg-amber-500/20 text-amber-300 border-amber-500/40 text-xs">
+                              Paid More (+${Math.abs(vAmt).toLocaleString()})
+                            </Badge>
+                          )}
+                          {vStatus === 'underpaid' && (
+                            <Badge className="bg-red-500/20 text-red-300 border-red-500/40 text-xs">
+                              Paid Less (-${Math.abs(vAmt).toLocaleString()})
+                            </Badge>
+                          )}
+                          {vStatus === 'exact' && (
+                            <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/40 text-xs">
+                              Exact Match
+                            </Badge>
+                          )}
+                          {vStatus === 'unpaid' && (
+                            <Badge className="bg-slate-500/20 text-slate-300 border-slate-500/40 text-xs">
+                              Unpaid (${Number(row.expectedTotal || 0).toLocaleString()} due)
+                            </Badge>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        );
+      })()}
+
       {/* Section 1: Salary Transactions Table with Clear DEBIT / CREDIT Badges */}
       <Card className="p-6 bg-[#0f172a]/90 border-white/10 space-y-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
@@ -730,9 +839,8 @@ export function PayrollPayslipsAI() {
                         )}
                       </td>
                       <td
-                        className={`py-3.5 px-3 text-right font-bold whitespace-nowrap ${
-                          isCredit ? 'text-emerald-400' : 'text-red-400'
-                        }`}
+                        className={`py-3.5 px-3 text-right font-bold whitespace-nowrap ${isCredit ? 'text-emerald-400' : 'text-red-400'
+                          }`}
                       >
                         {isCredit ? '+' : '-'}${txn.amount.toLocaleString()}
                       </td>
@@ -853,15 +961,34 @@ export function PayrollPayslipsAI() {
                       </td>
                       <td className="py-3 px-3 text-white font-medium">{p.period}</td>
                       <td className="py-3 px-3 text-gray-400">{p.issueDate}</td>
-                      <td className="py-3 px-3 text-right text-white">${Number(p.gross || 0).toLocaleString()}</td>
+                      <td className="py-3 px-3 text-right text-white">
+                        <div>${Number(p.gross || 0).toLocaleString()}</div>
+                        {Number(p.reimbursementAmount || 0) > 0 && (
+                          <div className="text-[11px] text-cyan-300 font-mono">
+                            Sal ${Number(p.salaryAmount || 0).toLocaleString()} + Exp ${Number(p.reimbursementAmount || 0).toLocaleString()}
+                          </div>
+                        )}
+                      </td>
                       <td className="py-3 px-3 text-right text-red-400">-${ded.toLocaleString()}</td>
                       <td className="py-3 px-3 text-right font-bold text-emerald-400">
                         ${Number(p.net || 0).toLocaleString()}
                       </td>
                       <td className="py-3 px-3">
-                        <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/30 uppercase text-[10px]">
-                          {p.status || 'paid'}
-                        </Badge>
+                        <div className="flex flex-col items-start gap-1">
+                          <Badge className="bg-emerald-500/20 text-emerald-300 border-emerald-500/30 uppercase text-[10px]">
+                            {p.status || 'paid'}
+                          </Badge>
+                          {p.varianceStatus === 'overpaid' && (
+                            <span className="text-[10px] text-amber-300 font-mono">
+                              +${Math.abs(Number(p.varianceAmount || 0)).toLocaleString()} overpaid
+                            </span>
+                          )}
+                          {p.varianceStatus === 'underpaid' && (
+                            <span className="text-[10px] text-red-300 font-mono">
+                              -${Math.abs(Number(p.varianceAmount || 0)).toLocaleString()} underpaid
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="py-3 px-3 text-right">
                         <Button
@@ -1116,11 +1243,10 @@ export function PayrollPayslipsAI() {
               {employeeSplits.map((emp, idx) => (
                 <div
                   key={emp.userId}
-                  className={`p-3.5 rounded-xl border transition-all ${
-                    emp.isAlreadyPaid
+                  className={`p-3.5 rounded-xl border transition-all ${emp.isAlreadyPaid
                       ? 'bg-emerald-950/20 border-emerald-500/30'
                       : 'bg-white/[0.03] border-white/10'
-                  } flex items-center justify-between gap-3`}
+                    } flex items-center justify-between gap-3`}
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -1158,11 +1284,10 @@ export function PayrollPayslipsAI() {
                           prev.map((r, i) => (i === idx ? { ...r, gross: val } : r))
                         );
                       }}
-                      className={`h-8 bg-slate-900 border-white/15 text-white text-sm text-right ${
-                        emp.isAlreadyPaid && (emp.gross === 0 || !emp.gross)
+                      className={`h-8 bg-slate-900 border-white/15 text-white text-sm text-right ${emp.isAlreadyPaid && (emp.gross === 0 || !emp.gross)
                           ? 'text-gray-400 font-normal'
                           : 'text-emerald-400 font-semibold'
-                      }`}
+                        }`}
                     />
                   </div>
 

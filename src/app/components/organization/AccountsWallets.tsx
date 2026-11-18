@@ -130,7 +130,7 @@ export function AccountsWallets() {
   const totalBankBalance = useMemo(
     () =>
       bankAccounts
-        .filter((a) => a.accountType === 'checking' || a.accountType === 'savings' || a.accountType === 'debit_card' || a.accountType === 'prepaid_card')
+        .filter((a) => !['cash', 'online_wallet', 'credit_card', 'line_of_credit', 'credit'].includes(String(a.accountType)))
         .reduce((sum, a) => sum + convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency), 0),
     [bankAccounts, baseCurrency],
   );
@@ -146,7 +146,7 @@ export function AccountsWallets() {
   const totalCreditLiabilities = useMemo(
     () =>
       bankAccounts
-        .filter((a) => a.accountType === 'credit_card' || a.accountType === 'line_of_credit')
+        .filter((a) => ['credit_card', 'line_of_credit', 'credit'].includes(String(a.accountType)))
         .reduce((sum, a) => sum + Math.abs(convertCurrency(Number(a.balance) || 0, a.currency || baseCurrency, baseCurrency)), 0),
     [bankAccounts, baseCurrency],
   );
