@@ -439,7 +439,7 @@ export function calculateTokenCost(params: {
 }
 
 export function detectNodeBillingTier(
-  node: Pick<GatewayModelState, 'provider' | 'modelName' | 'baseUrl' | 'billingTier' | 'rateLimitRpm' | 'costPer1MInput' | 'costPer1MOutput'> & { detectedTier?: 'free' | 'paid'; detectedBadge?: string },
+  node: Pick<GatewayModelState, 'provider' | 'modelName' | 'baseUrl' | 'billingTier' | 'rateLimitRpm' | 'rateLimitTpm' | 'costPer1MInput' | 'costPer1MOutput'> & { detectedTier?: 'free' | 'paid'; detectedBadge?: string },
   apiKey?: string
 ): { detectedTier: 'free' | 'paid'; detectedBadge: string; isBilledAsZero: boolean } {
   if (node.billingTier === 'free') {
