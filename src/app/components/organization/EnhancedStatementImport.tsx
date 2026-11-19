@@ -482,7 +482,8 @@ export function EnhancedStatementImport({
 
     // Generate idempotency key to prevent duplicate imports
     const firstDate = rowsToCommit[0]?.date || new Date().toISOString().split('T')[0];
-    const idempotencyKey = `import-${selectedAccount}-${selectedFile.name}-${rowsToCommit.length}-${firstDate}-${Date.now()}`;
+    const lastDate = rowsToCommit[rowsToCommit.length - 1]?.date || firstDate;
+    const idempotencyKey = `import-${selectedAccount}-${selectedFile.name}-${selectedFile.size}-${rowsToCommit.length}-${firstDate}-${lastDate}`;
 
     // DEBUG: Log what we're sending
     console.log('=== IMPORT DEBUG ===');

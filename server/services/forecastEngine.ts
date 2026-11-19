@@ -257,46 +257,51 @@ export function computeCashFlowForecast(input: EngineInput): {
   const currentCash = Math.round(Number(input.currentCash || 0) * 100) / 100;
   const baseCurrency = (input.baseCurrency || 'USD').toUpperCase();
 
-  // 1. Calculate historical baseline daily debits & credits in baseCurrency (using median for outlier resistance)
-  // Internal transfers are strictly excluded to avoid artificial inflation of consolidated cash flow
-  const todayStr = new Date().toISOString().split('T')[0];
-  const txns = (input.transactions || []).filter(t => !isInternalTransfer(t));
-  
-  const debitTxns = txns.filter(t => t.type === 'debit' && t.date <= todayStr);
-  const creditTxns = txns.filter(t => t.type === 'credit' && t.date <= todayStr);
+  // 1. Calculate historical baseline daily debits & credits in baseCurrency over trailing 90 calendar days
+  // Internal transfers and unposted/cancelled transactions are strictly excluded
+  const todayDate = new Date();
+  const todayStr = todayDate.toISOString().split('T')[0];
+  const windowStartDate = new Date(todayDate);
+  windowStartDate.setDate(windowStartDate.getDate() - 89);
+  const windowStartStr = windowStartDate.toISOString().split('T')[0];
 
-  const dailyDebitsMap: Record<string, number> = {};
-  for (const t of debitTxns) {
+  const excludedStatuses = new Set(['pending', 'draft', 'rejected', 'reversed', 'cancelled']);
+  const txns = (input.transactions || []).filter(
+    (t) => !isInternalTransfer(t) && !excludedStatuses.has(String(t.status || 'classified').toLowerCase())
+  );
+
+  const windowTxns = txns.filter((t) => t.date >= windowStartStr && t.date <= todayStr);
+  let windowCreditTotal = 0;
+  let windowDebitTotal = 0;
+  let earliestWindowDate = todayStr;
+
+  for (const t of windowTxns) {
+    if (t.date < earliestWindowDate) {
+      earliestWindowDate = t.date;
+    }
     const rawAmt = Number(t.amount || 0);
     const txnCurrency = (t.currency || baseCurrency).toUpperCase();
     const fxRate = extractFxRate(t);
-    const convertedAmt = convertCurrency(rawAmt, txnCurrency, baseCurrency, fxRate);
-    dailyDebitsMap[t.date] = (dailyDebitsMap[t.date] || 0) + Math.abs(convertedAmt);
+    const convertedAmt = Math.abs(convertCurrency(rawAmt, txnCurrency, baseCurrency, fxRate));
+    if (t.type === 'credit') {
+      windowCreditTotal += convertedAmt;
+    } else if (t.type === 'debit') {
+      windowDebitTotal += convertedAmt;
+    }
   }
-  const debitVals = Object.values(dailyDebitsMap).sort((a, b) => a - b);
-  const medianDailyDebit = debitVals.length > 0
-    ? (debitVals.length % 2 === 0
-        ? (debitVals[debitVals.length / 2 - 1] + debitVals[debitVals.length / 2]) / 2
-        : debitVals[Math.floor(debitVals.length / 2)])
-    : 0;
 
-  const dailyCreditsMap: Record<string, number> = {};
-  for (const t of creditTxns) {
-    const rawAmt = Number(t.amount || 0);
-    const txnCurrency = (t.currency || baseCurrency).toUpperCase();
-    const fxRate = extractFxRate(t);
-    const convertedAmt = convertCurrency(rawAmt, txnCurrency, baseCurrency, fxRate);
-    dailyCreditsMap[t.date] = (dailyCreditsMap[t.date] || 0) + Math.abs(convertedAmt);
-  }
-  const creditVals = Object.values(dailyCreditsMap).sort((a, b) => a - b);
-  const medianDailyCredit = creditVals.length > 0
-    ? (creditVals.length % 2 === 0
-        ? (creditVals[creditVals.length / 2 - 1] + creditVals[creditVals.length / 2]) / 2
-        : creditVals[Math.floor(creditVals.length / 2)])
-    : 0;
+  // Span at least 30 calendar days (and at most 90) so sparse/new orgs don't over-extrapolate a single day
+  const msPerDay = 86_400_000;
+  const rawSpanDays = Math.floor(
+    (new Date(todayStr + 'T00:00:00Z').getTime() - new Date(earliestWindowDate + 'T00:00:00Z').getTime()) / msPerDay
+  ) + 1;
+  const calendarSpanDays = windowTxns.length > 0 ? Math.max(30, Math.min(90, rawSpanDays)) : 30;
 
-  const baseDailyExpense = medianDailyDebit * profile.expenseFactor;
-  const baseDailyIncome = medianDailyCredit * profile.incomeFactor;
+  const avgDailyDebit = windowDebitTotal / calendarSpanDays;
+  const avgDailyCredit = windowCreditTotal / calendarSpanDays;
+
+  const baseDailyExpense = avgDailyDebit * profile.expenseFactor;
+  const baseDailyIncome = avgDailyCredit * profile.incomeFactor;
 
   // 2. Pre-index scheduled recurring items across the projection horizon (converted to baseCurrency)
   const recurringByDate: Record<string, { income: number; expense: number }> = {};
@@ -439,20 +444,23 @@ export function computeCashFlowForecast(input: EngineInput): {
     });
   }
 
-  // 5. Derived KPIs
+  // 5. Derived KPIs (consistent with the scenario-adjusted forecast series)
   const projectedCash = forecasts.length > 0 ? forecasts[forecasts.length - 1].balance : currentCash;
   const netChange = Math.round((projectedCash - currentCash) * 100) / 100;
 
-  // Burn rate: standard 30-day gross operating expense
-  const burnRate = Math.round(medianDailyDebit * 30);
-  const totalProjectedIncome30 = forecasts.slice(0, 30).reduce((s, f) => s + f.income, 0);
-  const totalProjectedExpense30 = forecasts.slice(0, 30).reduce((s, f) => s + f.expense, 0);
-  const netBurnMonthly = Math.round(totalProjectedExpense30 - totalProjectedIncome30);
+  const totalProjectedIncome = forecasts.reduce((s, f) => s + f.income, 0);
+  const totalProjectedExpense = forecasts.reduce((s, f) => s + f.expense, 0);
+  const projectedDailyIncome = forecasts.length > 0 ? totalProjectedIncome / forecasts.length : 0;
+  const projectedDailyExpense = forecasts.length > 0 ? totalProjectedExpense / forecasts.length : 0;
+
+  // Burn rate: scenario-adjusted 30-day gross operating outflow (baseline + recurring + loans)
+  const burnRate = Math.round(projectedDailyExpense * 30);
+  const projectedMonthlyIncome = Math.round(projectedDailyIncome * 30);
+  const netBurnMonthly = Math.round(burnRate - projectedMonthlyIncome);
 
   // 6. Generate accurate monthly breakdown using actual monthly transaction data in baseCurrency
   const monthlyBreakdown: MonthlyBreakdown[] = [];
   const historicalMonthly = aggregateTransactionsByMonth(txns, baseCurrency);
-  const { avgMonthlyIncome, avgMonthlyExpense } = getMonthlyPatternAverage(historicalMonthly);
 
   const todayMonth = todayStr.substring(0, 7);
   const relevantMonths = Object.keys(historicalMonthly).filter(
@@ -485,18 +493,14 @@ export function computeCashFlowForecast(input: EngineInput): {
     }
   }
 
-  // Calculate realistic monthly burn rate and runway
-  const actualMonthlyBurnRate = avgMonthlyExpense > 0 ? Math.round(avgMonthlyExpense) : burnRate;
-  const actualNetBurnMonthly = Math.round(avgMonthlyExpense - avgMonthlyIncome);
-
   let adjustedRunway: number | null = null;
   let finalRunwayStatus: 'cash_generative' | 'burning' | 'insufficient_cash' = 'cash_generative';
 
   if (currentCash <= 0) {
     adjustedRunway = 0;
     finalRunwayStatus = 'insufficient_cash';
-  } else if (actualNetBurnMonthly > 0) {
-    adjustedRunway = Math.round((currentCash / actualNetBurnMonthly) * 10) / 10;
+  } else if (netBurnMonthly > 0) {
+    adjustedRunway = Math.round((currentCash / netBurnMonthly) * 10) / 10;
     finalRunwayStatus = 'burning';
   } else {
     adjustedRunway = null;
@@ -509,10 +513,10 @@ export function computeCashFlowForecast(input: EngineInput): {
       currentCash,
       projectedCash,
       netChange,
-      burnRate: actualMonthlyBurnRate,
-      dailyBurn: Math.round((actualMonthlyBurnRate / 30) * 100) / 100,
-      dailyIncome: Math.round(medianDailyCredit * 100) / 100,
-      netBurnMonthly: actualNetBurnMonthly,
+      burnRate,
+      dailyBurn: Math.round(projectedDailyExpense * 100) / 100,
+      dailyIncome: Math.round(projectedDailyIncome * 100) / 100,
+      netBurnMonthly,
       runway: adjustedRunway,
       runwayStatus: finalRunwayStatus,
       cashCrunchDays,

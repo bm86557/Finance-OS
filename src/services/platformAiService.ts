@@ -80,6 +80,7 @@ export interface PlatformAiStats {
   totalTokens: number;
   totalPromptTokens: number;
   totalCompletionTokens: number;
+  platformThinkingTokens?: number;
   totalEvents: number;
   platformTokens?: number;
   platformPromptTokens?: number;
@@ -135,6 +136,9 @@ export interface TenantAiConsumption {
   aiCreditsQuota: number;
   statementsQuota?: number;
   tokensUsed: number;
+  platformTokens?: number;
+  byokTokens?: number;
+  totalTokens?: number;
   quotaPercent: number;
   rawCostUsd: number;
   commercialShadowCostUsd: number;
@@ -142,7 +146,7 @@ export interface TenantAiConsumption {
   netMarginUsd: number;
   marginPercent: number;
   burnStatus: 'healthy' | 'warning' | 'exceeded' | 'byok_exempt';
-  keySource: 'custom_byok' | 'platform_free_tier';
+  keySource: 'custom_byok' | 'platform_free_tier' | 'platform_paid_tier';
 }
 
 export interface GatewayNodeStatus {
@@ -172,6 +176,8 @@ export interface GatewayNodeStatus {
   maxTokensPerReq?: number;
   lastUsedAt?: string;
   billingTier?: 'auto' | 'free' | 'paid';
+  detectedTier?: 'free' | 'paid';
+  detectedBadge?: string;
   tokensUsed?: number;
   promptTokens?: number;
   completionTokens?: number;
@@ -338,7 +344,16 @@ export const platformAiService = {
     return { success: false, data: [], error: 'Backend API unreachable' };
   },
 
-  async testGatewayNode(id: string): Promise<ServiceResponse<{ success: boolean; latencyMs: number; model: string; provider: string; error?: string }>> {
+  async testGatewayNode(id: string): Promise<ServiceResponse<{
+    success: boolean;
+    latencyMs: number;
+    model: string;
+    provider: string;
+    error?: string;
+    detectedTier?: 'free' | 'paid';
+    detectedBadge?: string;
+    detectedLimits?: { rpm?: number; tpm?: number; rpd?: number };
+  }>> {
     if (isHttpBackendConfigured()) {
       return apiPostJson<object, any>(`/platform/ai/gateway/providers/${id}/test`, {});
     }
@@ -353,7 +368,16 @@ export const platformAiService = {
     modelName: string;
     apiKey: string;
     baseUrl?: string;
-  }): Promise<ServiceResponse<{ success: boolean; latencyMs: number; model: string; provider: string; error?: string }>> {
+  }): Promise<ServiceResponse<{
+    success: boolean;
+    latencyMs: number;
+    model: string;
+    provider: string;
+    error?: string;
+    detectedTier?: 'free' | 'paid';
+    detectedBadge?: string;
+    detectedLimits?: { rpm?: number; tpm?: number; rpd?: number };
+  }>> {
     if (isHttpBackendConfigured()) {
       return apiPostJson('/platform/ai/gateway/test-connection', params);
     }

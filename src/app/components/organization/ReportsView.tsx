@@ -25,6 +25,8 @@ import {
 import { BarChart, Bar, LineChart, Line, PieChart as RePieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Area, AreaChart } from 'recharts';
 import { toast } from 'sonner';
 import { AXIOM } from '../../../styles/axiom-tokens';
+import { NeonSkeleton, SkeletonCard, SkeletonChart } from '../ui/NeonSkeleton';
+import { SkeletonTable } from '../loading/LoadingStates';
 import { formatCurrency, formatDate } from '@/lib/formatters';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService } from '@/hooks/useService';
@@ -735,14 +737,47 @@ export function ReportsView() {
   const plExpenseChartData = expenseChartData;
   const plNetMarginPct = profitMargin;
 
-  // Show full-screen loading state only on initial cold mount with no data
+  // Show full-screen skeleton loading state on initial cold mount with no data
   if (loading && !plData && !balanceData) {
     return (
-      <div className="min-h-screen p-8 flex items-center justify-center" style={{ background: AXIOM.backgrounds.main }}>
-        <div className="text-center">
-          <RefreshCw className="size-12 animate-spin text-purple-500 mx-auto mb-4" />
-          <p className="text-white text-lg">Loading reports...</p>
+      <div className="min-h-screen p-4 sm:p-6 lg:p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
+        {/* Header Skeleton */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <NeonSkeleton width="48px" height="48px" color="#a855f7" />
+            <div className="space-y-2">
+              <NeonSkeleton width="220px" height="28px" color="#a855f7" />
+              <NeonSkeleton width="300px" height="14px" color="#a855f7" />
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <NeonSkeleton width="120px" height="40px" color="#a855f7" />
+            <NeonSkeleton width="110px" height="40px" color="#a855f7" />
+          </div>
         </div>
+
+        {/* Report Type Tabs Skeleton */}
+        <div className="flex flex-wrap gap-2">
+          {[140, 120, 110, 130, 150, 135].map((w, idx) => (
+            <NeonSkeleton key={idx} width={`${w}px`} height="40px" color="#a855f7" />
+          ))}
+        </div>
+
+        {/* KPI Cards Skeleton */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, idx) => (
+            <SkeletonCard key={idx} color="#a855f7" />
+          ))}
+        </div>
+
+        {/* Charts Skeleton */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <SkeletonChart color="#a855f7" />
+          <SkeletonChart color="#2dd4ff" />
+        </div>
+
+        {/* Detailed Breakdown Table Skeleton */}
+        <SkeletonTable rows={5} columns={4} />
       </div>
     );
   }
@@ -1306,7 +1341,9 @@ export function ReportsView() {
             </div>
 
             {loading && (
-              <p className="text-slate-400 text-center py-12">Loading this report…</p>
+              <div className="py-4 space-y-4">
+                <SkeletonTable rows={6} columns={4} />
+              </div>
             )}
 
             {error && (
@@ -1970,7 +2007,9 @@ export function ReportsView() {
             </div>
 
             {loading && (
-              <p className="text-slate-400 text-center py-8">Loading departments…</p>
+              <div className="py-4">
+                <SkeletonTable rows={4} columns={5} />
+              </div>
             )}
             {error && (
               <div className="text-center py-6 space-y-2">

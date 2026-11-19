@@ -483,7 +483,7 @@ export function OrganizationDashboard() {
         )}
         <div className="grid grid-cols-12 gap-6">
           {/* Left Content - Main Dashboard */}
-          <div className="col-span-12 lg:col-span-9 space-y-6">
+          <div className="col-span-12 lg:col-span-8 xl:col-span-9 space-y-6">
             {/* KPI Cards */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
               <ModernKPICard
@@ -964,7 +964,7 @@ export function OrganizationDashboard() {
           </div>
 
           {/* Right Sidebar - Widgets - BLUE THEME */}
-          <div className="col-span-12 lg:col-span-3 space-y-6">
+          <div className="col-span-12 lg:col-span-4 xl:col-span-3 space-y-6">
             {/* Quick Actions - BLUE THEME */}
             <motion.div
               initial={{ opacity: 0, x: 20 }}
@@ -1114,6 +1114,8 @@ export function OrganizationDashboard() {
               currency={orgCurrency}
               delay={0.6}
               emptyLabel="No recent transactions yet."
+              viewAllPageLabel="View All Transactions"
+              onViewAllPage={() => openOrgView('transactions')}
             />
 
             {/* Upcoming Payments */}
@@ -1124,6 +1126,8 @@ export function OrganizationDashboard() {
               currency={orgCurrency}
               delay={0.7}
               emptyLabel="No upcoming debits in this list yet."
+              viewAllPageLabel="Cash Flow Forecast"
+              onViewAllPage={() => openOrgView('forecast')}
             />
           </div>
         </div>

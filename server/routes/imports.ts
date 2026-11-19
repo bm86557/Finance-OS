@@ -3,6 +3,7 @@
  * All endpoints now use Supabase RPC functions for proper duplicate detection, idempotency, and real-time updates.
  */
 
+import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
 import { ok, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
@@ -323,8 +324,9 @@ export function createImportsRouter(): Router {
         }
       }
 
-      // Call the import_commit RPC function
-      const { data, error } = await sb.rpc('import_commit', {
+      // Call the import_commit RPC function (with handoff-compliant chunked server fallback if RPC fails on legacy DB)
+      let data: any = null;
+      const rpcRes = await sb.rpc('import_commit', {
         p_org_id: orgId,
         p_bank_account_id: bankAccountId,
         p_currency: currency,
@@ -339,31 +341,195 @@ export function createImportsRouter(): Router {
         p_file_type: detectedFileType,
       });
 
-      if (error) {
-        console.error('Import commit error:', error);
-        
-        // Handle specific error codes
-        if (error.code === '23505' || error.message?.includes('already imported')) {
-          return fail(res, 409, 'This exact statement was already imported');
-        } else if (error.code === '42704' || error.message?.includes('not found')) {
+      if (!rpcRes.error) {
+        data = rpcRes.data;
+      } else {
+        const rpcErr = rpcRes.error;
+        console.warn('[imports] import_commit RPC error, evaluating fallback:', rpcErr.code, rpcErr.message);
+
+        // Hard business/validation errors should still return immediately
+        if (rpcErr.code === '42704' || rpcErr.message?.includes('Bank account not found')) {
           return fail(res, 404, 'Bank account not found in this organization');
-        } else if (error.code === '22000' || error.message?.includes('currency')) {
-          return fail(res, 400, error.message || 'Currency mismatch');
         }
-        
-        return fail(res, 500, `Import failed: ${error.message}`);
+        if (rpcErr.code === '22000' || rpcErr.message?.includes('mixing currencies')) {
+          return fail(res, 400, rpcErr.message || 'Currency mismatch');
+        }
+
+        // Check if this batch was already completed (true idempotent replay)
+        const { data: existingHistory } = await sb
+          .from('import_history_records')
+          .select('*')
+          .eq('organization_id', orgId)
+          .eq('id', idempotencyKey)
+          .maybeSingle();
+
+        if (existingHistory && existingHistory.status === 'completed') {
+          return fail(res, 409, 'This exact statement was already imported');
+        }
+
+        // Handoff §10: Resumable, chunked, per-row idempotent commit using service_role
+        const accountDisplayName = `${bankRow.bank_name || bankRow.account_name || 'Bank Account'} (${targetCurr})`;
+        await sb.from('import_history_records').upsert({
+          id: idempotencyKey,
+          organization_id: orgId,
+          file_name: safeName,
+          imported_at: new Date().toISOString(),
+          transaction_count: 0,
+          status: 'processing',
+          account_name: accountDisplayName,
+          auto_placed: 0,
+          needs_review: 0,
+          duplicates_found: 0,
+          file_url: fileUrl,
+          file_path: filePath,
+          file_size: fileSize,
+          file_type: detectedFileType,
+        }, { onConflict: 'id' });
+
+        let importedCount = 0;
+        let skippedCount = 0;
+        let duplicateCount = 0;
+        let autoClassifiedCount = 0;
+        let needsReviewCount = 0;
+        let totalIncome = 0;
+        let totalExpenses = 0;
+        const chunkErrors: string[] = [];
+
+        const rowsToInsert: any[] = [];
+        finalRows.forEach((row, idx) => {
+          const isDup = Boolean((row as any).isDuplicate);
+          if (isDup) {
+            duplicateCount++;
+            if (skipDuplicates) {
+              skippedCount++;
+              return;
+            }
+          }
+
+          const absAmt = Math.abs(Number(row.amount || 0));
+          const catId = row.importCategoryId ? String(row.importCategoryId).trim() : '';
+          const projId = (row as any).projectId ? String((row as any).projectId).trim() : '';
+          const isClassified = Boolean(catId);
+          const worldScope = (row as any).usage === 'personal' ? 'personal' : 'business';
+          const tags = Array.from(new Set(['imported', `import:${safeName}`, worldScope]));
+
+          if (isClassified) {
+            autoClassifiedCount++;
+          } else {
+            needsReviewCount++;
+          }
+
+          if (row.type === 'credit') {
+            totalIncome += absAmt;
+          } else {
+            totalExpenses += absAmt;
+          }
+
+          rowsToInsert.push({
+            id: `txn-${crypto.randomUUID()}`,
+            organization_id: orgId,
+            bank_account_id: bankAccountId,
+            date: row.date,
+            description: String(row.narration || 'Imported').slice(0, 120),
+            narration: String(row.narration || 'Imported'),
+            amount: absAmt,
+            currency: statementCurr,
+            type: row.type === 'credit' ? 'credit' : 'debit',
+            category_id: catId || null,
+            project_id: projId || null,
+            status: isClassified ? 'classified' : 'pending',
+            confidence: isClassified ? 100 : null,
+            tags,
+            attachments: [],
+            idempotency_key: `${idempotencyKey}:row:${idx + 1}`,
+            classified_at: isClassified ? new Date().toISOString() : null,
+            classified_by: isClassified ? 'user' : null,
+            source_import_id: idempotencyKey,
+          });
+        });
+
+        const CHUNK_SIZE = 100;
+        for (let i = 0; i < rowsToInsert.length; i += CHUNK_SIZE) {
+          const chunk = rowsToInsert.slice(i, i + CHUNK_SIZE);
+          const chunkKeys = chunk.map((r) => r.idempotency_key).filter(Boolean);
+
+          // Avoid PostgREST partial-index ON CONFLICT 42P10 by checking existing keys first
+          const { data: existingRows } = await sb
+            .from('transactions')
+            .select('idempotency_key')
+            .eq('organization_id', orgId)
+            .in('idempotency_key', chunkKeys);
+
+          const existingKeySet = new Set((existingRows || []).map((r: any) => r.idempotency_key));
+          const newChunk = chunk.filter((r) => !existingKeySet.has(r.idempotency_key));
+
+          if (newChunk.length === 0) {
+            continue;
+          }
+
+          const { data: insertedRows, error: insertErr } = await sb
+            .from('transactions')
+            .insert(newChunk)
+            .select('id');
+
+          if (insertErr) {
+            console.error(`[imports] Fallback chunk ${Math.floor(i / CHUNK_SIZE) + 1} insert error:`, insertErr);
+            chunkErrors.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${insertErr.message}`);
+          } else {
+            importedCount += insertedRows ? insertedRows.length : newChunk.length;
+          }
+        }
+
+        const finalStatus = chunkErrors.length > 0
+          ? (importedCount > 0 ? 'partially_committed' : 'failed')
+          : 'completed';
+
+        await sb
+          .from('import_history_records')
+          .update({
+            transaction_count: importedCount,
+            status: finalStatus,
+            auto_placed: autoClassifiedCount,
+            needs_review: needsReviewCount,
+            duplicates_found: duplicateCount,
+          })
+          .eq('id', idempotencyKey)
+          .eq('organization_id', orgId);
+
+        if (finalStatus === 'failed') {
+          return fail(res, 500, `Import failed: ${chunkErrors[0] || rpcErr.message}`);
+        }
+
+        data = {
+          imported: importedCount,
+          skipped: skippedCount,
+          duplicates: duplicateCount,
+          errors: chunkErrors,
+          status: finalStatus,
+          summary: {
+            totalIncome,
+            totalExpenses,
+            netAmount: totalIncome - totalExpenses,
+            autoClassified: autoClassifiedCount,
+            needsReview: needsReviewCount,
+          },
+          historyId: idempotencyKey,
+        };
       }
+
+      const batchId = (data as any)?.historyId || (data as any)?.import_id || (data as any)?.batch_id || idempotencyKey;
 
       // Post-import: Apply pre-classified categories from the batch classification
       // The frontend already ran batchClassify with AI before import and set importCategoryId on each row
       if (data) {
         try {
-          // Get the newly imported transactions
+          // Get the newly imported transactions scoped strictly to this batch
           const { data: newTxns, error: fetchErr } = await sb
             .from('transactions')
             .select('id, description, narration, status, category_id')
             .eq('organization_id', orgId)
             .eq('bank_account_id', bankAccountId)
+            .eq('source_import_id', batchId)
             .is('category_id', null)
             .order('created_at', { ascending: false })
             .limit(rows.length + 5);
@@ -529,7 +695,6 @@ export function createImportsRouter(): Router {
 
       // ── Post-Commit Operations (Slice 1: Scoped to this batch only, §10, §33 #2, #7) ──
       try {
-        const batchId = data?.import_id || data?.batch_id || idempotencyKey;
         const { data: batchRows } = await sb
           .from('transactions')
           .select('*')
@@ -579,7 +744,6 @@ export function createImportsRouter(): Router {
 
       // §13 & §11: Automated AI Payroll & Salary Detection from Statement Ingestion
       try {
-        const batchId = (data as any)?.import_id || (data as any)?.batch_id || idempotencyKey;
         const { data: allBatchTxns } = await sb
           .from('transactions')
           .select('*')

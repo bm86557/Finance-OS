@@ -120,7 +120,7 @@ import {
   Edit2
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, ReferenceLine } from 'recharts';
 import { motion } from 'motion/react';
 import { AXIOM } from '../../../styles/axiom-tokens';
 
@@ -636,7 +636,7 @@ export function ProfitIntelligenceView() {
                 Margin: {displayOverall.netMargin.toFixed(1)}% · {periodLabel}
                 {orgSummary?.profitVelocity && (
                   <span className="ml-2 font-medium" style={{ color: 'rgb(216, 180, 254)' }}>
-                    · Velocity: {currency}{orgSummary.profitVelocity.velocityAmount.toFixed(0)}/day
+                    · Velocity: {currency}{(orgSummary.profitVelocity.dailyVelocity ?? 0).toFixed(0)}/day
                   </span>
                 )}
               </p>
@@ -856,23 +856,23 @@ export function ProfitIntelligenceView() {
 
                 {hasDeptBreakdown ? (
                   <ResponsiveContainer width="100%" height={300}>
-                    <PieChart>
-                      <Pie
-                        data={deptBreakdownRows}
-                        cx="50%"
-                        cy="50%"
-                        labelLine={false}
-                        label={(entry: { department?: string; profitMargin?: number }) =>
-                          `${entry.department ?? '—'}: ${(entry.profitMargin ?? 0).toFixed(1)}%`
-                        }
-                        outerRadius={80}
-                        fill="#8884d8"
-                        dataKey="netProfit"
-                      >
-                        {deptBreakdownRows.map((entry: any, index: number) => (
-                          <Cell key={`cell-${entry.department}-${index}`} fill={COLORS[index % COLORS.length]} />
-                        ))}
-                      </Pie>
+                    <BarChart data={deptBreakdownRows}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(148, 163, 184, 0.08)" vertical={false} />
+                      <XAxis
+                        dataKey="department"
+                        stroke="rgba(148, 163, 184, 0.5)"
+                        style={{ fontSize: '12px', fontWeight: 500 }}
+                        tickLine={false}
+                        axisLine={false}
+                      />
+                      <YAxis
+                        stroke="rgba(148, 163, 184, 0.5)"
+                        style={{ fontSize: '12px', fontWeight: 500 }}
+                        tickLine={false}
+                        axisLine={false}
+                        tickFormatter={(v: number) => `${Number(v).toFixed(0)}%`}
+                      />
+                      <ReferenceLine y={0} stroke="rgba(148, 163, 184, 0.35)" />
                       <Tooltip
                         contentStyle={{
                           backgroundColor: 'rgba(15, 23, 42, 0.98)',
@@ -882,8 +882,19 @@ export function ProfitIntelligenceView() {
                           padding: '12px 16px',
                           boxShadow: '0 10px 30px rgba(0, 0, 0, 0.2)',
                         }}
+                        labelStyle={{ color: '#e2e8f0', fontWeight: 600, marginBottom: '8px', fontSize: '13px' }}
+                        itemStyle={{ color: '#e2e8f0', fontSize: '12px' }}
+                        formatter={(value: any) => [`${Number(value ?? 0).toFixed(1)}%`, 'Profit Margin']}
                       />
-                    </PieChart>
+                      <Bar dataKey="profitMargin" name="Profit Margin (%)" radius={[6, 6, 0, 0]} maxBarSize={56}>
+                        {deptBreakdownRows.map((entry: any, index: number) => (
+                          <Cell
+                            key={`margin-cell-${entry.department}-${index}`}
+                            fill={Number(entry.profitMargin ?? 0) >= 0 ? '#10b981' : '#f43f5e'}
+                          />
+                        ))}
+                      </Bar>
+                    </BarChart>
                   </ResponsiveContainer>
                 ) : (
                   <p className="text-slate-400 text-sm py-12 text-center">No margin data for this period.</p>

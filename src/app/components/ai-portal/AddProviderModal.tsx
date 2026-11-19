@@ -95,12 +95,12 @@ const PRESETS: Record<string, ProviderPreset> = {
     id: 'groq',
     name: 'Groq Cloud (Fast LLaMA)',
     providerType: 'custom',
-    defaultModel: 'llama-3.3-70b-versatile',
+    defaultModel: 'llama-3.1-8b-instant',
     baseUrl: 'https://api.groq.com/openai/v1',
     rpm: 30,
     tpm: 1000000,
-    costIn: 0.590,
-    costOut: 0.790,
+    costIn: 0.050,
+    costOut: 0.080,
   },
   mistral: {
     id: 'mistral',
@@ -151,7 +151,13 @@ export function AddProviderModal({
 
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<{ success: boolean; latencyMs?: number; error?: string } | null>(null);
+  const [testResult, setTestResult] = useState<{
+    success: boolean;
+    latencyMs?: number;
+    error?: string;
+    detectedTier?: 'free' | 'paid';
+    detectedBadge?: string;
+  } | null>(null);
 
   useEffect(() => {
     if (!isOpen) {
@@ -228,7 +234,15 @@ export function AddProviderModal({
             success: res.data.success,
             latencyMs: res.data.latencyMs,
             error: res.data.error,
+            detectedTier: res.data.detectedTier,
+            detectedBadge: res.data.detectedBadge,
           });
+          if (res.data.detectedLimits?.rpm && billingTier === 'auto') {
+            setRateLimitRpm(res.data.detectedLimits.rpm);
+          }
+          if (res.data.detectedLimits?.tpm && billingTier === 'auto') {
+            setRateLimitTpm(res.data.detectedLimits.tpm);
+          }
           if (res.data.success) {
             toast.success(`Gateway Node Connected! Latency: ${res.data.latencyMs}ms`);
           } else {
@@ -267,7 +281,15 @@ export function AddProviderModal({
           success: res.data.success,
           latencyMs: res.data.latencyMs,
           error: res.data.error,
+          detectedTier: res.data.detectedTier,
+          detectedBadge: res.data.detectedBadge,
         });
+        if (res.data.detectedLimits?.rpm && billingTier === 'auto') {
+          setRateLimitRpm(res.data.detectedLimits.rpm);
+        }
+        if (res.data.detectedLimits?.tpm && billingTier === 'auto') {
+          setRateLimitTpm(res.data.detectedLimits.tpm);
+        }
         if (res.data.success) {
           toast.success(`Node Active! Latency: ${res.data.latencyMs}ms`);
         } else {
@@ -396,7 +418,7 @@ export function AddProviderModal({
           </div>
 
           {/* Form */}
-          <form onSubmit={handleSubmit} className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
+          <form onSubmit={handleSubmit} noValidate className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
             {/* Quick Provider Presets */}
             <div>
               <label className="block text-xs font-mono font-medium text-slate-300 mb-2">
@@ -607,11 +629,40 @@ export function AddProviderModal({
             <div className="p-3 rounded-xl border border-slate-800 bg-slate-900/60">
               <div className="flex items-center justify-between gap-4">
                 <div>
-                  <label className="block text-[11px] font-mono text-slate-300 font-semibold">
-                    Key Billing Tier Mode
-                  </label>
-                  <p className="text-[10px] font-mono text-slate-500 mt-0.5">
-                    Auto detects Gemini Free Tier via quota telemetry; force Paid for billed keys or Free for $0.00 actual spend + Commercial Shadow tracking.
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <label className="block text-[11px] font-mono text-slate-300 font-semibold">
+                      Key Billing Tier Mode
+                    </label>
+                    {(() => {
+                      const previewTier = billingTier !== 'auto'
+                        ? billingTier
+                        : testResult?.detectedTier
+                        ? testResult.detectedTier
+                        : (providerType === 'gemini' ||
+                           modelName.toLowerCase().endsWith(':free') ||
+                           (costPer1MInput === 0 && costPer1MOutput === 0) ||
+                           (baseUrl.toLowerCase().includes('groq.com') && (rateLimitTpm <= 30000 || rateLimitRpm <= 1000)))
+                        ? 'free'
+                        : 'paid';
+                      return (
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold border ${
+                            previewTier === 'free'
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          }`}
+                        >
+                          {billingTier === 'auto'
+                            ? testResult?.detectedBadge || (previewTier === 'free' ? 'Auto-Detected: FREE TIER ($0 Billed)' : 'Auto-Detected: PAID TIER (Commercial)')
+                            : previewTier === 'free'
+                            ? 'Manual: FREE TIER ($0 Billed)'
+                            : 'Manual: PAID TIER (Commercial)'}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                  <p className="text-[10px] font-mono text-slate-500 mt-1">
+                    Automatically detects Free vs Paid tier from provider type, live rate-limit headers, and quota signatures when adding or testing.
                   </p>
                 </div>
                 <select
@@ -619,7 +670,7 @@ export function AddProviderModal({
                   onChange={(e) => setBillingTier(e.target.value as 'auto' | 'free' | 'paid')}
                   className="bg-slate-950 border border-slate-700 text-white font-mono text-xs rounded-lg px-2.5 py-1.5 shrink-0"
                 >
-                  <option value="auto">Auto Detect</option>
+                  <option value="auto">Auto Detect (Recommended)</option>
                   <option value="free">Free Tier ($0 Billed)</option>
                   <option value="paid">Paid Tier (Commercial)</option>
                 </select>
@@ -635,7 +686,7 @@ export function AddProviderModal({
                     : 'bg-red-950/30 border-red-500/30 text-red-300'
                 }`}
               >
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   {testResult.success ? (
                     <CheckCircle2 className="size-4 text-emerald-400" />
                   ) : (
@@ -646,6 +697,15 @@ export function AddProviderModal({
                       ? `Connection Verified! Latency: ${testResult.latencyMs}ms`
                       : `Connection Test Failed: ${testResult.error || 'Check endpoint or API key'}`}
                   </span>
+                  {testResult.detectedBadge && (
+                    <span className={`text-[10px] px-2 py-0.5 rounded font-bold border ${
+                      testResult.detectedTier === 'free'
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                    }`}>
+                      {testResult.detectedBadge}
+                    </span>
+                  )}
                 </div>
               </div>
             )}

@@ -358,6 +358,9 @@ export function AiPortalWorkspace() {
             <CardContent className="pt-0 space-y-1">
               <p className="text-[11px] text-slate-400 font-mono">
                 Prompt: {stats?.totalPromptTokens?.toLocaleString() ?? '0'} · Comp: {stats?.totalCompletionTokens?.toLocaleString() ?? '0'}
+                {stats?.platformThinkingTokens && stats.platformThinkingTokens > 0
+                  ? ` · Think: ${stats.platformThinkingTokens.toLocaleString()}`
+                  : ''}
               </p>
               <div className="flex items-center justify-between text-[10px] font-mono gap-1 pt-0.5">
                 <span className="text-purple-300">
@@ -737,30 +740,53 @@ export function AiPortalWorkspace() {
                               <div className="text-slate-200 font-mono text-xs">
                                 {t.tokensUsed.toLocaleString()}
                               </div>
-                              <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                                Platform Key
+                              <div className="text-[10px] text-slate-500 font-mono mt-0.5 flex items-center gap-1.5 flex-wrap">
+                                <span>Platform Key</span>
+                                {(t.byokTokens ?? 0) > 0 && (
+                                  <span
+                                    className="text-[9px] px-1 py-0.2 rounded bg-purple-950/70 text-purple-300 border border-purple-500/30"
+                                    title="Historical tenant BYOK tokens isolated from platform quota and cost"
+                                  >
+                                    +{t.byokTokens?.toLocaleString()} BYOK
+                                  </span>
+                                )}
                               </div>
                             </div>
                           )}
                         </td>
-                        <td className="py-3.5 px-4 text-emerald-400 font-bold">
-                          ${t.rawCostUsd.toFixed(2)}
+                        <td className="py-3.5 px-4">
+                          <div className="text-emerald-400 font-bold">
+                            ${t.rawCostUsd > 0 ? t.rawCostUsd.toFixed(4) : '0.00'}
+                          </div>
+                          {(t.commercialShadowCostUsd ?? 0) > 0 && (
+                            <div className="text-[10px] text-pink-300/80 font-mono mt-0.5" title="Commercial token value at model list rates">
+                              Val: ${t.commercialShadowCostUsd.toFixed(4)}
+                            </div>
+                          )}
                         </td>
                         <td className="py-3.5 px-4 text-slate-300">
                           {t.planFeePkr > 0 ? `${t.planFeePkr.toLocaleString()} PKR` : 'Free'}
                         </td>
                         <td className="py-3.5 px-4">
                           <span className="font-bold text-emerald-400">
-                            {t.planFeePkr > 0 ? `${t.planFeePkr.toLocaleString()} PKR (100%)` : '100%'}
+                            {t.planFeePkr > 0
+                              ? `${(t.netMarginPkr ?? t.planFeePkr).toLocaleString()} PKR (${t.marginPercent ?? 100}%)`
+                              : `${t.marginPercent ?? 100}%`}
                           </span>
                         </td>
                         <td className="py-3.5 px-4">
                           <span className={`text-[10px] px-2 py-0.5 rounded font-mono ${
                             t.keySource === 'custom_byok'
                               ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
+                              : t.keySource === 'platform_paid_tier'
+                              ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                               : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                           }`}>
-                            {t.keySource === 'custom_byok' ? 'TENANT BYOK' : 'FREE TIER POOL'}
+                            {t.keySource === 'custom_byok'
+                              ? 'TENANT BYOK'
+                              : t.keySource === 'platform_paid_tier'
+                              ? 'PAID TIER POOL'
+                              : 'FREE TIER POOL'}
                           </span>
                         </td>
                         <td className="py-3.5 px-4 text-right">
@@ -1008,6 +1034,23 @@ export function AiPortalWorkspace() {
                               Not Configured (Add Key)
                             </button>
                           )}
+                        </span>
+                      </div>
+                      <div className="flex justify-between items-center text-slate-400">
+                        <span>Billing Tier:</span>
+                        <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold border ${
+                          (node.detectedTier || (node.billingTier === 'paid' ? 'paid' : node.provider === 'gemini' ? 'free' : 'paid')) === 'free'
+                            ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                            : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        }`}>
+                          {node.detectedBadge ||
+                            (node.billingTier === 'free'
+                              ? 'FREE TIER · Manual ($0 Billed)'
+                              : node.billingTier === 'paid'
+                              ? 'PAID TIER · Manual (Commercial)'
+                              : node.provider === 'gemini'
+                              ? 'FREE TIER · Auto-Detected'
+                              : 'PAID TIER · Auto-Detected')}
                         </span>
                       </div>
                       <div className="flex justify-between text-slate-400">

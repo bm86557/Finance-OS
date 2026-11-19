@@ -42,19 +42,48 @@ import {
 } from '../lib/aiKeyTier.js';
 
 /**
- * Calculates start of day in America/Los_Angeles (Pacific Time)
+ * Formats a timestamp or Date into 'YYYY-MM-DD' in America/Los_Angeles (Pacific Time).
  * Google Gemini daily request quota (RPD) resets at Midnight Pacific Time.
  */
-function getPacificDayStartTimestamp(): number {
-  const now = new Date();
-  // Pacific Time is UTC-8 (PST) or UTC-7 (PDT)
-  // Format current Pacific date string: "YYYY-MM-DD"
-  const ptDateStr = now.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
-  const [year, month, day] = ptDateStr.split('-').map(Number);
-  // Construct UTC timestamp representing Midnight PT (08:00 UTC during PST)
-  // Using Intl to determine exact UTC offset for this day
-  const midnightPtAsUtc = new Date(Date.UTC(year, month - 1, day, 8, 0, 0, 0)).getTime();
-  return midnightPtAsUtc;
+function toPacificDateStr(dateInput?: string | number | Date | null): string {
+  const d = dateInput ? new Date(dateInput) : new Date();
+  if (isNaN(d.getTime())) return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+  return d.toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+}
+
+/**
+ * Classifies a telemetry event as Tenant BYOK vs Platform Shared Key,
+ * and resolves its true out-of-pocket actual billed cost vs commercial value.
+ */
+function classifyTelemetryEvent(
+  ev: any,
+  customKeyOrgs: Set<string>,
+  isPlatformGeminiFreeTier: boolean
+): { isByok: boolean; actualCost: number; provider: string } {
+  const rawKeySource = ev.key_source ?? ev.keySource;
+  const orgId = ev.organization_id ?? ev.organizationId;
+  const rawCost = Number(ev.cost_usd ?? ev.costUsd ?? 0) || 0;
+  const provider = String(ev.provider || 'gemini').toLowerCase();
+
+  if (rawKeySource === 'custom_byok') {
+    return { isByok: true, actualCost: rawCost, provider };
+  }
+  if (rawKeySource === 'platform') {
+    const actualCost = (provider === 'gemini' && isPlatformGeminiFreeTier) ? 0 : rawCost;
+    return { isByok: false, actualCost, provider };
+  }
+
+  // Legacy rows (pre-0040 migration where key_source was NULL/undefined):
+  // Platform Gemini calls before 0040 always wrote cost_usd = 0; only Tenant BYOK wrote cost_usd > 0 for Gemini.
+  const isLegacyByok = (provider === 'gemini' && rawCost > 0)
+    || Boolean(orgId && customKeyOrgs.has(orgId));
+
+  if (isLegacyByok) {
+    return { isByok: true, actualCost: rawCost, provider };
+  }
+
+  const actualCost = (provider === 'gemini' && isPlatformGeminiFreeTier) ? 0 : rawCost;
+  return { isByok: false, actualCost, provider };
 }
 
 export function createPlatformAiRouter(): Router {
@@ -69,7 +98,24 @@ export function createPlatformAiRouter(): Router {
       const gatewayState = getGatewayRuntimeState();
       const primaryKeyInfo = getPrimaryGatewayApiKey();
       const rawApiKey = primaryKeyInfo.apiKey;
-      const tierInfo = resolveKeyTier(rawApiKey, 'platform');
+      const baseTierInfo = resolveKeyTier(rawApiKey, 'platform');
+      const primaryNode = (gatewayState.models || []).find((m) => m.priority === 1 && !m.circuitOpen) || gatewayState.models?.[0];
+      const tierInfo = primaryNode && primaryNode.detectedTier
+        ? {
+            ...baseTierInfo,
+            tier: primaryNode.detectedTier,
+            badgeLabel: primaryNode.detectedBadge || baseTierInfo.badgeLabel,
+            isBilledAsZero: primaryNode.detectedTier === 'free',
+            limits: {
+              rpm: primaryNode.rateLimitRpm || baseTierInfo.limits.rpm,
+              rpd: primaryNode.provider === 'gemini' && primaryNode.detectedTier === 'free' ? baseTierInfo.limits.rpd : 0,
+              tpm: primaryNode.rateLimitTpm || baseTierInfo.limits.tpm,
+              dailyResetTime: primaryNode.provider === 'gemini' && primaryNode.detectedTier === 'free'
+                ? baseTierInfo.limits.dailyResetTime
+                : 'Rolling Rate Limit',
+            },
+          }
+        : baseTierInfo;
       const rollingRpm = getCurrentRollingRpm(rawApiKey);
 
       // 0. Query tenant custom BYOK keys from org_ai_credentials
@@ -95,8 +141,16 @@ export function createPlatformAiRouter(): Router {
       let platformPromptTokens = 0;
       let platformCompletionTokens = 0;
       let platformEvents = 0;
+      let platformSuccessEvents = 0;
       let platformLatencySum = 0;
       let fallbackCount = 0;
+      let requestsToday = 0;
+
+      const primaryGeminiNode = (gatewayState.models || []).find((m) => (m.provider || '').toLowerCase() === 'gemini');
+      const isPlatformGeminiFreeTier = primaryGeminiNode?.billingTier === 'paid'
+        ? false
+        : (primaryGeminiNode?.billingTier === 'free' ? true : Boolean(tierInfo.isBilledAsZero));
+      const todayPtStr = toPacificDateStr();
 
       // Tenant BYOK usage (tenant brings own external key via Integrations - zero platform quota/cost)
       let byokTokens = 0;
@@ -202,7 +256,7 @@ export function createPlatformAiRouter(): Router {
           let dbEvents: any[] | null = null;
           const resExt = await sb
             .from('platform_ai_usage_events')
-            .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, commercial_cost_usd, key_source, key_last4, key_fingerprint, created_at')
+            .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, commercial_cost_usd, key_source, key_last4, key_fingerprint, status, created_at')
             .order('created_at', { ascending: false })
             .limit(5000);
 
@@ -211,7 +265,7 @@ export function createPlatformAiRouter(): Router {
           } else {
             const resBase = await sb
               .from('platform_ai_usage_events')
-              .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, created_at')
+              .select('organization_id, provider, model_name, prompt_tokens, completion_tokens, total_tokens, latency_ms, fallback_triggered, feature_area, cost_usd, status, created_at')
               .order('created_at', { ascending: false })
               .limit(5000);
             if (!resBase.error) dbEvents = resBase.data;
@@ -223,15 +277,11 @@ export function createPlatformAiRouter(): Router {
               const ct = Number(ev.completion_tokens) || 0;
               const tt = Number(ev.total_tokens) || (pt + ct);
               const lat = Number(ev.latency_ms) || 0;
-              const actualCost = Number(ev.cost_usd) || 0;
+              const { isByok, actualCost } = classifyTelemetryEvent(ev, customKeyOrgs, isPlatformGeminiFreeTier);
               const commercialCost = inferCommercialCost(ev, pt, ct);
 
               totalSystemTokens += tt;
               totalSystemEvents += 1;
-
-              // Only treat as BYOK when explicitly flagged custom_byok, or legacy org-with-key that had cost_usd > 0
-              const isByok = ev.key_source === 'custom_byok'
-                || (!ev.key_source && ev.organization_id && customKeyOrgs.has(ev.organization_id) && actualCost > 0);
 
               if (isByok) {
                 byokTokens += tt;
@@ -244,12 +294,18 @@ export function createPlatformAiRouter(): Router {
                 platformPromptTokens += pt;
                 platformCompletionTokens += ct;
                 platformEvents += 1;
+                if (ev.status !== 'error' && ev.status !== 'rate_limited') {
+                  platformSuccessEvents += 1;
+                }
                 platformLatencySum += lat;
                 platformActualSpendUsd += actualCost;
                 platformCommercialUsd += commercialCost;
 
                 if (ev.fallback_triggered) {
                   fallbackCount += 1;
+                }
+                if (ev.created_at && toPacificDateStr(ev.created_at) === todayPtStr) {
+                  requestsToday += 1;
                 }
               }
 
@@ -279,9 +335,7 @@ export function createPlatformAiRouter(): Router {
       // 2. Add unpersisted in-memory events only (prevents double-counting)
       const unpersisted = getUnpersistedTelemetryEvents();
       for (const ev of unpersisted) {
-        const actualCost = ev.costUsd || 0;
-        const isByok = ev.keySource === 'custom_byok'
-          || (!ev.keySource && ev.organizationId && customKeyOrgs.has(ev.organizationId) && actualCost > 0);
+        const { isByok, actualCost } = classifyTelemetryEvent(ev, customKeyOrgs, isPlatformGeminiFreeTier);
         const pt = ev.promptTokens || 0;
         const ct = ev.completionTokens || 0;
         const tt = ev.totalTokens || (pt + ct);
@@ -302,12 +356,18 @@ export function createPlatformAiRouter(): Router {
           platformPromptTokens += pt;
           platformCompletionTokens += ct;
           platformEvents += 1;
+          if (ev.status !== 'error' && ev.status !== 'rate_limited') {
+            platformSuccessEvents += 1;
+          }
           platformLatencySum += lat;
           platformActualSpendUsd += actualCost;
           platformCommercialUsd += commercialCost;
 
           if (ev.fallbackTriggered) {
             fallbackCount += 1;
+          }
+          if (toPacificDateStr(ev.timestamp || Date.now()) === todayPtStr) {
+            requestsToday += 1;
           }
         }
 
@@ -329,43 +389,7 @@ export function createPlatformAiRouter(): Router {
         featureBreakdown[feat] = (featureBreakdown[feat] || 0) + 1;
       }
 
-      // 3. Count today's platform requests in Pacific Time window (resets at Midnight PT)
-      const pacificDayStart = getPacificDayStartTimestamp();
-      let requestsToday = 0;
-
-      if (sb) {
-        try {
-          const { data: todayEvents, error } = await sb
-            .from('platform_ai_usage_events')
-            .select('organization_id, cost_usd')
-            .gte('created_at', new Date(pacificDayStart).toISOString());
-
-          if (!error && todayEvents) {
-            // Count strictly platform requests against the platform gateway daily quota
-            requestsToday = todayEvents.filter(
-              (ev) => {
-                const isByok = (ev as any).key_source === 'custom_byok'
-                  || Number(ev.cost_usd) > 0
-                  || (ev.organization_id && customKeyOrgs.has(ev.organization_id) && ev.cost_usd === undefined);
-                return !isByok;
-              }
-            ).length;
-          }
-        } catch {
-          // ignore
-        }
-      }
-
-      // Add unpersisted platform events today
-      const unpersistedPlatformToday = unpersisted.filter((ev) => {
-        const isByok = ev.keySource === 'custom_byok'
-          || (ev.costUsd !== undefined && ev.costUsd > 0)
-          || (ev.organizationId && customKeyOrgs.has(ev.organizationId) && ev.keySource === undefined);
-        if (isByok) return false;
-        const evTime = ev.timestamp ? new Date(ev.timestamp).getTime() : Date.now();
-        return evTime >= pacificDayStart;
-      }).length;
-      requestsToday += unpersistedPlatformToday;
+      const platformThinkingTokens = Math.max(0, platformTokens - (platformPromptTokens + platformCompletionTokens));
 
       // 4. Dual-Ledger Valuation: Actual Billed Spend + Commercial Equivalent + Free Tier Savings
       const commercialEquivalentUsd = Number(platformCommercialUsd.toFixed(6));
@@ -451,6 +475,7 @@ export function createPlatformAiRouter(): Router {
         totalTokens: platformTokens,
         totalPromptTokens: platformPromptTokens,
         totalCompletionTokens: platformCompletionTokens,
+        platformThinkingTokens,
         totalEvents: platformEvents,
         platformTokens,
         platformPromptTokens,
@@ -474,7 +499,9 @@ export function createPlatformAiRouter(): Router {
         apiKeyConfigured: !!rawApiKey,
         apiKeyMasked: maskedKey,
         avgLatencyMs,
-        uptimePercent: (platformEvents + byokEvents) > 0 ? 100.0 : null,
+        uptimePercent: platformEvents > 0
+          ? Number(((platformSuccessEvents / platformEvents) * 100).toFixed(1))
+          : (byokEvents > 0 ? 100.0 : null),
         fallbackCount,
         airGapVerified: true,
         featureBreakdown,
@@ -601,20 +628,41 @@ export function createPlatformAiRouter(): Router {
 
       // Aggregate from Supabase platform_ai_usage_events
       const orgCostMap = new Map<string, { platformActualUsd: number; platformCommercialUsd: number; byokCommercialUsd: number }>();
+      const gatewayState = getGatewayRuntimeState();
+      const primaryKeyInfo = getPrimaryGatewayApiKey();
+      const tierInfo = resolveKeyTier(primaryKeyInfo.apiKey, 'platform');
+      const primaryGeminiNode = (gatewayState.models || []).find((m) => (m.provider || '').toLowerCase() === 'gemini');
+      const isPlatformGeminiFreeTier = primaryGeminiNode?.billingTier === 'paid'
+        ? false
+        : (primaryGeminiNode?.billingTier === 'free' ? true : Boolean(tierInfo.isBilledAsZero));
+
+      const calcEventCommercialUsd = (ev: any, pt: number, ct: number, tt: number, actualCost: number): number => {
+        if (Number(ev.commercial_cost_usd ?? ev.commercialCostUsd ?? 0) > 0) {
+          return Number(ev.commercial_cost_usd ?? ev.commercialCostUsd);
+        }
+        if (actualCost > 0) return actualCost;
+        const prov = String(ev.provider || 'gemini').toLowerCase();
+        const inRate = prov === 'anthropic' ? 0.80 : prov === 'openai' ? 0.15 : 0.075;
+        const outRate = prov === 'anthropic' ? 4.00 : prov === 'openai' ? 0.60 : 0.30;
+        if (pt > 0 || ct > 0) {
+          return Number(((pt * inRate) / 1_000_000 + (ct * outRate) / 1_000_000).toFixed(6));
+        }
+        return Number((tt * 0.00000015).toFixed(6));
+      };
 
       if (sb) {
         try {
           let events: any[] | null = null;
           const resExt = await sb
             .from('platform_ai_usage_events')
-            .select('organization_id, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd, commercial_cost_usd, key_source')
+            .select('organization_id, provider, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd, commercial_cost_usd, key_source')
             .gte('created_at', defaultPeriodStart);
           if (!resExt.error) {
             events = resExt.data;
           } else {
             const resBase = await sb
               .from('platform_ai_usage_events')
-              .select('organization_id, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd')
+              .select('organization_id, provider, total_tokens, prompt_tokens, completion_tokens, portal_type, created_at, cost_usd')
               .gte('created_at', defaultPeriodStart);
             if (!resBase.error) events = resBase.data;
           }
@@ -634,15 +682,12 @@ export function createPlatformAiRouter(): Router {
                 platformCommercialUsd: 0,
                 byokCommercialUsd: 0,
               };
-              const tt = Number(ev.total_tokens) || 0;
-              const actualCost = Number(ev.cost_usd) || 0;
-              const commercialCost = Number(ev.commercial_cost_usd) > 0
-                ? Number(ev.commercial_cost_usd)
-                : (actualCost > 0 ? actualCost : Number((tt * 0.00000015).toFixed(6)));
+              const pt = Number(ev.prompt_tokens) || 0;
+              const ct = Number(ev.completion_tokens) || 0;
+              const tt = Number(ev.total_tokens) || (pt + ct);
+              const { isByok: isEvByok, actualCost } = classifyTelemetryEvent(ev, customKeyOrgs, isPlatformGeminiFreeTier);
+              const commercialCost = calcEventCommercialUsd(ev, pt, ct, tt, Number(ev.cost_usd) || 0);
               cur.totalTokens += tt;
-
-              const isEvByok = ev.key_source === 'custom_byok'
-                || (!ev.key_source && ev.organization_id && customKeyOrgs.has(ev.organization_id) && actualCost > 0);
 
               if (isEvByok) {
                 cur.byokTokens += tt;
@@ -679,15 +724,12 @@ export function createPlatformAiRouter(): Router {
           platformCommercialUsd: 0,
           byokCommercialUsd: 0,
         };
-        const tt = ev.totalTokens || 0;
-        const actualCost = ev.costUsd || 0;
-        const commercialCost = (ev.commercialCostUsd && ev.commercialCostUsd > 0)
-          ? ev.commercialCostUsd
-          : (actualCost > 0 ? actualCost : Number((tt * 0.00000015).toFixed(6)));
+        const pt = ev.promptTokens || 0;
+        const ct = ev.completionTokens || 0;
+        const tt = ev.totalTokens || (pt + ct);
+        const { isByok: isEvByok, actualCost } = classifyTelemetryEvent(ev, customKeyOrgs, isPlatformGeminiFreeTier);
+        const commercialCost = calcEventCommercialUsd(ev, pt, ct, tt, ev.costUsd || 0);
         cur.totalTokens += tt;
-
-        const isEvByok = ev.keySource === 'custom_byok'
-          || (!ev.keySource && ev.organizationId && customKeyOrgs.has(ev.organizationId) && actualCost > 0);
 
         if (isEvByok) {
           cur.byokTokens += tt;

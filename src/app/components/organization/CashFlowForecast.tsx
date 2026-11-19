@@ -24,6 +24,13 @@ interface Scenario {
   color: string;
 }
 
+function parseIsoDateLocal(dateStr: string): Date {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+    return new Date(`${dateStr}T12:00:00`);
+  }
+  return new Date(dateStr);
+}
+
 export function CashFlowForecast() {
   const svc = useOrgServices();
   const { currentOrganization } = useAuth();
@@ -165,10 +172,10 @@ export function CashFlowForecast() {
   }, [chartSeries, forecastData?.monthlyBreakdown]);
 
   return (
-    <div className="min-h-screen p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
+    <div className="min-h-screen p-4 sm:p-6 lg:p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
       {/* Header */}
       <motion.div {...AXIOM.animations.fadeInTop}>
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
           <div className="flex items-center gap-3">
             <div 
               className="p-3 rounded-xl flex items-center justify-center"
@@ -280,7 +287,7 @@ export function CashFlowForecast() {
       </div>
 
       {/* Key Metrics */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -317,7 +324,7 @@ export function CashFlowForecast() {
           <div className="flex items-center justify-between">
             <div>
               <p className="text-slate-400 text-sm mb-1">Projected Balance</p>
-              <p className={`text-2xl font-bold ${netChange > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+              <p className={`text-2xl font-bold ${netChange >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                 {formatCurrency(finalBalance, orgCurrency)}
               </p>
               <p className="text-xs text-slate-400 mt-1">
@@ -327,11 +334,11 @@ export function CashFlowForecast() {
             <div 
               className="w-12 h-12 rounded-xl flex items-center justify-center"
               style={{
-                background: netChange > 0 ? AXIOM.iconBoxes.green : AXIOM.iconBoxes.red,
-                boxShadow: netChange > 0 ? AXIOM.shadows.iconGreen : AXIOM.shadows.iconRed,
+                background: netChange >= 0 ? AXIOM.iconBoxes.green : AXIOM.iconBoxes.red,
+                boxShadow: netChange >= 0 ? AXIOM.shadows.iconGreen : AXIOM.shadows.iconRed,
               }}
             >
-              {netChange > 0 ? (
+              {netChange >= 0 ? (
                 <TrendingUp className="size-6 text-white" />
               ) : (
                 <TrendingDown className="size-6 text-white" />
@@ -647,7 +654,7 @@ export function CashFlowForecast() {
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="text-white font-semibold">
-                      {new Date(month.month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
+                      {parseIsoDateLocal(month.month + '-01').toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}
                     </h3>
                     {month.type === 'actual' && (
                       <span className="px-2 py-0.5 rounded text-xs font-medium" style={AXIOM.badges.info}>

@@ -91,39 +91,47 @@ export async function generateCashFlowForecast(
       .eq('organization_id', organizationId);
 
     let currentCash = 0;
-    if (bankData && bankData.length > 0) {
+    const scopedBanks = (bankData || []).filter(
+      (b: any) => (b.usage === 'personal' ? 'personal' : 'business') === 'business'
+    );
+    if (scopedBanks.length > 0) {
       let totalBank = 0;
       let totalOnlineWallets = 0;
       let totalCreditLiabilities = 0;
       let totalCash = 0;
 
-      for (const b of bankData) {
+      for (const b of scopedBanks) {
         const accountTxns = (txns || []).filter(
           (t: any) =>
             t.bank_account_id === b.id &&
             !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
         );
         const rawOpening = b.opening_balance;
+        const fallbackStored = b.current_balance ?? b.balance;
         const openingBal = rawOpening != null
           ? Number(rawOpening)
-          : (accountTxns.length > 0 ? 0 : Number(b.balance ?? 0));
+          : (accountTxns.length > 0 ? 0 : Number(fallbackStored ?? 0));
 
         let liveBal = openingBal;
 
-        for (const t of accountTxns) {
-          const rawAmt = Number(t.amount || 0);
-          const txnCurrency = (t.currency || b.currency || baseCurrency).toUpperCase();
-          let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-          const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
-          if (!fxRate && tags) {
-            const rTag = tags.find((tag: any) => typeof tag === 'string' && tag.startsWith('fx:rate:'));
-            if (rTag) fxRate = Number(rTag.slice(8));
-          }
-          const convertedAmt = convertCurrency(rawAmt, txnCurrency, b.currency || baseCurrency, fxRate);
-          if (t.type === 'credit') {
-            liveBal += convertedAmt;
-          } else {
-            liveBal -= Math.abs(convertedAmt);
+        if (accountTxns.length === 0) {
+          liveBal = Number(fallbackStored ?? openingBal ?? 0);
+        } else {
+          for (const t of accountTxns) {
+            const rawAmt = Number(t.amount || 0);
+            const txnCurrency = (t.currency || b.currency || baseCurrency).toUpperCase();
+            let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
+            const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
+            if (!fxRate && tags) {
+              const rTag = tags.find((tag: any) => typeof tag === 'string' && tag.startsWith('fx:rate:'));
+              if (rTag) fxRate = Number(rTag.slice(8));
+            }
+            const convertedAmt = convertCurrency(rawAmt, txnCurrency, b.currency || baseCurrency, fxRate);
+            if (t.type === 'credit') {
+              liveBal += convertedAmt;
+            } else {
+              liveBal -= Math.abs(convertedAmt);
+            }
           }
         }
 
@@ -134,7 +142,7 @@ export async function generateCashFlowForecast(
           totalBank += balInBase;
         } else if (b.account_type === 'online_wallet') {
           totalOnlineWallets += balInBase;
-        } else if (['credit_card', 'line_of_credit'].includes(b.account_type)) {
+        } else if (['credit_card', 'line_of_credit', 'credit'].includes(b.account_type)) {
           totalCreditLiabilities += Math.abs(balInBase);
         } else if (b.account_type === 'cash') {
           totalCash += balInBase;
@@ -171,6 +179,22 @@ export async function generateCashFlowForecast(
       .select('*')
       .eq('organization_id', organizationId);
 
+    // Enforce business/personal world isolation (§5, §32, §33)
+    const bankUsageById = new Map<string, string>();
+    for (const b of bankData || []) {
+      bankUsageById.set(String(b.id), b.usage === 'personal' ? 'personal' : 'business');
+    }
+    const businessTxns = (txns || []).filter((t: any) => {
+      const bankUsage = t.bank_account_id ? bankUsageById.get(String(t.bank_account_id)) : undefined;
+      const usage = bankUsage || (t.usage === 'personal' || t.world === 'personal' ? 'personal' : 'business');
+      return usage === 'business';
+    });
+    const businessRecurring = (recurring || []).filter((r: any) => {
+      const bankUsage = r.bank_account_id ? bankUsageById.get(String(r.bank_account_id)) : undefined;
+      const usage = bankUsage || (r.usage === 'personal' || r.world === 'personal' ? 'personal' : 'business');
+      return usage === 'business';
+    });
+
     // Compute deterministic forecast with baseCurrency
     const engineResult = computeCashFlowForecast({
       organizationId,
@@ -178,8 +202,8 @@ export async function generateCashFlowForecast(
       scenario,
       currentCash,
       baseCurrency,
-      transactions: txns || [],
-      recurring: recurring || [],
+      transactions: businessTxns,
+      recurring: businessRecurring,
       loans: loans || [],
     });
 

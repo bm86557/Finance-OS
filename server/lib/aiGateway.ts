@@ -88,6 +88,13 @@ export interface AITestResult {
   latencyMs: number;
   error?: string;
   isQuotaExceeded?: boolean;
+  detectedTier?: 'free' | 'paid';
+  detectedBadge?: string;
+  detectedLimits?: {
+    rpm?: number;
+    tpm?: number;
+    rpd?: number;
+  };
 }
 
 export interface TelemetryEventParams {
@@ -133,6 +140,8 @@ export interface GatewayModelState {
   costPer1MInput: number;
   costPer1MOutput: number;
   billingTier?: BillingTierMode;
+  detectedTier?: 'free' | 'paid';
+  detectedBadge?: string;
   tokensUsed?: number;
   promptTokens?: number;
   completionTokens?: number;
@@ -295,6 +304,9 @@ export function getGatewayRuntimeModels(): GatewayModelState[] {
       ? 'online'
       : 'standby';
 
+    const resolvedKey = resolveNodeApiKey(m);
+    const tierDetection = detectNodeBillingTier(m, resolvedKey);
+
     // Strictly strip encrypted ciphertext from API responses to ensure zero key exposure to client
     const { apiKeyEncrypted, ...safeProps } = m;
 
@@ -304,6 +316,8 @@ export function getGatewayRuntimeModels(): GatewayModelState[] {
       latencyMs: m.callCount > 0 ? (m.lastLatencyMs || m.avgLatencyMs) : 0,
       status: computedStatus,
       successRate: m.callCount > 0 ? Number((((m.callCount - m.failureCount) / m.callCount) * 100).toFixed(1)) : 100,
+      detectedTier: tierDetection.detectedTier,
+      detectedBadge: tierDetection.detectedBadge,
     };
   });
 }
@@ -424,13 +438,83 @@ export function calculateTokenCost(params: {
   return { actualCostUsd, commercialCostUsd, rateIn1M, rateOut1M };
 }
 
-export function isNodeFreeTierZeroBilled(node: GatewayModelState, apiKey: string): boolean {
-  if (node.billingTier === 'free') return true;
-  if (node.billingTier === 'paid') return false;
-  if ((node.provider || '').toLowerCase() === 'gemini') {
-    return resolveKeyTier(apiKey, 'platform').isBilledAsZero;
+export function detectNodeBillingTier(
+  node: Pick<GatewayModelState, 'provider' | 'modelName' | 'baseUrl' | 'billingTier' | 'rateLimitRpm' | 'costPer1MInput' | 'costPer1MOutput'> & { detectedTier?: 'free' | 'paid'; detectedBadge?: string },
+  apiKey?: string
+): { detectedTier: 'free' | 'paid'; detectedBadge: string; isBilledAsZero: boolean } {
+  if (node.billingTier === 'free') {
+    return {
+      detectedTier: 'free',
+      detectedBadge: 'FREE TIER · Manual Override ($0 Billed)',
+      isBilledAsZero: true,
+    };
   }
-  return false;
+  if (node.billingTier === 'paid') {
+    return {
+      detectedTier: 'paid',
+      detectedBadge: 'PAID TIER · Manual Override (Commercial)',
+      isBilledAsZero: false,
+    };
+  }
+
+  // If live HTTP header probe already detected tier on this node in auto mode, honor it
+  if (node.detectedTier && node.detectedBadge && !node.detectedBadge.includes('Manual')) {
+    return {
+      detectedTier: node.detectedTier,
+      detectedBadge: node.detectedBadge,
+      isBilledAsZero: node.detectedTier === 'free',
+    };
+  }
+
+  const prov = (node.provider || '').toLowerCase();
+  const model = (node.modelName || '').toLowerCase();
+  const base = (node.baseUrl || '').toLowerCase();
+
+  // 1. OpenRouter or custom ":free" model suffix or explicitly $0 input/output rates
+  if (model.endsWith(':free') || (node.costPer1MInput === 0 && node.costPer1MOutput === 0)) {
+    return {
+      detectedTier: 'free',
+      detectedBadge: 'FREE TIER · Auto-Detected ($0 Model Rate)',
+      isBilledAsZero: true,
+    };
+  }
+
+  // 2. Groq Free Developer Tier detection (api.groq.com: Free Tier has <= 30k TPM or <= 1000 RPD/RPM)
+  if (prov === 'groq' || base.includes('groq.com')) {
+    const isGroqFree = (node.rateLimitTpm !== undefined && node.rateLimitTpm <= 30000)
+      || (node.rateLimitRpm !== undefined && node.rateLimitRpm <= 1000);
+    if (isGroqFree) {
+      return {
+        detectedTier: 'free',
+        detectedBadge: 'FREE TIER · Auto-Detected (Groq Free Limits)',
+        isBilledAsZero: true,
+      };
+    }
+  }
+
+  // 3. Google Gemini layered key-tier detection (429 QuotaFailure signature + rolling >20 RPM throughput)
+  if (prov === 'gemini') {
+    const geminiTier = resolveKeyTier(apiKey, 'platform');
+    const isPaid = geminiTier.tier === 'paid';
+    return {
+      detectedTier: isPaid ? 'paid' : 'free',
+      detectedBadge: isPaid
+        ? (geminiTier.badgeLabel || 'PAID TIER · Auto-Detected')
+        : (geminiTier.badgeLabel || 'FREE TIER · Auto-Detected (Gemini)'),
+      isBilledAsZero: !isPaid,
+    };
+  }
+
+  // 4. OpenAI, Anthropic, DeepSeek, and Custom commercial endpoints default to Paid Tier
+  return {
+    detectedTier: 'paid',
+    detectedBadge: 'PAID TIER · Auto-Detected (Commercial Key)',
+    isBilledAsZero: false,
+  };
+}
+
+export function isNodeFreeTierZeroBilled(node: GatewayModelState, apiKey: string): boolean {
+  return detectNodeBillingTier(node, apiKey).isBilledAsZero;
 }
 
 /**
@@ -466,8 +550,11 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
 
     if (Array.isArray(usageRows)) {
       for (const ev of usageRows) {
-        if ((ev as any).key_source === 'custom_byok') continue;
-        const key = `${String(ev.provider || '').toLowerCase()}::${String(ev.model_name || '').toLowerCase()}`;
+        const rawKeySource = (ev as any).key_source;
+        const evProv = String(ev.provider || 'gemini').toLowerCase();
+        const evCost = Number(ev.cost_usd) || 0;
+        if (rawKeySource === 'custom_byok' || (!rawKeySource && evProv === 'gemini' && evCost > 0)) continue;
+        const key = `${evProv}::${String(ev.model_name || '').toLowerCase()}`;
         const cur = nodeUsageMap.get(key) || {
           calls: 0,
           failures: 0,
@@ -596,20 +683,29 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
             : row.priority === 1
             ? 'online'
             : 'standby',
-          baseUrl: row.base_url || undefined,
-          hasApiKey,
-          keySource,
-          keyLast4: keyLast4 ? `••••${keyLast4}` : undefined,
-          apiKeyEncrypted: row.api_key_encrypted || undefined,
-          rateLimitRpm: row.rate_limit_rpm || 60,
-          rateLimitTpm: row.rate_limit_tpm || 1000000,
-          maxTokensPerReq: row.max_tokens_per_req || 4096,
-          timeoutMs: row.timeout_ms || 10000,
+          baseUrl: row.base_url || existing?.baseUrl || undefined,
+          hasApiKey: hasApiKey || Boolean(existing?.hasApiKey),
+          keySource: hasApiKey ? keySource : (existing?.keySource || 'none'),
+          keyLast4: keyLast4 ? `••••${keyLast4}` : existing?.keyLast4,
+          apiKeyEncrypted: row.api_key_encrypted || existing?.apiKeyEncrypted || undefined,
+          rateLimitRpm: row.rate_limit_rpm || existing?.rateLimitRpm || 60,
+          rateLimitTpm: row.rate_limit_tpm || existing?.rateLimitTpm || 1000000,
+          maxTokensPerReq: row.max_tokens_per_req || existing?.maxTokensPerReq || 4096,
+          timeoutMs: row.timeout_ms || existing?.timeoutMs || 10000,
         };
       });
 
+      // Preserve any custom in-memory nodes that haven't been persisted to DB yet (e.g. pending migration 0036)
+      const unpersistedCustomNodes = runtimeGatewayModels.filter(
+        (m) =>
+          m.id?.startsWith('custom-') &&
+          !updatedModels.some(
+            (u) => u.provider.toLowerCase() === m.provider.toLowerCase() && u.modelName.toLowerCase() === m.modelName.toLowerCase()
+          )
+      );
+
       runtimeGatewayModels.length = 0;
-      runtimeGatewayModels.push(...updatedModels);
+      runtimeGatewayModels.push(...updatedModels, ...unpersistedCustomNodes);
       runtimeGatewayModels.sort((a, b) => a.priority - b.priority);
     }
   } catch (err) {
@@ -661,12 +757,42 @@ export async function addGatewayProviderDb(params: {
       if (encryptedKey) payload.api_key_encrypted = encryptedKey;
       if (params.baseUrl) payload.base_url = params.baseUrl;
 
-      const { error: upsertErr } = await sb.from('platform_ai_gateway_providers').upsert(payload, { onConflict: 'provider, model_name' });
-      if (upsertErr && String(upsertErr.message || '').includes('billing_tier')) {
+      let dbSaveErr: any = null;
+      const attemptUpsert = async (p: any) =>
+        sb.from('platform_ai_gateway_providers').upsert(p, { onConflict: 'provider, model_name' }).select('id').maybeSingle();
+
+      let res = await attemptUpsert(payload);
+      dbSaveErr = res.error;
+
+      if (dbSaveErr && String(dbSaveErr.message || '').includes('billing_tier')) {
         delete payload.billing_tier;
-        await sb.from('platform_ai_gateway_providers').upsert(payload, { onConflict: 'provider, model_name' });
+        res = await attemptUpsert(payload);
+        dbSaveErr = res.error;
       }
-      await syncGatewayProvidersFromDb();
+
+      // Fallback if unique index (provider, model_name) is missing in DB
+      if (dbSaveErr) {
+        const { data: existingDb } = await sb
+          .from('platform_ai_gateway_providers')
+          .select('id')
+          .eq('provider', payload.provider)
+          .eq('model_name', payload.model_name)
+          .maybeSingle();
+
+        if (existingDb?.id) {
+          const upd = await sb.from('platform_ai_gateway_providers').update(payload).eq('id', existingDb.id);
+          dbSaveErr = upd.error;
+        } else {
+          const ins = await sb.from('platform_ai_gateway_providers').insert(payload);
+          dbSaveErr = ins.error;
+        }
+      }
+
+      if (!dbSaveErr) {
+        await syncGatewayProvidersFromDb();
+      } else {
+        console.warn('[aiGateway] Could not persist provider to Supabase (keeping in-memory):', dbSaveErr.message);
+      }
     } catch (e) {
       console.warn('[aiGateway] Could not upsert provider to DB, keeping in-memory fallback:', e);
     }
@@ -719,6 +845,29 @@ export async function addGatewayProviderDb(params: {
       timeoutMs: params.timeoutMs ?? 10000,
     };
     runtimeGatewayModels.push(existing);
+  }
+
+  const tierInfo = detectNodeBillingTier(existing, params.apiKey || resolveNodeApiKey(existing));
+  existing.detectedTier = tierInfo.detectedTier;
+  existing.detectedBadge = tierInfo.detectedBadge;
+
+  // If an API key was provided and billingTier is 'auto', asynchronously probe the live endpoint to refine tier/limits from HTTP headers
+  if (params.apiKey && (!params.billingTier || params.billingTier === 'auto')) {
+    const targetNode = existing;
+    const rawKey = params.apiKey.trim();
+    void testAIConnection({
+      provider: (params.provider === 'gemini' ? 'gemini' : params.provider === 'openai' ? 'openai' : params.provider === 'anthropic' ? 'anthropic' : 'custom') as AIProvider,
+      modelName: params.modelName,
+      apiKey: rawKey,
+      baseUrl: params.baseUrl,
+    })
+      .then((probe) => {
+        if (probe.detectedTier) targetNode.detectedTier = probe.detectedTier;
+        if (probe.detectedBadge) targetNode.detectedBadge = probe.detectedBadge;
+        if (probe.detectedLimits?.rpm && !params.rateLimitRpm) targetNode.rateLimitRpm = probe.detectedLimits.rpm;
+        if (probe.detectedLimits?.tpm && !params.rateLimitTpm) targetNode.rateLimitTpm = probe.detectedLimits.tpm;
+      })
+      .catch(() => {});
   }
 
   runtimeGatewayModels.sort((a, b) => a.priority - b.priority);
@@ -797,6 +946,27 @@ export async function updateGatewayProviderDb(
     if (params.circuitOpen !== undefined) existing.circuitOpen = params.circuitOpen;
     if (params.isActive !== undefined) existing.isActive = params.isActive;
     if (params.billingTier !== undefined) existing.billingTier = params.billingTier;
+    const tierInfo = detectNodeBillingTier(existing, params.apiKey || resolveNodeApiKey(existing));
+    existing.detectedTier = tierInfo.detectedTier;
+    existing.detectedBadge = tierInfo.detectedBadge;
+
+    if (params.apiKey && (existing.billingTier || 'auto') === 'auto') {
+      const targetNode = existing;
+      const rawKey = params.apiKey.trim();
+      void testAIConnection({
+        provider: (existing.provider === 'gemini' ? 'gemini' : existing.provider === 'openai' ? 'openai' : existing.provider === 'anthropic' ? 'anthropic' : 'custom') as AIProvider,
+        modelName: existing.modelName,
+        apiKey: rawKey,
+        baseUrl: existing.baseUrl,
+      })
+        .then((probe) => {
+          if (probe.detectedTier) targetNode.detectedTier = probe.detectedTier;
+          if (probe.detectedBadge) targetNode.detectedBadge = probe.detectedBadge;
+          if (probe.detectedLimits?.rpm && !params.rateLimitRpm) targetNode.rateLimitRpm = probe.detectedLimits.rpm;
+          if (probe.detectedLimits?.tpm && !params.rateLimitTpm) targetNode.rateLimitTpm = probe.detectedLimits.tpm;
+        })
+        .catch(() => {});
+    }
     runtimeGatewayModels.sort((a, b) => a.priority - b.priority);
   }
   return existing || null;
@@ -1443,6 +1613,7 @@ export async function testAIConnection(params: {
         } else if (res.status === 400 || res.status === 403) {
           errorMsg = 'Invalid API key or unauthorized project access.';
         }
+        const resolvedAfterErr = resolveKeyTier(cleanKey, 'platform');
         return {
           success: false,
           provider: 'gemini',
@@ -1450,6 +1621,9 @@ export async function testAIConnection(params: {
           latencyMs,
           error: errorMsg,
           isQuotaExceeded: isQuota,
+          detectedTier: resolvedAfterErr.tier === 'paid' ? 'paid' : 'free',
+          detectedBadge: resolvedAfterErr.badgeLabel,
+          detectedLimits: resolvedAfterErr.limits,
         };
       }
 
@@ -1457,7 +1631,8 @@ export async function testAIConnection(params: {
       recordSuccessfulCall(cleanKey, 'platform');
 
       // 2. Actively verify key tier live
-      void verifyGeminiKeyLive(cleanKey, normalizedModel, 'platform').catch(() => {});
+      await verifyGeminiKeyLive(cleanKey, normalizedModel, 'platform').catch(() => {});
+      const resolvedGeminiTier = resolveKeyTier(cleanKey, 'platform');
 
       // 3. Record live telemetry event so dashboard metrics reflect the invocation
       void recordAiTelemetryEvent({
@@ -1484,6 +1659,8 @@ export async function testAIConnection(params: {
           ? Math.round((matched.avgLatencyMs * (matched.callCount - 1) + latencyMs) / matched.callCount)
           : latencyMs;
         matched.lastUsedAt = new Date().toISOString();
+        matched.detectedTier = resolvedGeminiTier.tier === 'paid' ? 'paid' : 'free';
+        matched.detectedBadge = resolvedGeminiTier.badgeLabel;
       }
 
       return {
@@ -1491,6 +1668,9 @@ export async function testAIConnection(params: {
         provider: 'gemini',
         model: normalizedModel,
         latencyMs,
+        detectedTier: resolvedGeminiTier.tier === 'paid' ? 'paid' : 'free',
+        detectedBadge: resolvedGeminiTier.badgeLabel || 'FREE TIER · Verified Live (15 RPM / 1,500 RPD)',
+        detectedLimits: resolvedGeminiTier.limits,
       };
     } else if (provider === 'anthropic') {
       const url = 'https://api.anthropic.com/v1/messages';
@@ -1510,6 +1690,8 @@ export async function testAIConnection(params: {
       });
 
       const latencyMs = Date.now() - start;
+      const anthRpm = Number(res.headers?.get?.('anthropic-ratelimit-requests-limit') || 0) || undefined;
+      const anthTpm = Number(res.headers?.get?.('anthropic-ratelimit-tokens-limit') || 0) || undefined;
 
       if (!res.ok) {
         const errorText = await res.text();
@@ -1527,6 +1709,9 @@ export async function testAIConnection(params: {
           latencyMs,
           error: errorMsg,
           isQuotaExceeded: isQuota,
+          detectedTier: 'paid',
+          detectedBadge: 'PAID TIER · Auto-Detected (Anthropic Commercial)',
+          detectedLimits: { rpm: anthRpm, tpm: anthTpm },
         };
       }
 
@@ -1535,6 +1720,11 @@ export async function testAIConnection(params: {
         provider: 'anthropic',
         model: modelName,
         latencyMs,
+        detectedTier: 'paid',
+        detectedBadge: anthRpm
+          ? `PAID TIER · Auto-Detected (${anthRpm} RPM Limit)`
+          : 'PAID TIER · Auto-Detected (Anthropic Commercial)',
+        detectedLimits: { rpm: anthRpm, tpm: anthTpm },
       };
     } else {
       // OpenAI / OpenAI-compatible / Custom (DeepSeek, Groq, etc.)
@@ -1557,15 +1747,64 @@ export async function testAIConnection(params: {
       });
 
       const latencyMs = Date.now() - start;
+      const headerRpm = Number(res.headers?.get?.('x-ratelimit-limit-requests') || 0) || undefined;
+      const headerTpm = Number(res.headers?.get?.('x-ratelimit-limit-tokens') || 0) || undefined;
+      const isGroqFree = String(baseUrl || '').toLowerCase().includes('groq.com')
+        && ((headerTpm !== undefined && headerTpm <= 30000) || (!headerTpm && (!headerRpm || headerRpm <= 1000)));
+      const isFreeModelOrEndpoint =
+        String(modelName || '').toLowerCase().endsWith(':free') ||
+        isGroqFree ||
+        (headerRpm !== undefined && headerRpm <= 3);
+      const detectedTier: 'free' | 'paid' = isFreeModelOrEndpoint ? 'free' : 'paid';
+      const detectedBadge = isGroqFree
+        ? `FREE TIER · Auto-Detected (Groq ${headerTpm ? `${(headerTpm / 1000).toFixed(0)}k TPM` : 'Free Limits'})`
+        : isFreeModelOrEndpoint
+        ? `FREE TIER · Auto-Detected${headerRpm ? ` (${headerRpm} RPM)` : ''}`
+        : `PAID TIER · Auto-Detected${headerRpm ? ` (${headerRpm} RPM)` : ' (Commercial Key)'}`;
 
       if (!res.ok) {
         const errorText = await res.text();
+        let providerDetail = '';
+        try {
+          const parsedErr = JSON.parse(errorText);
+          providerDetail = parsedErr?.error?.message || parsedErr?.message || '';
+        } catch {
+          providerDetail = errorText.slice(0, 160);
+        }
         const isQuota = res.status === 429 || errorText.includes('insufficient_quota');
-        let errorMsg = `Provider returned ${res.status}: ${res.statusText}`;
+        let errorMsg = providerDetail
+          ? `Provider returned ${res.status}: ${providerDetail}`
+          : `Provider returned ${res.status}: ${res.statusText}`;
         if (isQuota) {
           errorMsg = 'API quota exhausted on this key (check billing/credits).';
         } else if (res.status === 401) {
           errorMsg = 'Invalid API key or unauthorized.';
+        } else if (res.status === 404) {
+          try {
+            const modelsUrl = baseUrl
+              ? `${baseUrl.replace(/\/+$/, '')}/models`
+              : 'https://api.openai.com/v1/models';
+            const modelsRes = await fetch(modelsUrl, {
+              headers: { Authorization: `Bearer ${cleanKey}` },
+              signal: AbortSignal.timeout(5_000),
+            });
+            if (modelsRes.ok) {
+              const modelsJson: any = await modelsRes.json();
+              const availableIds: string[] = Array.isArray(modelsJson?.data)
+                ? modelsJson.data
+                    .map((m: any) => String(m?.id || ''))
+                    .filter((id: string) => id && !id.includes('whisper') && !id.includes('tts') && !id.includes('guard'))
+                    .slice(0, 6)
+                : [];
+              if (availableIds.length > 0) {
+                errorMsg += ` Available models for this key: ${availableIds.join(', ')}`;
+              } else {
+                errorMsg += ' This API key currently has no chat models enabled in its provider project.';
+              }
+            }
+          } catch {
+            // ignore secondary model lookup failure
+          }
         }
         return {
           success: false,
@@ -1574,6 +1813,9 @@ export async function testAIConnection(params: {
           latencyMs,
           error: errorMsg,
           isQuotaExceeded: isQuota,
+          detectedTier,
+          detectedBadge,
+          detectedLimits: { rpm: headerRpm, tpm: headerTpm },
         };
       }
 
@@ -1582,6 +1824,9 @@ export async function testAIConnection(params: {
         provider: provider || 'openai',
         model: modelName,
         latencyMs,
+        detectedTier,
+        detectedBadge,
+        detectedLimits: { rpm: headerRpm, tpm: headerTpm },
       };
     }
   } catch (err: any) {

@@ -282,6 +282,8 @@ export const importService = {
       fileSize?: number;
       fileContent?: string;
       idempotencyKey?: string;
+      statementAccountHint?: string;
+      confirmAccountMismatch?: boolean;
     } = {},
   ): Promise<ServiceResponse<ImportResult>> {
     const err = requireOrg<ImportResult>(organizationId);
@@ -310,6 +312,8 @@ export const importService = {
           idempotencyKey: importKey,
           fileContent: options.fileContent,
           fileType: fileType,
+          statementAccountHint: options.statementAccountHint,
+          confirmAccountMismatch: options.confirmAccountMismatch,
         };
         
         console.log('=== HTTP PAYLOAD DEBUG [' + new Date().toISOString() + '] ===');
@@ -337,6 +341,8 @@ export const importService = {
             idempotencyKey?: string;
             fileContent?: string;
             fileType?: 'csv' | 'pdf';
+            statementAccountHint?: string;
+            confirmAccountMismatch?: boolean;
           },
           ImportResult
         >(`${IMP(organizationId)}/commit-parsed`, payload);

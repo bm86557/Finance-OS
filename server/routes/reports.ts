@@ -877,40 +877,52 @@ export function createReportsRouter(): Router {
     sbClient: any,
     bankAccounts: any[],
     transactions: any[],
-    baseCurrency = 'USD'
+    baseCurrency = 'USD',
+    world: 'business' | 'personal' | 'all' = 'business'
   ): Promise<number> {
     let totalBank = 0;
     let totalOnlineWallets = 0;
     let totalCreditLiabilities = 0;
     let totalCash = 0;
 
-    if (bankAccounts && bankAccounts.length > 0) {
-      for (const b of bankAccounts) {
+    const scopedBanks = (bankAccounts || []).filter((b: any) => {
+      const usage = b.usage === 'personal' ? 'personal' : 'business';
+      if (world === 'all') return true;
+      return usage === world;
+    });
+
+    if (scopedBanks.length > 0) {
+      for (const b of scopedBanks) {
         const accountTxns = (transactions || []).filter(
           (t: any) =>
             t.bank_account_id === b.id &&
             !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
         );
         const rawOpening = b.opening_balance;
+        const fallbackStored = b.current_balance ?? b.balance;
         const openingBal = rawOpening != null
           ? Number(rawOpening)
-          : (accountTxns.length > 0 ? 0 : Number(b.balance ?? 0));
+          : (accountTxns.length > 0 ? 0 : Number(fallbackStored ?? 0));
         let liveBal = openingBal;
 
-        for (const t of accountTxns) {
-          const rawAmt = Number(t.amount || 0);
-          const txnCurrency = (t.currency || b.currency || baseCurrency).toUpperCase();
-          let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
-          const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
-          if (!fxRate && tags) {
-            const rTag = tags.find((tag: any) => typeof tag === 'string' && tag.startsWith('fx:rate:'));
-            if (rTag) fxRate = Number(rTag.slice(8));
-          }
-          const convertedAmt = convertCurrency(rawAmt, txnCurrency, b.currency || baseCurrency, fxRate);
-          if (t.type === 'credit') {
-            liveBal += convertedAmt;
-          } else {
-            liveBal -= Math.abs(convertedAmt);
+        if (accountTxns.length === 0) {
+          liveBal = Number(fallbackStored ?? openingBal ?? 0);
+        } else {
+          for (const t of accountTxns) {
+            const rawAmt = Number(t.amount || 0);
+            const txnCurrency = (t.currency || b.currency || baseCurrency).toUpperCase();
+            let fxRate: number | undefined = t.fx_rate_to_base ? Number(t.fx_rate_to_base) : undefined;
+            const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
+            if (!fxRate && tags) {
+              const rTag = tags.find((tag: any) => typeof tag === 'string' && tag.startsWith('fx:rate:'));
+              if (rTag) fxRate = Number(rTag.slice(8));
+            }
+            const convertedAmt = convertCurrency(rawAmt, txnCurrency, b.currency || baseCurrency, fxRate);
+            if (t.type === 'credit') {
+              liveBal += convertedAmt;
+            } else {
+              liveBal -= Math.abs(convertedAmt);
+            }
           }
         }
 
@@ -930,7 +942,7 @@ export function createReportsRouter(): Router {
           totalBank += balInBase;
         } else if (b.account_type === 'online_wallet') {
           totalOnlineWallets += balInBase;
-        } else if (['credit_card', 'line_of_credit'].includes(b.account_type)) {
+        } else if (['credit_card', 'line_of_credit', 'credit'].includes(b.account_type)) {
           totalCreditLiabilities += Math.abs(balInBase);
         } else if (b.account_type === 'cash') {
           totalCash += balInBase;
@@ -955,49 +967,66 @@ export function createReportsRouter(): Router {
     return 0;
   }
 
-  r.get('/forecast', async (req: Request, res: Response) => {
-    const orgId = String(req.params.organizationId);
-    const horizonDays = Number(req.query.horizonDays ?? (Number(req.query.monthsAhead ?? 3) * 30)) || 90;
-    const scenario = ((req.query.scenario as string) || 'realistic') as 'realistic' | 'best' | 'worst';
-
+  async function runForecastForOrg(
+    req: Request,
+    orgId: string,
+    horizonDays: number,
+    scenario: 'realistic' | 'best' | 'worst',
+  ) {
     const sb = getSupabaseAdminClient();
     if (!sb) {
-      return res.status(503).json({ error: 'Database connection required. Please configure Supabase.' });
+      return { status: 503 as const, error: 'Database connection required. Please configure Supabase.' };
     }
 
-    let currentCash = 0;
-    let txns: any[] = [];
-    let recurring: any[] = [];
-    let loans: any[] = [];
-    let baseCurrency = 'USD';
+    const rawWorld = String(req.query.world || req.body?.world || 'business').toLowerCase();
+    const worldFilter: WorldFilter =
+      rawWorld === 'personal' || rawWorld === 'all' ? rawWorld : 'business';
+    const callerUserId = req.authUser?.id;
+    const isOrgOwner = req.orgMembership?.role === 'owner';
 
-    try {
-      const [
-        { data: orgData },
-        { data: bankData },
-        { data: txnData },
-        { data: recData },
-        { data: loanData },
-      ] = await Promise.all([
-        sb.from('organizations').select('currency').eq('id', orgId).single(),
-        sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('recurring_transactions').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('loans').select('*').eq('organization_id', orgId),
-      ]);
+    const [
+      { data: orgData },
+      { data: bankData },
+      { data: txnData },
+      { data: recData },
+      { data: loanData },
+    ] = await Promise.all([
+      sb.from('organizations').select('currency').eq('id', orgId).single(),
+      sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
+      sb.from('transactions').select('*').eq('organization_id', orgId),
+      sb.from('recurring_transactions').select('*').eq('organization_id', orgId).eq('is_active', true),
+      sb.from('loans').select('*').eq('organization_id', orgId),
+    ]);
 
-      if (orgData?.currency) {
-        baseCurrency = orgData.currency;
+    const baseCurrency = orgData?.currency || 'USD';
+    const rawTxns = txnData || [];
+    const { worldBanks, bankWorldMap } = filterAccessibleBanks(
+      bankData || [],
+      worldFilter,
+      callerUserId,
+      isOrgOwner,
+    );
+
+    const worldTxns = rawTxns.filter((t: any) => {
+      const bankWorld = t.bank_account_id ? bankWorldMap.get(String(t.bank_account_id)) : undefined;
+      if (t.bank_account_id && !bankWorld && (bankData || []).some((b: any) => String(b.id) === String(t.bank_account_id))) {
+        return false;
       }
-      if (txnData) txns = txnData;
-      if (recData) recurring = recData;
-      if (loanData) loans = loanData;
+      const usage = bankWorld || (t.usage === 'personal' || t.world === 'personal' ? 'personal' : 'business');
+      if (usage === 'personal' && t.owner_user_id && t.owner_user_id !== callerUserId && !isOrgOwner) {
+        return false;
+      }
+      return worldFilter === 'all' ? true : usage === worldFilter;
+    });
 
-      currentCash = await computeLiveLiquidCash(orgId, sb, bankData || [], txns, baseCurrency);
-    } catch (dbErr) {
-      console.error('[reports.forecast] Supabase DB read error:', dbErr);
-      return res.status(500).json({ error: 'Failed to fetch forecast data from Supabase.' });
-    }
+    const worldRecurring = (recData || []).filter((r: any) => {
+      const bankWorld = r.bank_account_id ? bankWorldMap.get(String(r.bank_account_id)) : undefined;
+      const usage = bankWorld || (r.usage === 'personal' || r.world === 'personal' ? 'personal' : 'business');
+      return worldFilter === 'all' ? true : usage === worldFilter;
+    });
+
+    const worldLoans = worldFilter === 'personal' ? [] : (loanData || []);
+    const currentCash = await computeLiveLiquidCash(orgId, sb, worldBanks, rawTxns, baseCurrency, worldFilter);
 
     const { computeCashFlowForecast } = await import('../services/forecastEngine.js');
     const result = computeCashFlowForecast({
@@ -1006,9 +1035,9 @@ export function createReportsRouter(): Router {
       scenario,
       currentCash,
       baseCurrency,
-      transactions: txns,
-      recurring,
-      loans,
+      transactions: worldTxns,
+      recurring: worldRecurring,
+      loans: worldLoans,
     });
 
     if (result.forecasts.length > 0) {
@@ -1039,12 +1068,33 @@ export function createReportsRouter(): Router {
       }
     }
 
-    ok(res, {
-      ...result.kpis,
-      forecasts: result.forecasts,
-      assumptions: (result as any).assumptions,
-      cutoffDate: (result as any).cutoffDate,
-    });
+    return {
+      status: 200 as const,
+      payload: {
+        ...result.kpis,
+        worldScope: worldFilter,
+        forecasts: result.forecasts,
+        assumptions: (result as any).assumptions,
+        cutoffDate: (result as any).cutoffDate,
+      },
+    };
+  }
+
+  r.get('/forecast', async (req: Request, res: Response) => {
+    const orgId = String(req.params.organizationId);
+    const horizonDays = Number(req.query.horizonDays ?? (Number(req.query.monthsAhead ?? 3) * 30)) || 90;
+    const scenario = ((req.query.scenario as string) || 'realistic') as 'realistic' | 'best' | 'worst';
+
+    try {
+      const outcome = await runForecastForOrg(req, orgId, horizonDays, scenario);
+      if (outcome.status !== 200) {
+        return res.status(outcome.status).json({ error: outcome.error });
+      }
+      return ok(res, outcome.payload);
+    } catch (dbErr) {
+      console.error('[reports.forecast] Supabase DB read error:', dbErr);
+      return res.status(500).json({ error: 'Failed to fetch forecast data from Supabase.' });
+    }
   });
 
   // ── GET /forecast/profit — Accrued / Recognized Profit Forecast ───────────
@@ -1261,91 +1311,16 @@ export function createReportsRouter(): Router {
     const horizonDays = Number(req.body?.horizonDays || req.query.horizonDays || 90);
     const scenario = ((req.body?.scenario || req.query.scenario || 'realistic') as string) as 'realistic' | 'best' | 'worst';
 
-    const sb = getSupabaseAdminClient();
-    if (!sb) {
-      return res.status(503).json({ error: 'Database connection required. Please configure Supabase.' });
-    }
-
-    let currentCash = 0;
-    let txns: any[] = [];
-    let recurring: any[] = [];
-    let loans: any[] = [];
-    let baseCurrency = 'USD';
-
     try {
-      const [
-        { data: orgData },
-        { data: bankData },
-        { data: txnData },
-        { data: recData },
-        { data: loanData },
-      ] = await Promise.all([
-        sb.from('organizations').select('currency').eq('id', orgId).single(),
-        sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('recurring_transactions').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('loans').select('*').eq('organization_id', orgId),
-      ]);
-
-      if (orgData?.currency) {
-        baseCurrency = orgData.currency;
+      const outcome = await runForecastForOrg(req, orgId, horizonDays, scenario);
+      if (outcome.status !== 200) {
+        return res.status(outcome.status).json({ error: outcome.error });
       }
-      if (txnData) txns = txnData;
-      if (recData) recurring = recData;
-      if (loanData) loans = loanData;
-
-      currentCash = await computeLiveLiquidCash(orgId, sb, bankData || [], txns, baseCurrency);
+      return ok(res, outcome.payload);
     } catch (err) {
       console.error('[reports.forecast/generate] DB query error:', err);
       return res.status(500).json({ error: 'Failed to fetch forecast data from Supabase.' });
     }
-
-    const { computeCashFlowForecast } = await import('../services/forecastEngine.js');
-    const result = computeCashFlowForecast({
-      organizationId: orgId,
-      horizonDays,
-      scenario,
-      currentCash,
-      baseCurrency,
-      transactions: txns,
-      recurring,
-      loans,
-    });
-
-    if (result.forecasts.length > 0) {
-      try {
-        const rowsToInsert = result.forecasts.map(f => ({
-          id: `cff-${orgId}-${f.date}-${scenario}`,
-          organization_id: orgId,
-          date: f.date,
-          forecasted_income: f.income,
-          forecasted_expenses: f.expense,
-          net_cash_flow: f.net,
-          projected_balance: f.balance,
-          confidence: f.confidence,
-          scenario,
-          generated_at: new Date().toISOString(),
-        }));
-
-        await sb
-          .from('cash_flow_forecasts')
-          .delete()
-          .eq('organization_id', orgId)
-          .eq('scenario', scenario)
-          .gte('date', result.forecasts[0].date);
-
-        await sb.from('cash_flow_forecasts').upsert(rowsToInsert);
-      } catch (e) {
-        console.warn('[reports.forecast/generate] Persist error:', e);
-      }
-    }
-
-    ok(res, {
-      ...result.kpis,
-      forecasts: result.forecasts,
-      assumptions: (result as any).assumptions,
-      cutoffDate: (result as any).cutoffDate,
-    });
   });
 
   // ── GET /forecast/profit — Accrued / Recognized Profit Forecast ───────────
