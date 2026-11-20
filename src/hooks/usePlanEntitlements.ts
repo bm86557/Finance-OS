@@ -98,7 +98,7 @@ function getBillingSummaryCached(orgId: string, force = false): Promise<BillingS
 }
 
 export function usePlanEntitlements(): UsePlanEntitlementsResult {
-  const { currentOrganization } = useAuth();
+  const { currentOrganization, isAuthenticated, isLoading: isAuthLoading } = useAuth();
   const orgId = currentOrganization?.id || '';
   const { featureFlags } = usePlatformSettings();
   const [plans, setPlans] = useState<PlatformPlan[]>(() => cachedPlans?.data ?? []);
@@ -109,8 +109,14 @@ export function usePlanEntitlements(): UsePlanEntitlementsResult {
     () => !(cachedPlans && (!orgId || cachedBillingSummaries.has(orgId)))
   );
 
-  // Load plans catalogue and authoritative subscription summary
+  // Load plans catalogue and authoritative subscription summary only after authentication is ready
   const loadEntitlements = useCallback(async (force = false) => {
+    if (isAuthLoading) return;
+    if (!isAuthenticated) {
+      setIsLoading(false);
+      return;
+    }
+
     try {
       const [plansData, summaryData] = await Promise.all([
         getPlansCached(force),
@@ -125,7 +131,7 @@ export function usePlanEntitlements(): UsePlanEntitlementsResult {
     } finally {
       setIsLoading(false);
     }
-  }, [orgId]);
+  }, [orgId, isAuthenticated, isAuthLoading]);
 
   useEffect(() => {
     void loadEntitlements(false);
