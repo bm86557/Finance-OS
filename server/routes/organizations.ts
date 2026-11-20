@@ -9,7 +9,7 @@ import { ok, created, fail, notFound } from '../lib/http.js';
 import { requireOrgRole, canViewConfidentialPayroll } from '../middleware/auth.js';
 import { findAuthUserIdByLegacyId, getSupabaseAdminClient, isSupabaseAdminConfigured } from '../lib/supabaseAdmin.js';
 import { findAuthUserByEmail } from '../lib/supabaseAuth.js';
-import { sendInviteEmail } from '../lib/emailService.js';
+import { sendInviteEmail, resolveMemberPortalAndRole } from '../lib/emailService.js';
 import { env } from '../config/env.js';
 import { resolveClientOrigin } from '../lib/requestOrigin.js';
 import { encryptSecret, decryptSecret, maskApiKey, extractLast4, fingerprintKey } from '../lib/secretBox.js';
@@ -851,27 +851,13 @@ export function createOrganizationRouter(): Router {
     const positionTitle = item.position?.trim() || ''; // Job title (UI/UX Designer, etc.)
     const roleInput = item.role?.trim() || 'employee';
 
-    // Map input role to system role
-    let normalizedRole: OrganizationMember['role'] = 'employee';
-    let portalType: OrganizationMember['portalType'] = 'employee';
-
-    const lowerRole = roleInput.toLowerCase();
-    if (lowerRole === 'owner' || lowerRole.includes('owner')) {
-      normalizedRole = 'owner';
-      portalType = 'organization_admin';
-    } else if (lowerRole === 'admin' || lowerRole === 'organization admin') {
-      normalizedRole = 'admin';
-      portalType = 'organization_admin';
-    } else if (lowerRole === 'accountant') {
-      normalizedRole = 'employee'; // Accountants are employees with special permissions
-      portalType = 'employee';
-    } else if (lowerRole === 'viewer') {
-      normalizedRole = 'employee';
-      portalType = 'employee';
-    } else {
-      normalizedRole = 'employee';
-      portalType = 'employee';
-    }
+    // Map input role to canonical system role, portalType, accessRole, and login path
+    const {
+      normalizedRole,
+      portalType,
+      roleLabel,
+      loginPath,
+    } = resolveMemberPortalAndRole(roleInput);
 
     // Org + invitee + duplicate checks all resolve against Supabase. The local store is no longer a
     // fallback: an org that exists only in Postgres must still be invitable, and a duplicate must
@@ -916,7 +902,8 @@ export function createOrganizationRouter(): Router {
 
     if (isSupabaseAdminConfigured() && sb) {
       try {
-        const clientRedirectUrl = `${resolveClientOrigin(req)}/accept-invite`;
+        const clientOrigin = resolveClientOrigin(req);
+        const clientRedirectUrl = `${clientOrigin}/accept-invite?portal=${encodeURIComponent(portalType)}&role=${encodeURIComponent(normalizedRole)}&email=${encodeURIComponent(trimmedEmail)}`;
         const orgKey = org.id || orgId;
 
         // Resolve real department_id so headcount for overhead allocation is automatically linked
@@ -965,6 +952,7 @@ export function createOrganizationRouter(): Router {
               ...(existingSbUser.user_metadata || {}),
               full_name: item.name?.trim() || (existingSbUser.user_metadata as any)?.full_name || trimmedEmail.split('@')[0],
               role: normalizedRole,
+              portal_type: portalType,
               position: positionTitle,
               department: assignedDept,
               organization_id: orgKey,
@@ -986,7 +974,7 @@ export function createOrganizationRouter(): Router {
             user_id: authUserId,
             name: item.name?.trim() || (existingSbUser.user_metadata as any)?.full_name || trimmedEmail.split('@')[0],
             email: trimmedEmail,
-            role: positionTitle,
+            role: positionTitle || roleLabel,
             department: assignedDept,
             joined_at: new Date().toISOString(),
             status: 'pending',
@@ -994,6 +982,7 @@ export function createOrganizationRouter(): Router {
             onConflict: 'id'
           });
 
+          // Generate a single valid magiclink token (do NOT call signInWithOtp afterward, which would invalidate actionLink!)
           try {
             const { data: linkData } = await sb.auth.admin.generateLink({
               type: 'magiclink',
@@ -1007,156 +996,98 @@ export function createOrganizationRouter(): Router {
             console.warn('[invite] Magic link generation warning:', linkErr);
           }
 
-          // Trigger Supabase to dispatch email directly through Supabase Auth mailer
+          inviteSuccessful = true;
+        } else {
+          // Prefer generateLink({ type: 'invite' }) so we get a single valid action_link AND create the user
+          // without hitting Supabase's strict 2-emails/hour built-in mailer limit on Vercel.
           try {
-            const { error: otpErr } = await sb.auth.signInWithOtp({
+            const { data: linkData, error: linkErr } = await sb.auth.admin.generateLink({
+              type: 'invite',
               email: trimmedEmail,
               options: {
-                emailRedirectTo: clientRedirectUrl,
+                redirectTo: clientRedirectUrl,
                 data: {
+                  full_name: item.name?.trim() || trimmedEmail.split('@')[0],
+                  platform_role: 'organization_user',
                   organization_id: orgKey,
                   organization_name: orgName,
+                  department: assignedDept,
+                  department_id: matchedDeptId || undefined,
+                  role: normalizedRole,
+                  portal_type: portalType,
+                  position: positionTitle,
+                  status: 'pending',
                 },
               },
             });
-            if (otpErr) {
-              console.warn('[invite] Supabase signInWithOtp notice:', otpErr.message);
-            } else {
-              console.log('[invite] Supabase sent invitation email to:', trimmedEmail);
-            }
-          } catch (otpExc) {
-            console.warn('[invite] Supabase signInWithOtp exception:', otpExc);
-          }
 
-          inviteSuccessful = true;
-        } else {
-          const { data: inviteData, error: inviteErr } = await sb.auth.admin.inviteUserByEmail(trimmedEmail, {
-            data: {
-              full_name: item.name?.trim() || trimmedEmail.split('@')[0],
-              platform_role: 'organization_user',
-              organization_id: orgKey,
-              organization_name: orgName,
-              department: assignedDept,
-              role: normalizedRole,
-              position: positionTitle,
-              status: 'pending',
-            },
-            redirectTo: clientRedirectUrl,
-          });
-
-          if (!inviteErr && inviteData?.user) {
-            authUserId = inviteData.user.id;
-
-            await sb.from('organization_members').upsert({
-              organization_id: orgKey,
-              user_id: authUserId,
-              role: normalizedRole,
-              portal_type: portalType,
-              status: 'pending',
-              department: assignedDept,
-              department_id: matchedDeptId || undefined,
-              position: positionTitle,
-              joined_at: new Date().toISOString(),
-            }, {
-              onConflict: 'user_id,organization_id'
-            });
-
-            await sb.from('profiles').upsert({
-              id: authUserId,
-              email: trimmedEmail,
-              full_name: item.name?.trim() || trimmedEmail.split('@')[0],
-              platform_role: 'organization_user',
-              created_at: inviteData.user.created_at || new Date().toISOString(),
-            });
-
-            await sb.from('employee_team_members').upsert({
-              id: `tm-${orgKey}-${authUserId}`,
-              organization_id: orgKey,
-              user_id: authUserId,
-              name: item.name?.trim() || trimmedEmail.split('@')[0],
-              email: trimmedEmail,
-              role: positionTitle,
-              department: assignedDept,
-              joined_at: new Date().toISOString(),
-              status: 'pending',
-            }, {
-              onConflict: 'id'
-            });
-
-            inviteSuccessful = true;
-          } else {
-            console.warn('[invite] inviteUserByEmail returned error or fallback needed:', inviteErr?.message);
-            // Trigger Supabase mailer via signInWithOtp
-            try {
-              await sb.auth.signInWithOtp({
-                email: trimmedEmail,
-                options: {
-                  emailRedirectTo: clientRedirectUrl,
-                  data: {
-                    organization_id: orgKey,
-                    organization_name: orgName,
-                  },
-                },
-              });
-            } catch {
-              /* ignore */
-            }
-
-            try {
-              const { data: linkData } = await sb.auth.admin.generateLink({
-                type: 'invite',
-                email: trimmedEmail,
-                options: {
-                  redirectTo: clientRedirectUrl,
-                  data: {
-                    full_name: item.name?.trim() || trimmedEmail.split('@')[0],
-                    organization_id: orgKey,
-                    organization_name: orgName,
-                    department: assignedDept,
-                    department_id: matchedDeptId || undefined,
-                    role: normalizedRole,
-                    position: positionTitle,
-                    status: 'pending',
-                  },
-                },
-              });
-              if (linkData) {
-                if (linkData.user) authUserId = linkData.user.id;
-                if (linkData.properties?.action_link) actionLink = linkData.properties.action_link;
-                if (authUserId) {
-                  await sb.from('organization_members').upsert({
-                    organization_id: orgKey,
-                    user_id: authUserId,
-                    role: normalizedRole,
-                    portal_type: portalType,
-                    status: 'pending',
-                    department: assignedDept,
-                    department_id: matchedDeptId || undefined,
-                    position: positionTitle,
-                    joined_at: new Date().toISOString(),
-                  }, {
-                    onConflict: 'user_id,organization_id'
-                  });
-
-                  await sb.from('employee_team_members').upsert({
-                    id: `tm-${orgKey}-${authUserId}`,
-                    organization_id: orgKey,
-                    user_id: authUserId,
-                    name: item.name?.trim() || trimmedEmail.split('@')[0],
-                    email: trimmedEmail,
-                    role: positionTitle,
-                    department: assignedDept,
-                    joined_at: new Date().toISOString(),
-                    status: 'pending',
-                  }, {
-                    onConflict: 'id'
-                  });
-                }
-                inviteSuccessful = true;
+            if (!linkErr && linkData?.user) {
+              authUserId = linkData.user.id;
+              if (linkData.properties?.action_link) {
+                actionLink = linkData.properties.action_link;
               }
-            } catch (linkErr) {
-              console.error('[invite] generateLink exception:', linkErr);
+            } else {
+              console.warn('[invite] generateLink fallback to inviteUserByEmail:', linkErr?.message);
+              const { data: inviteData, error: inviteErr } = await sb.auth.admin.inviteUserByEmail(trimmedEmail, {
+                data: {
+                  full_name: item.name?.trim() || trimmedEmail.split('@')[0],
+                  platform_role: 'organization_user',
+                  organization_id: orgKey,
+                  organization_name: orgName,
+                  department: assignedDept,
+                  role: normalizedRole,
+                  portal_type: portalType,
+                  position: positionTitle,
+                  status: 'pending',
+                },
+                redirectTo: clientRedirectUrl,
+              });
+              if (!inviteErr && inviteData?.user) {
+                authUserId = inviteData.user.id;
+              }
             }
+
+            if (authUserId) {
+              await sb.from('organization_members').upsert({
+                organization_id: orgKey,
+                user_id: authUserId,
+                role: normalizedRole,
+                portal_type: portalType,
+                status: 'pending',
+                department: assignedDept,
+                department_id: matchedDeptId || undefined,
+                position: positionTitle,
+                joined_at: new Date().toISOString(),
+              }, {
+                onConflict: 'user_id,organization_id'
+              });
+
+              await sb.from('profiles').upsert({
+                id: authUserId,
+                email: trimmedEmail,
+                full_name: item.name?.trim() || trimmedEmail.split('@')[0],
+                platform_role: 'organization_user',
+                created_at: new Date().toISOString(),
+              });
+
+              await sb.from('employee_team_members').upsert({
+                id: `tm-${orgKey}-${authUserId}`,
+                organization_id: orgKey,
+                user_id: authUserId,
+                name: item.name?.trim() || trimmedEmail.split('@')[0],
+                email: trimmedEmail,
+                role: positionTitle || roleLabel,
+                department: assignedDept,
+                joined_at: new Date().toISOString(),
+                status: 'pending',
+              }, {
+                onConflict: 'id'
+              });
+
+              inviteSuccessful = true;
+            }
+          } catch (linkErr) {
+            console.error('[invite] generateLink exception:', linkErr);
           }
         }
       } catch (e) {
@@ -1174,20 +1105,25 @@ export function createOrganizationRouter(): Router {
     }
 
     const clientOrigin = resolveClientOrigin(req);
-    // The login page is sign-in only. First-time invitees activate their password via
-    // `acceptInviteUrl`, so the portal link is just the everyday sign-in entry point.
-    const portalUrl = `${clientOrigin}/login/employee?email=${encodeURIComponent(trimmedEmail)}&org=${encodeURIComponent(org!.slug || orgId)}`;
-    const acceptInviteUrl = actionLink || `${clientOrigin}/accept-invite?email=${encodeURIComponent(trimmedEmail)}`;
+    const portalUrl = `${clientOrigin}${loginPath}?email=${encodeURIComponent(trimmedEmail)}&org=${encodeURIComponent(org!.slug || orgId)}`;
+    const acceptInviteUrl = actionLink || `${clientOrigin}/accept-invite?portal=${encodeURIComponent(portalType)}&role=${encodeURIComponent(normalizedRole)}&email=${encodeURIComponent(trimmedEmail)}`;
 
     const mailRes = await sendInviteEmail({
       toEmail: trimmedEmail,
       name: item.name?.trim() || trimmedEmail.split('@')[0],
       organizationName: orgName,
       organizationId: org.id || orgId,
-      role: positionTitle,
+      role: positionTitle || roleLabel,
+      portalType,
       portalUrl,
       acceptInviteUrl,
     });
+
+    const emailStatusMsg = !mailRes.success
+      ? `Member added, but email failed (${mailRes.error || 'SMTP error'}). Share the invite link manually.`
+      : mailRes.previewUrl
+      ? `Invitation sent to ${trimmedEmail}! Preview: ${mailRes.previewUrl}`
+      : `Invitation sent to ${trimmedEmail}!`;
 
     const member: OrganizationMember = {
       userId: authUserId ?? '',
@@ -1212,9 +1148,7 @@ export function createOrganizationRouter(): Router {
           success: true,
           member: rowToMember(persisted as unknown as Record<string, unknown>),
           previewUrl: mailRes.previewUrl,
-          message: mailRes.previewUrl
-            ? `Invitation sent to ${trimmedEmail}! Preview: ${mailRes.previewUrl}`
-            : `Invitation sent to ${trimmedEmail}!`,
+          message: emailStatusMsg,
         };
       }
     }
@@ -1224,9 +1158,7 @@ export function createOrganizationRouter(): Router {
       success: true,
       member,
       previewUrl: mailRes.previewUrl,
-      message: mailRes.previewUrl
-        ? `Invitation sent to ${trimmedEmail}! Preview: ${mailRes.previewUrl}`
-        : `Invitation sent to ${trimmedEmail}!`,
+      message: emailStatusMsg,
     };
   }
 
@@ -1428,32 +1360,19 @@ export function createOrganizationRouter(): Router {
     }
     const orgName = org?.name || 'Organization';
 
+    const {
+      normalizedRole: resendRole,
+      portalType: resendPortalType,
+      roleLabel: resendRoleLabel,
+      loginPath: resendLoginPath,
+    } = resolveMemberPortalAndRole(role);
+
     const clientOrigin = resolveClientOrigin(req);
-    const clientRedirectUrl = `${clientOrigin}/accept-invite`;
+    const clientRedirectUrl = `${clientOrigin}/accept-invite?portal=${encodeURIComponent(resendPortalType)}&role=${encodeURIComponent(resendRole)}&email=${encodeURIComponent(email)}`;
     let actionLink: string | undefined = undefined;
 
-    // Trigger Supabase email directly via Supabase Auth
+    // Generate a single valid magiclink token (do NOT call signInWithOtp afterward, which invalidates actionLink)
     if (sb && email) {
-      try {
-        const { error: otpErr } = await sb.auth.signInWithOtp({
-          email,
-          options: {
-            emailRedirectTo: clientRedirectUrl,
-            data: {
-              organization_id: orgId,
-              organization_name: orgName,
-            },
-          },
-        });
-        if (otpErr) {
-          console.warn('[resend-invite] Supabase signInWithOtp notice:', otpErr.message);
-        } else {
-          console.log('[resend-invite] Supabase resent invitation email to:', email);
-        }
-      } catch (err) {
-        console.warn('[resend-invite] Supabase send error:', err);
-      }
-
       try {
         const { data: linkData } = await sb.auth.admin.generateLink({
           type: 'magiclink',
@@ -1463,33 +1382,33 @@ export function createOrganizationRouter(): Router {
         if (linkData?.properties?.action_link) {
           actionLink = linkData.properties.action_link;
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        console.warn('[resend-invite] generateLink warning:', err);
       }
     }
 
-    const portalUrl = `${clientOrigin}/login/employee?email=${encodeURIComponent(email)}&org=${encodeURIComponent(org?.slug || orgId)}&setup=true`;
-    const acceptInviteUrl = actionLink || `${clientOrigin}/accept-invite?email=${encodeURIComponent(email)}`;
+    const portalUrl = `${clientOrigin}${resendLoginPath}?email=${encodeURIComponent(email)}&org=${encodeURIComponent(org?.slug || orgId)}`;
+    const acceptInviteUrl = actionLink || clientRedirectUrl;
 
-    let mailRes: { previewUrl?: string } = {};
-    try {
-      mailRes = await sendInviteEmail({
-        toEmail: email,
-        name: userName,
-        organizationName: orgName,
-        organizationId: orgId,
-        role,
-        portalUrl,
-        acceptInviteUrl,
-      });
-    } catch {
-      /* ignore */
-    }
+    const mailRes = await sendInviteEmail({
+      toEmail: email,
+      name: userName,
+      organizationName: orgName,
+      organizationId: orgId,
+      role: resendRoleLabel,
+      portalType: resendPortalType,
+      portalUrl,
+      acceptInviteUrl,
+    });
 
     ok(res, {
       previewUrl: actionLink || mailRes.previewUrl,
       inviteUrl: acceptInviteUrl,
-    }, `Invitation email resent via Supabase to ${email}`);
+      emailDelivered: mailRes.success,
+      emailError: mailRes.error,
+    }, mailRes.success
+      ? `Invitation email resent to ${email}`
+      : `Invite link regenerated, but email failed (${mailRes.error || 'SMTP error'})`);
   };
 
   r.post('/members/:userId/resend-invite', ownerOrAdmin, resendInviteHandler);

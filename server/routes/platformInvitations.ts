@@ -10,6 +10,7 @@ import { findAuthUserByEmail } from '../lib/supabaseAuth.js';
 import nodemailer from 'nodemailer';
 import { env } from '../config/env.js';
 import { resolveClientOrigin } from '../lib/requestOrigin.js';
+import { createSmtpTransporter } from '../lib/emailService.js';
 
 const router = Router();
 
@@ -24,44 +25,10 @@ interface OrgInvitationEmailParams {
 }
 
 /**
- * Get email transporter (shared logic from emailService.ts)
+ * Get email transporter (uses shared SMTP factory with port 465 SSL auto-detection & 8s Vercel-safe timeouts)
  */
 async function getTransporter() {
-  if (env.smtpHost && env.smtpUser) {
-    return {
-      transporter: nodemailer.createTransport({
-        host: env.smtpHost,
-        port: env.smtpPort,
-        secure: env.smtpSecure,
-        auth: {
-          user: env.smtpUser,
-          pass: env.smtpPass,
-        },
-      }),
-      isTest: false,
-    };
-  }
-
-  // Development fallback: try Ethereal
-  try {
-    const testAccount = await nodemailer.createTestAccount();
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.ethereal.email',
-      port: 587,
-      secure: false,
-      auth: {
-        user: testAccount.user,
-        pass: testAccount.pass,
-      },
-    });
-    return { transporter, isTest: true };
-  } catch (err) {
-    console.warn('[getTransporter] Ethereal failed, using JSON transport:', err);
-    const transporter = nodemailer.createTransport({
-      jsonTransport: true,
-    });
-    return { transporter, isTest: true };
-  }
+  return createSmtpTransporter();
 }
 
 /**
@@ -333,7 +300,7 @@ router.post('/', async (req: Request, res: Response) => {
     });
 
     if (!emailResult.success) {
-      console.warn('[platformInvitations] Email failed, but invitation created');
+      console.warn('[platformInvitations] Email failed, but invitation created:', emailResult.error);
     }
 
     return res.json({
@@ -351,8 +318,12 @@ router.post('/', async (req: Request, res: Response) => {
         createdAt: invitation.created_at,
         invitationUrl,
         previewUrl: emailResult.previewUrl,
+        emailSent: emailResult.success,
+        emailError: emailResult.error,
       },
-      message: emailResult.previewUrl
+      message: !emailResult.success
+        ? `Invitation created, but email delivery failed (${emailResult.error || 'SMTP error'}). Share the invite link manually.`
+        : emailResult.previewUrl
         ? `Invitation created and email sent! Preview: ${emailResult.previewUrl}`
         : `Invitation created and email sent to ${trimmedEmail}!`,
     });

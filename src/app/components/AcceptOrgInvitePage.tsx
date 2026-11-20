@@ -7,6 +7,7 @@ import { Label } from './ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
 import { Building2, Lock, Eye, EyeOff, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
 import { orgInvitationService } from '@/services/orgInvitationService';
 import type { ValidateTokenResult } from '@/services/orgInvitationService';
 
@@ -23,6 +24,7 @@ export function AcceptOrgInvitePage() {
   const [success, setSuccess] = useState(false);
   const navigate = useNavigate();
   const { theme } = useTheme();
+  const { login } = useAuth();
 
   useEffect(() => {
     validateInvitation();
@@ -91,12 +93,18 @@ export function AcceptOrgInvitePage() {
       console.log('[AcceptInvitation] Organization ID:', result.data.organizationId);
       console.log('[AcceptInvitation] User ID:', result.data.userId);
 
-      // Wait a bit for database transactions to complete, then force full reload
+      // Sign the newly created Org Admin into Supabase Auth in the browser so /dashboard is authenticated immediately
+      if (inviteData?.adminEmail) {
+        try {
+          await login(inviteData.adminEmail, password, inviteData.organizationSlug, 'organization_admin');
+        } catch (loginErr) {
+          console.warn('[AcceptInvitation] Auto-login fallback:', loginErr);
+        }
+      }
+
       setTimeout(() => {
-        console.log('[AcceptInvitation] Redirecting to dashboard...');
-        // Force full page reload to refresh auth session with new organization context
-        window.location.href = '/dashboard';
-      }, 2500);
+        navigate('/dashboard');
+      }, 1500);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create organization. Please try again.');
     } finally {

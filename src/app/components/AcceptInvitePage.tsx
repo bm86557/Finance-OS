@@ -15,6 +15,7 @@ export function AcceptInvitePage() {
   const [email, setEmail] = useState('');
   const [orgName, setOrgName] = useState('');
   const [role, setRole] = useState('');
+  const [portalType, setPortalType] = useState<'organization_admin' | 'employee'>('employee');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -33,7 +34,13 @@ export function AcceptInvitePage() {
     const checkInviteSession = async () => {
       const urlParams = new URLSearchParams(window.location.search);
       const emailParam = urlParams.get('email');
+      const portalParam = urlParams.get('portal');
+      const roleParam = urlParams.get('role');
       if (emailParam) setEmail(emailParam);
+      if (roleParam) setRole(roleParam);
+      if (portalParam === 'organization_admin' || (roleParam && ['owner', 'admin', 'org_admin', 'accountant', 'viewer'].includes(roleParam.toLowerCase()))) {
+        setPortalType('organization_admin');
+      }
 
       const sb = getSupabaseClient();
       if (!sb) {
@@ -58,7 +65,14 @@ export function AcceptInvitePage() {
           setEmail(session.user.email || emailParam || '');
           const meta = session.user.user_metadata || {};
           setOrgName(meta.organization_name || meta.org_name || 'Organization');
-          setRole(meta.role || 'Team Member');
+          const resolvedRole = meta.role || roleParam || 'Team Member';
+          setRole(resolvedRole);
+          if (
+            meta.portal_type === 'organization_admin' ||
+            ['owner', 'admin', 'org_admin', 'accountant', 'viewer'].includes(String(resolvedRole).toLowerCase())
+          ) {
+            setPortalType('organization_admin');
+          }
         } else {
           // Fallback: listen for auth state changes
           const { data: { subscription } } = sb.auth.onAuthStateChange((_event, session) => {
@@ -66,7 +80,14 @@ export function AcceptInvitePage() {
               setEmail(session.user.email || emailParam || '');
               const meta = session.user.user_metadata || {};
               setOrgName(meta.organization_name || meta.org_name || 'Organization');
-              setRole(meta.role || 'Team Member');
+              const resolvedRole = meta.role || roleParam || 'Team Member';
+              setRole(resolvedRole);
+              if (
+                meta.portal_type === 'organization_admin' ||
+                ['owner', 'admin', 'org_admin', 'accountant', 'viewer'].includes(String(resolvedRole).toLowerCase())
+              ) {
+                setPortalType('organization_admin');
+              }
               setIsVerifyingSession(false);
             }
           });
@@ -113,15 +134,18 @@ export function AcceptInvitePage() {
 
       setSuccess(true);
 
-      // Auto-login to employee portal
+      // Auto-login to the invitee's designated portal based on their role
+      const targetPortal = portalType === 'organization_admin' ? 'organization_admin' : 'employee';
+      const targetRoute = targetPortal === 'organization_admin' ? '/dashboard' : '/employee';
+      const fallbackLoginRoute = targetPortal === 'organization_admin' ? '/login/organization' : '/login/employee';
       try {
-        await login(email, password, undefined, 'employee');
+        await login(email, password, undefined, targetPortal);
         setTimeout(() => {
-          navigate('/employee');
+          navigate(targetRoute);
         }, 1200);
       } catch {
         setTimeout(() => {
-          navigate('/login/employee');
+          navigate(fallbackLoginRoute);
         }, 1500);
       }
     } catch (err) {

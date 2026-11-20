@@ -7,8 +7,32 @@ export interface InviteEmailParams {
   organizationName: string;
   organizationId: string;
   role: string;
+  portalType?: 'organization_admin' | 'employee';
   portalUrl: string;
   acceptInviteUrl?: string;
+}
+
+export function resolveMemberPortalAndRole(roleInput?: string): {
+  normalizedRole: 'owner' | 'admin' | 'accountant' | 'viewer' | 'employee';
+  portalType: 'organization_admin' | 'employee';
+  accessRole: 'org_admin' | 'accountant' | 'viewer' | 'team_member';
+  roleLabel: string;
+  loginPath: '/login/organization' | '/login/employee';
+} {
+  const lower = (roleInput || 'employee').trim().toLowerCase();
+  if (lower === 'owner' || lower.includes('owner')) {
+    return { normalizedRole: 'owner', portalType: 'organization_admin', accessRole: 'org_admin', roleLabel: 'Organization Owner', loginPath: '/login/organization' };
+  }
+  if (lower === 'admin' || lower === 'org_admin' || lower === 'organization admin' || lower === 'organization_admin') {
+    return { normalizedRole: 'admin', portalType: 'organization_admin', accessRole: 'org_admin', roleLabel: 'Organization Admin', loginPath: '/login/organization' };
+  }
+  if (lower === 'accountant') {
+    return { normalizedRole: 'accountant', portalType: 'organization_admin', accessRole: 'accountant', roleLabel: 'Accountant', loginPath: '/login/organization' };
+  }
+  if (lower === 'viewer') {
+    return { normalizedRole: 'viewer', portalType: 'organization_admin', accessRole: 'viewer', roleLabel: 'Viewer', loginPath: '/login/organization' };
+  }
+  return { normalizedRole: 'employee', portalType: 'employee', accessRole: 'team_member', roleLabel: 'Team Member', loginPath: '/login/employee' };
 }
 
 export interface SentEmailRecord {
@@ -28,16 +52,16 @@ export interface SentEmailRecord {
 export const recentSentEmails: SentEmailRecord[] = [];
 
 /**
- * Creates a configured nodemailer transporter.
- * If SMTP credentials are provided, connects to real SMTP.
- * Otherwise, falls back to an Ethereal test inbox or in-memory logging for development.
+ * Shared SMTP transporter factory used by both team member invites and organization creation invites.
+ * Auto-enables SSL/TLS for port 465 and STARTTLS for port 587 with Vercel-safe 8s timeouts.
  */
-async function getTransporter() {
+export async function createSmtpTransporter() {
   const host = process.env.SMTP_HOST?.trim() || env.smtpHost;
   const user = process.env.SMTP_USER?.trim() || env.smtpUser;
   const pass = process.env.SMTP_PASS?.trim() || env.smtpPass;
   const port = Number(process.env.SMTP_PORT || env.smtpPort || 587);
-  const secure = (process.env.SMTP_SECURE || String(env.smtpSecure)) === 'true';
+  const explicitSecure = process.env.SMTP_SECURE?.trim();
+  const secure = explicitSecure ? explicitSecure === 'true' : (port === 465 || env.smtpSecure);
 
   if (process.env.NODE_ENV !== 'test' && host && user && pass) {
     return {
@@ -45,13 +69,14 @@ async function getTransporter() {
         host,
         port,
         secure,
+        requireTLS: !secure && port === 587,
         auth: {
           user,
           pass,
         },
-        connectionTimeout: 10000,
-        greetingTimeout: 10000,
-        socketTimeout: 10000,
+        connectionTimeout: 8000,
+        greetingTimeout: 8000,
+        socketTimeout: 8000,
       }),
       isTest: false,
     };
@@ -64,10 +89,15 @@ async function getTransporter() {
   return { transporter, isTest: true };
 }
 
-function generateEmailHtml(params: InviteEmailParams): string {
-  const { toEmail, name, organizationName, role, portalUrl, acceptInviteUrl } = params;
-  const roleDisplay = role.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+async function getTransporter() {
+  return createSmtpTransporter();
+}
+
+export function generateInviteEmailHtml(params: InviteEmailParams): string {
+  const { toEmail, name, organizationName, role, portalType, portalUrl, acceptInviteUrl } = params;
+  const roleDisplay = (role?.trim() || 'Team Member').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   const recipientName = name?.trim() || toEmail.split('@')[0];
+  const portalDisplayName = portalType === 'organization_admin' ? 'Organization Portal' : 'Employee Portal';
 
   return `
 <!DOCTYPE html>
@@ -127,10 +157,10 @@ function generateEmailHtml(params: InviteEmailParams): string {
                       1. Click <strong>Activate &amp; Set Password</strong> below and choose a password for <strong>${toEmail}</strong>.
                     </p>
                     <p style="margin: 0 0 8px; font-size: 14px; color: #e2e8f0; line-height: 1.5;">
-                      2. You will be signed in and taken to the <strong>Employee Portal</strong> automatically.
+                      2. You will be signed in and taken to the <strong>${portalDisplayName}</strong> automatically.
                     </p>
                     <p style="margin: 0; font-size: 14px; color: #e2e8f0; line-height: 1.5;">
-                      3. After that, use the <strong>Employee Portal</strong> link below to sign in again any time.
+                      3. After that, use the <strong>${portalDisplayName}</strong> link below to sign in again any time.
                     </p>
                   </td>
                 </tr>
@@ -182,21 +212,26 @@ function generateEmailHtml(params: InviteEmailParams): string {
  */
 export async function sendInviteEmail(params: InviteEmailParams): Promise<{
   success: boolean;
+  delivered?: boolean;
+  error?: string;
   messageId?: string;
   previewUrl?: string;
   clientUrl: string;
 }> {
-  const { toEmail, organizationName, portalUrl } = params;
+  const { toEmail, organizationName, portalUrl, portalType } = params;
+  const portalDisplayName = portalType === 'organization_admin' ? 'Organization Portal' : 'Employee Portal';
   const subject = `You are invited to the team of ${organizationName} on Finance OS`;
-  const html = generateEmailHtml(params);
+  const html = generateInviteEmailHtml(params);
   const text = `
 You are invited to join the team of ${organizationName} on Finance OS!
 
-You can log in through the Employee Portal of Finance OS to join the team and access your workspace:
+Activate your account and set your password:
+${params.acceptInviteUrl || portalUrl}
+
+Already activated? Sign in through the ${portalDisplayName} of Finance OS:
 ${portalUrl}
 
-If this is your first time logging in with this email (${toEmail}), please set up your password on the Employee Portal.
-Once logged in, you will see your organization invitation with options to Accept or Reject joining the team.
+If this is your first time logging in with this email (${toEmail}), please use the activation link above to set up your password.
 
 Finance OS
   `.trim();
@@ -247,6 +282,7 @@ Finance OS
 
     return {
       success: true,
+      delivered: !isTest,
       messageId: info.messageId,
       previewUrl,
       clientUrl: portalUrl,
@@ -254,7 +290,7 @@ Finance OS
   } catch (err) {
     console.error('[emailService] Error sending email:', err);
 
-    // Fallback: record as logged so the system doesn't break
+    // Fallback: record as logged so the system doesn't crash, but report truthful delivery failure
     const record: SentEmailRecord = {
       id: `mail-${Date.now()}`,
       to: toEmail,
@@ -270,7 +306,9 @@ Finance OS
     recentSentEmails.unshift(record);
 
     return {
-      success: true,
+      success: false,
+      delivered: false,
+      error: err instanceof Error ? err.message : 'SMTP delivery failed',
       previewUrl: undefined,
       clientUrl: portalUrl,
     };
