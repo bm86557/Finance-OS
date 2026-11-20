@@ -2760,7 +2760,6 @@ export function TeamPermissions() {
                   >
                     <option value="employee">Team Member</option>
                     <option value="accountant">Accountant</option>
-                    <option value="admin">Organization Admin</option>
                     <option value="viewer">Viewer</option>
                   </select>
                   <p className="text-xs text-slate-500">Controls what features they can access</p>
@@ -2916,7 +2915,7 @@ export function TeamPermissions() {
                   {/* Quick Role Preset Chips for Bulk Defaults */}
                   <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                     <span className="text-[11px] text-slate-500 font-mono">Quick Roles:</span>
-                    {['Team Member', 'Senior Developer', 'Frontend Engineer', 'Backend Engineer', 'Full Stack Developer', 'UI/UX Designer', 'Accountant', 'Organization Admin', 'Viewer'].map((r) => (
+                    {['Team Member', 'Senior Developer', 'Frontend Engineer', 'Backend Engineer', 'Full Stack Developer', 'UI/UX Designer', 'Accountant', 'Viewer'].map((r) => (
                       <button
                         key={r}
                         type="button"
