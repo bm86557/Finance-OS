@@ -99,9 +99,9 @@ export function PlatformLayout({ children, currentView, onViewChange }: Platform
       </div>
 
       {/* Main Content Area */}
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="flex-1 flex overflow-hidden relative min-h-0">
         {/* Sidebar */}
-        <div className="w-72 backdrop-blur-xl flex flex-col shrink-0 relative" style={{
+        <div className="w-64 xl:w-72 backdrop-blur-xl flex flex-col shrink-0 relative" style={{
           background: 'rgba(15, 23, 42, 0.5)',
           borderRight: '1px solid rgba(168, 85, 247, 0.15)',
         }}>
@@ -174,7 +174,7 @@ export function PlatformLayout({ children, currentView, onViewChange }: Platform
         </div>
 
         {/* Main Content */}
-        <div className="flex-1 overflow-auto relative">
+        <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden relative">
           {children}
         </div>
       </div>

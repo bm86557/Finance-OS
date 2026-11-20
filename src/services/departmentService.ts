@@ -483,12 +483,7 @@ export const departmentService = {
       const txnMatchedHeadcount = members.filter((m) =>
         orgTxns.some((t) => t.departmentId === dept.id && t.classifiedBy === m.userId),
       ).length;
-      let headcount = txnMatchedHeadcount;
-      if (headcount === 0) {
-        let h = 0;
-        for (let i = 0; i < dept.id.length; i++) h = (h * 31 + dept.id.charCodeAt(i)) | 0;
-        headcount = 2 + (Math.abs(h) % 5);
-      }
+      const headcount = txnMatchedHeadcount;
 
       const fullDepartmentCost = Math.round((directCosts + allocatedOverhead) * 100) / 100;
       const totalCost = fullDepartmentCost;
@@ -497,14 +492,12 @@ export const departmentService = {
         ? Math.round(((revenue - totalCost) / revenue) * 1000) / 10
         : null;
 
+      // Per Handoff v1.2 §12.1 L620: 0 headcount => null capacity (never fabricate mock headcount/hours)
       const capacityHours = headcount > 0 ? headcount * 160 : null;
       const totalHours = capacityHours;
       const totalMinutes = capacityHours != null ? capacityHours * 60 : null;
 
-      const billableRatio = revenue > 0
-        ? Math.min(0.85, Math.max(0.45, revenue / (revenue + directCosts + 1)))
-        : 0.6;
-      const billableHours = capacityHours ? Math.round(capacityHours * billableRatio) : 0;
+      const billableHours = 0;
 
       const utilization = (capacityHours != null && capacityHours > 0 && billableHours > 0)
         ? Math.round((billableHours / capacityHours) * 1000) / 10
@@ -514,14 +507,14 @@ export const departmentService = {
       let directCostPerMinute: number | null = null;
       if (capacityHours != null && capacityHours > 0 && directCosts > 0) {
         directCostPerHour = Math.round((directCosts / capacityHours) * 100) / 100;
-        directCostPerMinute = Math.round((directCostPerHour / 60) * 10000) / 10000;
+        directCostPerMinute = Math.round((directCosts / (capacityHours * 60)) * 10000) / 10000;
       }
 
       let costPerHour: number | null = null;
       let costPerMinute: number | null = null;
       if (capacityHours != null && capacityHours > 0 && totalCost > 0) {
         costPerHour = Math.round((totalCost / capacityHours) * 100) / 100;
-        costPerMinute = Math.round((totalCost / capacityHours / 60) * 10000) / 10000;
+        costPerMinute = Math.round((totalCost / (capacityHours * 60)) * 10000) / 10000;
       }
 
       const productiveHours = billableHours > 0 ? billableHours : null;
@@ -529,7 +522,7 @@ export const departmentService = {
       let productiveCostPerMinute: number | null = null;
       if (productiveHours != null && productiveHours > 0 && totalCost > 0) {
         productiveCostPerHour = Math.round((totalCost / productiveHours) * 100) / 100;
-        productiveCostPerMinute = Math.round((totalCost / productiveHours / 60) * 10000) / 10000;
+        productiveCostPerMinute = Math.round((totalCost / (productiveHours * 60)) * 10000) / 10000;
       }
 
       const budgetAmount = Number(dept.budget || 0);

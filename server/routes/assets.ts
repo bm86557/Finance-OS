@@ -6,6 +6,8 @@ import { Router, type Request, type Response } from 'express';
 import type { Asset, DepreciationSchedule } from '../../src/services/types.js';
 import { ok, created, fail, notFound } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { ensureDefaultAccounts } from './accounts.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 
 function calculateMonthlyDepreciation(asset: Asset): number {
   if (asset.status !== 'active') return 0;
@@ -54,7 +56,7 @@ function mapDomainToDbAsset(asset: Asset): Record<string, unknown> {
     disposal_date: asset.disposalDate || null,
     disposal_amount: asset.disposalAmount ?? null,
     department_id: asset.departmentId || null,
-    location: asset.locationDetails || null,
+    location_details: asset.locationDetails || null,
     purchase_payment_method: asset.purchasePaymentMethod || null,
     purchase_bank_account_id: asset.purchaseBankAccountId || null,
     purchase_transaction_id: asset.purchaseTransactionId || null,
@@ -218,7 +220,7 @@ export function createAssetsRouter(): Router {
             status: asset.status,
             disposalDate: asset.disposal_date,
             disposalAmount: asset.disposal_amount,
-            location: asset.location,
+            locationDetails: asset.location_details ?? asset.location ?? undefined,
             serialNumber: asset.serial_number,
             departmentId: asset.department_id,
           };
@@ -591,7 +593,7 @@ export function createAssetsRouter(): Router {
             disposalDate: data.disposal_date,
             disposalAmount: data.disposal_amount,
             departmentId: data.department_id,
-            locationDetails: data.location,
+            locationDetails: data.location_details ?? data.location,
             purchasePaymentMethod: data.purchase_payment_method,
             purchaseBankAccountId: data.purchase_bank_account_id,
             purchaseTransactionId: data.purchase_transaction_id,
@@ -611,26 +613,111 @@ export function createAssetsRouter(): Router {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
-    // Generate unique asset code
-    const categoryPrefix = data.category ? data.category.substring(0, 3).toUpperCase() : 'AST';
-    const assetCode = `AST-${categoryPrefix}-${Date.now().toString().slice(-6)}`;
+    // Handoff §15 validation: name, cost basis, salvage, useful life, category, depreciation method
+    const name = String(data.name || '').trim();
+    if (!name) return fail(res, 400, 'Asset Name is required');
 
-    const newAsset: Asset = {
-      ...data,
-      id: 'asset-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9),
-      organizationId: orgId,
-      assetCode,
-      currentValue: data.purchasePrice,
-      accumulatedDepreciation: 0,
-    };
+    const purchasePrice = Number(data.purchasePrice);
+    const salvageValue = Number(data.salvageValue ?? 0);
+    const usefulLifeYears = Number(data.usefulLifeYears);
+
+    if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+      return fail(res, 400, 'Purchase price must be 0 or greater');
+    }
+    if (!Number.isFinite(salvageValue) || salvageValue < 0 || salvageValue > purchasePrice) {
+      return fail(res, 400, 'Salvage value must be between 0 and purchase price');
+    }
+    if (!Number.isFinite(usefulLifeYears) || usefulLifeYears <= 0) {
+      return fail(res, 400, 'Useful life must be greater than 0 years');
+    }
+    if (!data.purchaseDate) {
+      return fail(res, 400, 'Purchase date is required');
+    }
 
     try {
+      // Resolve required Chart of Accounts FKs (account_id, accumulated_depreciation_account_id, depreciation_expense_account_id)
+      let accountId = data.accountId?.trim() || '';
+      let accumDeprAccountId = data.accumulatedDepreciationAccountId?.trim() || '';
+      let deprExpAccountId = data.depreciationExpenseAccountId?.trim() || '';
+
+      if (!accountId || !accumDeprAccountId || !deprExpAccountId) {
+        await ensureDefaultAccounts(orgId);
+        const { data: orgAccounts, error: accErr } = await sb
+          .from('accounts')
+          .select('id, name, type, subtype')
+          .eq('organization_id', orgId)
+          .eq('is_active', true);
+
+        if (accErr) throw accErr;
+        const accts = orgAccounts || [];
+
+        if (!accountId) {
+          const fixedAssetAcct =
+            accts.find((a: any) => String(a.subtype || '').toLowerCase() === 'fixed_asset') ||
+            accts.find((a: any) => String(a.name || '').toLowerCase().includes('fixed asset')) ||
+            accts.find((a: any) => a.type === 'asset');
+          accountId = fixedAssetAcct?.id || '';
+        }
+
+        if (!accumDeprAccountId) {
+          const accumAcct =
+            accts.find((a: any) => String(a.subtype || '').toLowerCase() === 'accumulated_depreciation') ||
+            accts.find((a: any) => String(a.name || '').toLowerCase().includes('accumulated depreciation')) ||
+            accts.find((a: any) => a.type === 'asset');
+          accumDeprAccountId = accumAcct?.id || accountId;
+        }
+
+        if (!deprExpAccountId) {
+          const deprExpAcct =
+            accts.find((a: any) => String(a.name || '').toLowerCase().includes('depreciation') && a.type === 'expense') ||
+            accts.find((a: any) => a.type === 'expense');
+          deprExpAccountId = deprExpAcct?.id || accountId;
+        }
+      }
+
+      if (!accountId || !accumDeprAccountId || !deprExpAccountId) {
+        return fail(res, 400, 'Organization chart of accounts is missing required Fixed Asset / Depreciation accounts.');
+      }
+
+      const categoryPrefix = data.category ? data.category.substring(0, 3).toUpperCase() : 'AST';
+      const assetCode = data.assetCode?.trim() || `AST-${categoryPrefix}-${Date.now().toString().slice(-6)}`;
+
+      const newAsset: Asset = {
+        ...data,
+        name,
+        id: 'asset-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9),
+        organizationId: orgId,
+        assetCode,
+        accountId,
+        accumulatedDepreciationAccountId: accumDeprAccountId,
+        depreciationExpenseAccountId: deprExpAccountId,
+        purchasePrice,
+        salvageValue,
+        usefulLifeYears,
+        depreciationMethod: data.depreciationMethod || 'straight_line',
+        currentValue: purchasePrice,
+        accumulatedDepreciation: 0,
+        status: data.status || 'active',
+        placedInServiceDate: data.placedInServiceDate || data.purchaseDate,
+        costBasis: data.costBasis ?? purchasePrice,
+      };
+
       const { error } = await sb.from('assets').upsert(mapDomainToDbAsset(newAsset), { onConflict: 'id' });
       if (error) throw error;
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'create_asset',
+        entityType: 'asset',
+        entityId: newAsset.id,
+        description: `Registered fixed asset ${newAsset.name} (${newAsset.assetCode}) at ${newAsset.purchasePrice}`,
+        afterState: { ...newAsset },
+      });
+
       return created(res, newAsset, 'Asset created');
-    } catch (err) {
+    } catch (err: any) {
       console.error('[assets.post] Supabase persist error:', err);
-      return fail(res, 500, 'Failed to create asset');
+      return fail(res, 500, err?.message || 'Failed to create asset');
     }
   });
 
@@ -670,7 +757,7 @@ export function createAssetsRouter(): Router {
         disposalDate: existing.disposal_date,
         disposalAmount: existing.disposal_amount,
         departmentId: existing.department_id,
-        locationDetails: existing.location,
+        locationDetails: existing.location_details ?? existing.location,
         purchasePaymentMethod: existing.purchase_payment_method,
         purchaseBankAccountId: existing.purchase_bank_account_id,
         purchaseTransactionId: existing.purchase_transaction_id,

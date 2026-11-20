@@ -494,14 +494,34 @@ export function InventoryManagementView() {
     setIsDeleteItemModalOpen(true);
   };
 
+  // Handler: Open Purchase Order modal pre-filled for a low-stock item
+  const handleOpenPurchaseOrder = (targetItem?: typeof inventoryItems[number]) => {
+    const item = targetItem || lowStockItems[0];
+    if (item) {
+      setPurchaseItemId(item.id);
+      const suggestedQty = item.reorderQuantity > 0
+        ? item.reorderQuantity
+        : Math.max(1, Math.ceil((item.reorderLevel || 5) * 2 - (item.currentStock || 0)));
+      setPurchaseQuantity(suggestedQty);
+      setPurchaseUnitCost(item.lastCost || item.averageCost || '');
+      setPurchaseReference(`PO-${Date.now().toString().slice(-6)}`);
+      setPurchaseNotes(`Restock Purchase Order for low-stock item: ${item.name}`);
+    } else {
+      setPurchaseReference(`PO-${Date.now().toString().slice(-6)}`);
+    }
+    setPurchaseDate(new Date().toISOString().slice(0, 10));
+    setActionError(null);
+    setIsNewPurchaseModalOpen(true);
+  };
+
   return (
-    <div className="min-h-screen p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
+    <div className="min-h-screen p-4 sm:p-6 lg:p-8 space-y-6 max-w-full overflow-x-hidden" style={{ background: AXIOM.backgrounds.main }}>
       {/* Header */}
       <motion.div {...AXIOM.animations.fadeInTop}>
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4 mb-6">
+          <div className="flex items-center gap-3 min-w-0">
             <div 
-              className="p-3 rounded-xl flex items-center justify-center"
+              className="p-3 rounded-xl flex items-center justify-center shrink-0"
               style={{
                 background: AXIOM.iconBoxes.purple,
                 boxShadow: AXIOM.shadows.iconPurple,
@@ -509,14 +529,14 @@ export function InventoryManagementView() {
             >
               <Package className="size-6 text-white" />
             </div>
-            <div>
-              <h1 className="text-4xl font-bold" style={AXIOM.text.titleStyle}>
+            <div className="min-w-0">
+              <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold truncate" style={AXIOM.text.titleStyle}>
                 Inventory Management
               </h1>
               <p className="text-slate-400 text-sm">Track stock levels, costing, and valuations</p>
             </div>
           </div>
-          <div className="flex gap-3">
+          <div className="flex flex-wrap gap-2 sm:gap-3">
             <motion.button
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
@@ -580,7 +600,7 @@ export function InventoryManagementView() {
       )}
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -700,7 +720,7 @@ export function InventoryManagementView() {
             border: '1px solid rgba(251, 146, 60, 0.3)',
           }}
         >
-          <div className="flex items-start gap-4">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
             <div 
               className="w-12 h-12 rounded-xl flex items-center justify-center flex-shrink-0"
               style={{
@@ -710,20 +730,23 @@ export function InventoryManagementView() {
             >
               <AlertTriangle className="size-6 text-white" />
             </div>
-            <div className="flex-1">
+            <div className="flex-1 min-w-0">
               <h3 className="text-lg font-semibold text-white mb-1">Low Stock Alert</h3>
               <p className="text-slate-400 text-sm mb-3">
-                {lowStockItems.length} items are below reorder level and need to be restocked
+                {lowStockItems.length} {lowStockItems.length === 1 ? 'item is' : 'items are'} below reorder level and need to be restocked
               </p>
               <div className="flex flex-wrap gap-2">
                 {lowStockItems.slice(0, 3).map((item) => (
-                  <span 
-                    key={item.id} 
-                    className="px-3 py-1 rounded-lg text-sm text-orange-400"
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => handleOpenPurchaseOrder(item)}
+                    title={`Create Purchase Order for ${item.name}`}
+                    className="px-3 py-1 rounded-lg text-sm text-orange-300 hover:text-white hover:bg-orange-500/30 transition-colors cursor-pointer"
                     style={{ background: 'rgba(251, 146, 60, 0.15)', border: '1px solid rgba(251, 146, 60, 0.3)' }}
                   >
                     {item.name} ({item.currentStock} left)
-                  </span>
+                  </button>
                 ))}
                 {lowStockItems.length > 3 && (
                   <span 
@@ -736,9 +759,11 @@ export function InventoryManagementView() {
               </div>
             </div>
             <motion.button
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-              className="px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 flex-shrink-0"
+              type="button"
+              onClick={() => handleOpenPurchaseOrder(lowStockItems[0])}
+              whileHover={{ scale: 1.03 }}
+              whileTap={{ scale: 0.97 }}
+              className="px-4 py-2.5 rounded-xl text-sm font-semibold flex items-center gap-2 flex-shrink-0 cursor-pointer whitespace-nowrap"
               style={{
                 background: 'rgba(251, 146, 60, 0.3)',
                 color: '#ffffff',
@@ -746,7 +771,7 @@ export function InventoryManagementView() {
               }}
             >
               <ShoppingCart className="size-4" />
-              Create PO
+              Create Purchase Order
             </motion.button>
           </div>
         </motion.div>
@@ -757,7 +782,7 @@ export function InventoryManagementView() {
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.35 }}
-        className="flex gap-2 p-1 rounded-2xl"
+        className="flex flex-wrap sm:flex-nowrap gap-2 p-1 rounded-2xl overflow-x-auto"
         style={AXIOM.containers.list}
       >
         {[
@@ -1518,7 +1543,7 @@ export function InventoryManagementView() {
             style={AXIOM.containers.list}
           >
             <div className="flex items-center justify-between mb-6">
-              <h2 className="text-2xl font-bold text-white">Record New Purchase</h2>
+              <h2 className="text-2xl font-bold text-white">Create Purchase Order</h2>
               <button
                 onClick={() => {
                   setIsNewPurchaseModalOpen(false);

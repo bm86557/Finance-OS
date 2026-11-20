@@ -31,6 +31,8 @@ export interface WhatIfScenario {
   fxSensitivityPct?: number;
   allocationMethod?: 'headcount' | 'revenue' | 'equal' | 'direct_cost';
   visibility?: 'private' | 'organization' | 'management';
+  baselineSnapshotId?: string;
+  aiAnalysis?: SimulatorAIAnalysis;
   isPreset: boolean;
   lastResult?: ScenarioImpact;
   createdBy?: string;
@@ -52,6 +54,7 @@ export interface SimulatorBaseline {
   hasSufficientHistory: boolean;
   currency: string;
   liquidCash?: number;
+  departments?: Array<{ id: string; name: string; revenueShare: number; costShare: number }>;
   snapshotId?: string;
   snapshotName?: string;
   snapshotDescription?: string;
@@ -93,6 +96,38 @@ export interface UncertaintyCase {
   profit: number;
   margin: number;
   runwayMonths: number;
+}
+
+export interface SimulatorAIAnalysis {
+  aiPowered: boolean;
+  provider: string;
+  model: string;
+  executiveSummary: string;
+  riskLevel: 'low' | 'moderate' | 'high';
+  keyRisks: string[];
+  optimizationLevers: string[];
+  departmentCommentary: string;
+  recommendedAction: string;
+  disclaimer?: string;
+}
+
+export interface SimulatorAIParseResult {
+  aiPowered: boolean;
+  provider: string;
+  model: string;
+  scenario: {
+    name: string;
+    revenueChangePct: number;
+    expenseChangePct: number;
+    priceIncreasePct: number;
+    utilizationRatePct: number;
+    newHires: number;
+    avgSalary: number;
+    salaryChangePct: number;
+    vendorCostChangePct: number;
+    fxSensitivityPct: number;
+  };
+  rationale: string;
 }
 
 /**
@@ -699,20 +734,16 @@ export function createSimulatorService(organizationId: string) {
       const liquidCash = baseline.liquidCash ?? 12500000;
       const runwayMonths = monthlyBurnRate > 0 ? Math.round((liquidCash / monthlyBurnRate) * 10) / 10 : 999;
 
-      // 6. Department Impact Breakdown (§14)
-      const depts = [
-        { id: 'dept-dev', name: 'Development & Engineering', weight: 0.55 },
-        { id: 'dept-des', name: 'Product & Design', weight: 0.15 },
-        { id: 'dept-qa', name: 'QA & Golden Testing', weight: 0.10 },
-        { id: 'dept-sales', name: 'Sales & Growth', weight: 0.12 },
-        { id: 'dept-ops', name: 'Operations & G&A', weight: 0.08 },
-      ];
+      // 6. Department Impact Breakdown (§14 — uses real organization departments from Supabase)
+      const orgDepts = baseline.departments && baseline.departments.length > 0
+        ? baseline.departments
+        : [{ id: 'org-total', name: 'Organization Total', revenueShare: 1, costShare: 1 }];
 
-      const departmentImpact: DepartmentImpactItem[] = depts.map(d => {
-        const bCost = Math.round(baseline.monthlyExpense * d.weight);
-        const sCost = Math.round(projectedExpense * d.weight);
-        const bRev = Math.round(baseline.monthlyRevenue * d.weight);
-        const sRev = Math.round(projectedRevenue * d.weight);
+      const departmentImpact: DepartmentImpactItem[] = orgDepts.map(d => {
+        const bCost = Math.round(baseline.monthlyExpense * d.costShare);
+        const sCost = Math.round(projectedExpense * d.costShare);
+        const bRev = Math.round(baseline.monthlyRevenue * d.revenueShare);
+        const sRev = Math.round(projectedRevenue * d.revenueShare);
         const bProf = bRev - bCost;
         const sProf = sRev - sCost;
         return {
@@ -724,8 +755,8 @@ export function createSimulatorService(organizationId: string) {
           baselineProfit: bProf,
           scenarioProfit: sProf,
           profitDelta: sProf - bProf,
-          baselineMargin: bRev > 0 ? (bProf / bRev) * 100 : 0,
-          scenarioMargin: sRev > 0 ? (sProf / sRev) * 100 : 0,
+          baselineMargin: bRev > 0 ? Math.round((bProf / bRev) * 1000) / 10 : 0,
+          scenarioMargin: sRev > 0 ? Math.round((sProf / sRev) * 1000) / 10 : 0,
         };
       });
 
@@ -783,6 +814,39 @@ export function createSimulatorService(organizationId: string) {
           },
         },
       };
+    },
+
+    /**
+     * AI-powered natural language -> scenario parameters (§14, non-posting)
+     */
+    async parseScenarioWithAI(
+      prompt: string,
+      baseline: SimulatorBaseline,
+    ): Promise<ServiceResponse<SimulatorAIParseResult>> {
+      if (isHttpBackendConfigured()) {
+        return apiPostJson<{ prompt: string; baseline: SimulatorBaseline }, SimulatorAIParseResult>(
+          `${basePath}/ai-parse`,
+          { prompt, baseline },
+        );
+      }
+      return { success: false, data: null as any, error: 'Backend API required for AI scenario modeling' };
+    },
+
+    /**
+     * AI-powered CFO analysis of scenario vs. baseline (§13, §14, non-posting)
+     */
+    async analyzeScenarioWithAI(
+      baseline: SimulatorBaseline,
+      scenario: Partial<WhatIfScenario>,
+      impact: ScenarioImpact,
+    ): Promise<ServiceResponse<SimulatorAIAnalysis>> {
+      if (isHttpBackendConfigured()) {
+        return apiPostJson<
+          { baseline: SimulatorBaseline; scenario: Partial<WhatIfScenario>; impact: ScenarioImpact },
+          SimulatorAIAnalysis
+        >(`${basePath}/ai-analyze`, { baseline, scenario, impact });
+      }
+      return { success: false, data: null as any, error: 'Backend API required for AI CFO analysis' };
     },
 
     /**

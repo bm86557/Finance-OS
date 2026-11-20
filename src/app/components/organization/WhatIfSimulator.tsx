@@ -9,14 +9,15 @@ import { useMemo, useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { Slider } from '../ui/slider';
 import { formatCurrency } from '@/lib/formatters';
-import { Zap, TrendingUp, RefreshCw, Save, Target, Trash2, AlertCircle } from 'lucide-react';
+import { Zap, TrendingUp, RefreshCw, Save, Target, Trash2, AlertCircle, Sparkles, Send, ShieldAlert, CheckCircle2, Building2, X } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { toast } from 'sonner';
 import { AXIOM } from '../../../styles/axiom-tokens';
+import { NeonSkeleton, SkeletonCard, SkeletonChart } from '../ui/NeonSkeleton';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService } from '@/hooks/useService';
 import { createSimulatorService } from '@/services/simulatorService';
-import type { WhatIfScenario, SimulatorBaseline, ProjectionPoint } from '@/services/simulatorService';
+import type { WhatIfScenario, SimulatorBaseline, ProjectionPoint, SimulatorAIAnalysis } from '@/services/simulatorService';
 import { usePlatformSettings } from '@/hooks/usePlatformSettings';
 
 interface ScenarioInput {
@@ -27,6 +28,9 @@ interface ScenarioInput {
   avgSalary: number;
   priceIncreasePct: number;
   utilizationRatePct: number;
+  salaryChangePct?: number;
+  vendorCostChangePct?: number;
+  fxSensitivityPct?: number;
 }
 
 function safeDiv(n: number, d: number, fallback = 0): number {
@@ -41,7 +45,7 @@ export function WhatIfSimulator() {
   const simulatorSvc = useMemo(() => createSimulatorService(svc.orgId), [svc.orgId]);
 
   // Fetch baseline metrics from backend
-  const { data: baseline, loading: baselineLoading, error: baselineError } = useService(
+  const { data: baseline, loading: baselineLoading, error: baselineError, refetch: refetchBaseline } = useService(
     () => simulatorSvc.getBaseline(),
     [svc.orgId]
   );
@@ -70,6 +74,18 @@ export function WhatIfSimulator() {
 
   const [savingScenario, setSavingScenario] = useState(false);
   const [deletingScenarioId, setDeletingScenarioId] = useState<string | null>(null);
+
+  // Save Scenario Modal state (§14 ownership & visibility policy)
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [saveScenarioName, setSaveScenarioName] = useState('');
+  const [saveVisibility, setSaveVisibility] = useState<'organization' | 'management' | 'private'>('organization');
+
+  // AI Scenario Copilot state (§13, §14)
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [aiParsing, setAiParsing] = useState(false);
+  const [aiRationale, setAiRationale] = useState<string | null>(null);
+  const [aiAnalysis, setAiAnalysis] = useState<SimulatorAIAnalysis | null>(null);
+  const [aiAnalyzing, setAiAnalyzing] = useState(false);
 
   // Update scenario defaults when baseline loads
   useEffect(() => {
@@ -153,21 +169,38 @@ export function WhatIfSimulator() {
     toast.success('Reset to baseline');
   };
 
-  const handleSave = async () => {
-    const name = prompt('Enter scenario name:');
-    if (!name || !name.trim()) return;
+  const handleOpenSaveModal = () => {
+    setSaveScenarioName(
+      currentScenario.name && currentScenario.name !== 'Current State'
+        ? currentScenario.name
+        : `Scenario ${new Date().toLocaleDateString()}`
+    );
+    setSaveModalOpen(true);
+  };
+
+  const handleSave = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const name = saveScenarioName.trim();
+    if (!name) {
+      toast.error('Please enter a scenario name');
+      return;
+    }
 
     setSavingScenario(true);
     try {
       const result = await simulatorSvc.createScenario({
         ...currentScenario,
-        name: name.trim(),
+        name,
+        visibility: saveVisibility,
+        baselineSnapshotId: baseline?.snapshotId || 'live_90d',
+        aiAnalysis: aiAnalysis ?? undefined,
         isPreset: false,
         lastResult: currentImpact ?? undefined,
       });
 
       if (result.success) {
-        toast.success(`Saved scenario: ${name}`);
+        toast.success(`Saved scenario "${name}" to Supabase`);
+        setSaveModalOpen(false);
         await refetchScenarios();
       } else {
         toast.error(result.error || 'Failed to save scenario');
@@ -177,6 +210,65 @@ export function WhatIfSimulator() {
       console.error('Save scenario error:', error);
     } finally {
       setSavingScenario(false);
+    }
+  };
+
+  const handleAIParse = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!baseline || !aiPrompt.trim()) return;
+    setAiParsing(true);
+    setAiRationale(null);
+    try {
+      const res = await simulatorSvc.parseScenarioWithAI(aiPrompt.trim(), baseline);
+      if (res.success && res.data?.scenario) {
+        const s = res.data.scenario;
+        setCurrentScenario({
+          name: s.name,
+          revenueChangePct: s.revenueChangePct,
+          expenseChangePct: s.expenseChangePct,
+          priceIncreasePct: s.priceIncreasePct,
+          utilizationRatePct: s.utilizationRatePct,
+          newHires: s.newHires,
+          avgSalary: s.avgSalary || baseline.avgSalary,
+          salaryChangePct: s.salaryChangePct,
+          vendorCostChangePct: s.vendorCostChangePct,
+          fxSensitivityPct: s.fxSensitivityPct,
+        });
+        setAiRationale(res.data.rationale);
+        toast.success(
+          res.data.aiPowered
+            ? `AI modeled "${s.name}" (${res.data.model})`
+            : `Modeled "${s.name}"`
+        );
+      } else {
+        toast.error(res.error || 'Could not parse scenario prompt');
+      }
+    } catch {
+      toast.error('AI scenario modeling failed');
+    } finally {
+      setAiParsing(false);
+    }
+  };
+
+  const handleAIAnalyze = async () => {
+    if (!baseline || !currentImpact) return;
+    setAiAnalyzing(true);
+    try {
+      const res = await simulatorSvc.analyzeScenarioWithAI(baseline, currentScenario, currentImpact);
+      if (res.success && res.data) {
+        setAiAnalysis(res.data);
+        toast.success(
+          res.data.aiPowered
+            ? `AI CFO Analysis ready (${res.data.model})`
+            : 'CFO Analysis generated'
+        );
+      } else {
+        toast.error(res.error || 'Failed to run AI CFO analysis');
+      }
+    } catch {
+      toast.error('AI CFO analysis failed');
+    } finally {
+      setAiAnalyzing(false);
     }
   };
 
@@ -268,26 +360,56 @@ export function WhatIfSimulator() {
     );
   }
 
-  // Loading state
-  if (baselineLoading || !baseline) {
+  // Loading state (consistent skeleton loading across the app)
+  if (baselineLoading) {
     return (
-      <div className="min-h-screen p-8 flex items-center justify-center" style={{ background: AXIOM.backgrounds.main }}>
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-cyan-500 mx-auto mb-4"></div>
-          <p className="text-slate-400">Loading simulator data...</p>
+      <div className="min-h-screen p-4 sm:p-6 lg:p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <NeonSkeleton width="48px" height="48px" color="#a855f7" />
+            <div className="space-y-2">
+              <NeonSkeleton width="240px" height="28px" color="#a855f7" />
+              <NeonSkeleton width="320px" height="14px" color="#a855f7" />
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <NeonSkeleton width="90px" height="38px" color="#2dd4ff" />
+            <NeonSkeleton width="130px" height="38px" color="#2dd4ff" />
+          </div>
         </div>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {Array.from({ length: 3 }).map((_, idx) => (
+            <SkeletonCard key={idx} color="#a855f7" />
+          ))}
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, idx) => (
+            <SkeletonCard key={idx} color="#2dd4ff" />
+          ))}
+        </div>
+        <SkeletonChart color="#2dd4ff" />
       </div>
     );
   }
 
-  // Error state
-  if (baselineError) {
+  // Error or empty baseline state (never stuck on loading!)
+  if (baselineError || !baseline) {
     return (
       <div className="min-h-screen p-8 flex items-center justify-center" style={{ background: AXIOM.backgrounds.main }}>
-        <div className="text-center">
-          <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
-          <p className="text-white text-lg font-semibold mb-2">Failed to load simulator data</p>
-          <p className="text-slate-400">{baselineError}</p>
+        <div className="max-w-md text-center p-8 rounded-2xl border border-red-500/30 bg-slate-900/80 space-y-4">
+          <AlertCircle className="w-12 h-12 text-red-500 mx-auto" />
+          <p className="text-white text-lg font-semibold">Failed to load simulator baseline</p>
+          <p className="text-slate-400 text-sm">
+            {baselineError || 'Unable to retrieve organization financial baseline from the server.'}
+          </p>
+          <button
+            type="button"
+            onClick={() => refetchBaseline()}
+            className="px-4 py-2 rounded-xl text-sm font-semibold text-white cursor-pointer"
+            style={AXIOM.buttons.primary}
+          >
+            Retry Loading Simulator
+          </button>
         </div>
       </div>
     );
@@ -343,7 +465,7 @@ export function WhatIfSimulator() {
                 boxShadow: '0 10px 30px -10px rgba(6, 182, 212, 0.6)',
                 color: '#ffffff',
               }}
-              onClick={handleSave}
+              onClick={handleOpenSaveModal}
               disabled={savingScenario}
             >
               <Save className="size-4" />
@@ -351,6 +473,62 @@ export function WhatIfSimulator() {
             </motion.button>
           </div>
         </div>
+
+        {/* AI Scenario Copilot (§13, §14 — Non-Posting Sandbox) */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="p-4 sm:p-5 rounded-2xl mb-4"
+          style={{
+            background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.14), rgba(6, 182, 212, 0.12))',
+            border: '1px solid rgba(168, 85, 247, 0.35)',
+          }}
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+            <div className="flex items-center gap-2">
+              <Sparkles className="size-4 text-purple-400" />
+              <span className="text-sm font-bold text-white">AI Scenario Copilot</span>
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                Non-Posting Sandbox (§14)
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleAIAnalyze}
+              disabled={aiAnalyzing || !currentImpact}
+              className="px-3 py-1.5 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              style={{
+                background: 'linear-gradient(135deg, #a855f7, #06b6d4)',
+              }}
+            >
+              <Sparkles className="size-3.5" />
+              {aiAnalyzing ? 'Analyzing Scenario…' : 'Run AI CFO Analysis'}
+            </button>
+          </div>
+          <form onSubmit={handleAIParse} className="flex flex-col sm:flex-row gap-2">
+            <input
+              type="text"
+              value={aiPrompt}
+              onChange={(e) => setAiPrompt(e.target.value)}
+              placeholder='Ask AI to model a scenario, e.g. "Hire 2 devs at $5000/mo, increase prices 15%, cut expenses 10%"'
+              className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-950/70 border border-slate-700 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:border-purple-400"
+            />
+            <button
+              type="submit"
+              disabled={aiParsing || !aiPrompt.trim()}
+              className="px-4 py-2.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              style={AXIOM.buttons.primary}
+            >
+              <Send className="size-4" />
+              {aiParsing ? 'Modeling…' : 'Model with AI'}
+            </button>
+          </form>
+          {aiRationale && (
+            <p className="text-xs text-cyan-300 mt-2.5">
+              ✨ {aiRationale}
+            </p>
+          )}
+        </motion.div>
 
         {/* Data Warning */}
         {showDataWarning && (
@@ -891,7 +1069,80 @@ export function WhatIfSimulator() {
         </motion.div>
       )}
 
-      {/* AI Insights */}
+      {/* §14 Uncertainty Envelope & Real Department Impact */}
+      {currentImpact && (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Uncertainty Envelope + Burn/Runway */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="p-6 rounded-2xl space-y-4"
+            style={AXIOM.containers.list}
+          >
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-bold text-white">Uncertainty & Cash Runway (§14)</h3>
+              <span className="text-xs px-2.5 py-1 rounded-lg bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                {currentImpact.monthlyBurnRate > 0
+                  ? `Burn: ${formatCurrency(currentImpact.monthlyBurnRate, currency)}/mo · ${currentImpact.runwayMonths} mo runway`
+                  : 'Cash Generative (Net Positive)'}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {[
+                { key: 'stress', c: currentImpact.uncertainty.stressCase, accent: 'border-red-500/30 bg-red-500/5', text: 'text-red-400' },
+                { key: 'expected', c: currentImpact.uncertainty.expectedCase, accent: 'border-cyan-500/30 bg-cyan-500/5', text: 'text-cyan-400' },
+                { key: 'bull', c: currentImpact.uncertainty.bullCase, accent: 'border-emerald-500/30 bg-emerald-500/5', text: 'text-emerald-400' },
+              ].map(({ key, c, accent, text }) => (
+                <div key={key} className={`p-3 rounded-xl border ${accent} space-y-1`}>
+                  <p className="text-[11px] font-semibold text-slate-300">{c.label}</p>
+                  <p className={`text-base font-bold ${text}`}>{formatCurrency(c.profit, currency)}</p>
+                  <p className="text-[11px] text-slate-400">
+                    Margin: {c.margin.toFixed(1)}% · {c.runwayMonths >= 999 ? 'Cash Gen.' : `${c.runwayMonths} mo`}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+
+          {/* Real Organization Department Impact */}
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="p-6 rounded-2xl space-y-3"
+            style={AXIOM.containers.list}
+          >
+            <div className="flex items-center gap-2">
+              <Building2 className="size-4 text-purple-400" />
+              <h3 className="text-lg font-bold text-white">Department Impact Breakdown</h3>
+            </div>
+            <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+              {currentImpact.departmentImpact.map((d) => (
+                <div
+                  key={d.departmentId}
+                  className="p-3 rounded-xl bg-slate-900/60 border border-slate-800 flex items-center justify-between gap-3 text-xs"
+                >
+                  <div className="min-w-0">
+                    <p className="font-semibold text-white truncate">{d.departmentName}</p>
+                    <p className="text-slate-400">
+                      Cost: {formatCurrency(d.scenarioCost, currency)} ({d.costDelta >= 0 ? '+' : ''}{formatCurrency(d.costDelta, currency)})
+                    </p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    <p className={`font-bold ${d.scenarioProfit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                      {formatCurrency(d.scenarioProfit, currency)}
+                    </p>
+                    <p className="text-slate-400">
+                      {d.scenarioMargin.toFixed(1)}% margin
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* AI CFO Analysis & Real-Time Insights */}
       {currentImpact && thresholds && (
         <motion.div
           initial={{ opacity: 0, y: 20 }}
@@ -908,10 +1159,60 @@ export function WhatIfSimulator() {
                 boxShadow: AXIOM.shadows.iconPurple,
               }}
             >
-              <Zap className="size-5 text-white" />
+              <Sparkles className="size-5 text-white" />
             </div>
-            <div className="flex-1">
-              <h3 className="text-lg font-bold text-white mb-2">AI Insights</h3>
+            <div className="flex-1 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="text-lg font-bold text-white">AI CFO Scenario Intelligence</h3>
+                {aiAnalysis && (
+                  <span
+                    className={`text-xs font-semibold px-2.5 py-1 rounded-lg border ${
+                      aiAnalysis.riskLevel === 'high'
+                        ? 'bg-red-500/15 text-red-300 border-red-500/30'
+                        : aiAnalysis.riskLevel === 'moderate'
+                        ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                        : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                    }`}
+                  >
+                    Risk: {aiAnalysis.riskLevel.toUpperCase()} · {aiAnalysis.aiPowered ? `${aiAnalysis.provider}/${aiAnalysis.model}` : 'Deterministic Fallback'}
+                  </span>
+                )}
+              </div>
+
+              {aiAnalysis && (
+                <div className="p-4 rounded-xl bg-slate-950/60 border border-purple-500/25 space-y-3 text-sm">
+                  <p className="text-slate-100 leading-relaxed">{aiAnalysis.executiveSummary}</p>
+                  {aiAnalysis.keyRisks.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold text-amber-400 mb-1 flex items-center gap-1">
+                        <ShieldAlert className="size-3.5" /> Key Risks
+                      </p>
+                      <ul className="space-y-1 text-xs text-slate-300 list-disc pl-4">
+                        {aiAnalysis.keyRisks.map((r, i) => <li key={i}>{r}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  {aiAnalysis.optimizationLevers.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold text-emerald-400 mb-1 flex items-center gap-1">
+                        <CheckCircle2 className="size-3.5" /> Optimization Levers
+                      </p>
+                      <ul className="space-y-1 text-xs text-slate-300 list-disc pl-4">
+                        {aiAnalysis.optimizationLevers.map((l, i) => <li key={i}>{l}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  {aiAnalysis.recommendedAction && (
+                    <p className="text-xs text-cyan-300 pt-1 border-t border-slate-800">
+                      <strong>Recommended Next Step:</strong> {aiAnalysis.recommendedAction}
+                    </p>
+                  )}
+                  {aiAnalysis.disclaimer && (
+                    <p className="text-[11px] text-slate-500">{aiAnalysis.disclaimer}</p>
+                  )}
+                </div>
+              )}
+
               <div className="space-y-2 text-sm text-slate-300">
                 {currentImpact.margin > thresholds.healthy_margin_pct && (
                   <p>✅ Excellent margin ({currentImpact.margin.toFixed(1)}%) — well above the {thresholds.healthy_margin_pct}% healthy threshold.</p>
@@ -938,6 +1239,69 @@ export function WhatIfSimulator() {
             </div>
           </div>
         </motion.div>
+      )}
+
+      {/* Save Scenario Modal (§14 Ownership & Visibility Policy) */}
+      {saveModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="w-full max-w-md rounded-2xl bg-slate-950 border border-slate-700 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-bold text-white">Save What-If Scenario</h3>
+              <button
+                type="button"
+                onClick={() => setSaveModalOpen(false)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+            <form onSubmit={handleSave} className="space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">Scenario Name *</label>
+                <input
+                  type="text"
+                  value={saveScenarioName}
+                  onChange={(e) => setSaveScenarioName(e.target.value)}
+                  placeholder="e.g. Q4 Expansion + 10% Pricing"
+                  required
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white focus:outline-none focus:border-cyan-400"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">Visibility Policy (§14)</label>
+                <select
+                  value={saveVisibility}
+                  onChange={(e) => setSaveVisibility(e.target.value as 'organization' | 'management' | 'private')}
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-sm text-white focus:outline-none focus:border-cyan-400"
+                >
+                  <option value="organization">Organization (All authorized finance users)</option>
+                  <option value="management">Management Only</option>
+                  <option value="private">Private (Owner only)</option>
+                </select>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Saves hypothetical inputs, computed KPIs, and AI analysis to Supabase without modifying posted ledger records.
+              </p>
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setSaveModalOpen(false)}
+                  className="px-4 py-2 rounded-xl text-sm font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingScenario}
+                  className="px-4 py-2 rounded-xl text-sm font-semibold text-white cursor-pointer disabled:opacity-50"
+                  style={AXIOM.buttons.primary}
+                >
+                  {savingScenario ? 'Saving…' : 'Save to Supabase'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </div>
   );

@@ -30,7 +30,7 @@ import { useAuth } from '@/contexts/AuthContext';
 interface DepartmentRow {
   id: string;
   name: string;
-  costPerHour: number;
+  costPerHour: number | null;
   directCostPerHour?: number | null;
   directCostPerMinute?: number | null;
   costPerMinute?: number | null;
@@ -44,13 +44,15 @@ interface DepartmentRow {
   profit: number;
   margin: number;
   utilization: number | null;
-  totalHours: number;
+  totalHours: number | null;
   billableHours: number;
   budget?: number;
   budgetSpent?: number;
   budgetRemaining?: number;
   budgetUtilization?: number;
-  standardRate?: number;
+  standardRate?: number | null;
+  capacityBasis?: string;
+  policyVersion?: string;
 }
 
 function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow {
@@ -66,12 +68,23 @@ function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow 
     : 0;
 
   const headcount = Number(dp.headcount ?? 0);
-  const totalHours = Number(dp.totalHours || (headcount > 0 ? headcount * 160 : 160));
+  // Per Handoff v1.2 §12.1 L620: zero-hour denominator is undefined (null), never 160h or $0
+  const totalHours = dp.totalHours != null
+    ? Number(dp.totalHours)
+    : (headcount > 0 ? headcount * 160 : null);
   const billableHours = Number(dp.billableHours ?? 0);
-  const utilization = dp.utilization != null 
-    ? Number(dp.utilization) 
-    : (billableHours > 0 && totalHours > 0 ? Math.round((billableHours / totalHours) * 1000) / 10 : null);
-  const costPerHour = Number(dp.costPerHour || (totalHours > 0 ? Math.round(monthlyCost / totalHours) : 0));
+  const utilization = dp.utilization != null
+    ? Number(dp.utilization)
+    : (billableHours > 0 && totalHours != null && totalHours > 0 ? Math.round((billableHours / totalHours) * 1000) / 10 : null);
+  const costPerHour = dp.costPerHour != null
+    ? Number(dp.costPerHour)
+    : (totalHours != null && totalHours > 0 && monthlyCost > 0 ? Math.round((monthlyCost / totalHours) * 100) / 100 : null);
+  const costPerMinute = dp.costPerMinute != null
+    ? Number(dp.costPerMinute)
+    : (totalHours != null && totalHours > 0 && monthlyCost > 0 ? Math.round((monthlyCost / (totalHours * 60)) * 10000) / 10000 : null);
+  const directCostPerHour = dp.directCostPerHour != null
+    ? Number(dp.directCostPerHour)
+    : (totalHours != null && totalHours > 0 && directCosts > 0 ? Math.round((directCosts / totalHours) * 100) / 100 : null);
   const budget = dp.budget != null ? Number(dp.budget) : undefined;
   const budgetSpent = dp.budgetSpent != null ? Number(dp.budgetSpent) : directCosts;
   const budgetRemaining = budget != null ? Math.max(0, budget - budgetSpent) : undefined;
@@ -81,9 +94,9 @@ function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow 
     id: dp.departmentId,
     name: dp.departmentName,
     costPerHour,
-    directCostPerHour: dp.directCostPerHour,
-    directCostPerMinute: dp.directCostPerMinute,
-    costPerMinute: dp.costPerMinute,
+    directCostPerHour,
+    directCostPerMinute: dp.directCostPerMinute ?? null,
+    costPerMinute,
     allocatedStaffLabor: dp.allocatedStaffLabor,
     directDepartmentExpenses: dp.directDepartmentExpenses,
     headcount,
@@ -100,7 +113,9 @@ function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow 
     budgetSpent,
     budgetRemaining,
     budgetUtilization,
-    standardRate: dp.standardRate ?? (budget && budget > 0 ? Math.round(budget / totalHours) : costPerHour),
+    standardRate: dp.standardRate ?? (budget && budget > 0 && totalHours && totalHours > 0 ? Math.round((budget / totalHours) * 100) / 100 : costPerHour),
+    capacityBasis: dp.costMatrixMeta?.selectedCapacityBasis ?? dp.capacityBasis ?? (totalHours != null ? 'fte_160h' : 'none'),
+    policyVersion: dp.costMatrixMeta?.policyVersion ?? 'v1.2-costing',
   };
 }
 
@@ -163,7 +178,9 @@ export function CostingPricing() {
         rows.push({
           id: d.id,
           name: d.name,
-          costPerHour: b && b > 0 ? Math.round(b / 160) : 0,
+          costPerHour: null,
+          directCostPerHour: null,
+          costPerMinute: null,
           headcount: 0,
           monthlyRevenue: 0,
           monthlyCost: 0,
@@ -172,13 +189,15 @@ export function CostingPricing() {
           profit: 0,
           margin: 0,
           utilization: null,
-          totalHours: 160,
+          totalHours: null,
           billableHours: 0,
           budget: b,
           budgetSpent: 0,
           budgetRemaining: b,
           budgetUtilization: 0,
-          standardRate: b && b > 0 ? Math.round(b / 160) : 0,
+          standardRate: null,
+          capacityBasis: 'none',
+          policyVersion: 'v1.2-costing',
         });
       }
     }
@@ -324,7 +343,7 @@ export function CostingPricing() {
   const quoteAnalysis = useMemo(() => {
     if (!quoteAmount || !estimatedHours) return null;
     const dept = billableDepartments.find(d => d.id === selectedDept);
-    if (!dept) return null;
+    if (!dept || dept.costPerHour == null) return null;
 
     const hours = parseFloat(estimatedHours);
     const revenue = parseFloat(quoteAmount);
@@ -683,10 +702,25 @@ export function CostingPricing() {
 
                 <div className="grid grid-cols-2 gap-3 mb-4">
                   <div>
-                    <p className="text-xs text-slate-400 mb-1">Cost / Hour</p>
-                    <p className="text-xl font-bold text-white">
-                      {formatCurrency(dept.costPerHour, currency)}
-                    </p>
+                    <p className="text-xs text-slate-400 mb-1">Cost / Hour (Loaded)</p>
+                    {dept.costPerHour != null ? (
+                      <>
+                        <p className="text-xl font-bold text-white">
+                          {formatCurrency(dept.costPerHour, currency)}
+                        </p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          {dept.costPerMinute != null ? `${formatCurrency(dept.costPerMinute, currency)}/min` : ''}
+                          {dept.directCostPerHour != null ? ` · Direct ${formatCurrency(dept.directCostPerHour, currency)}/hr` : ''}
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-lg font-semibold text-slate-400">Undefined</p>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          {dept.headcount === 0 ? 'No active staff (0h)' : 'No costs recorded'}
+                        </p>
+                      </>
+                    )}
                   </div>
                   <div>
                     <p className="text-xs text-slate-400 mb-1">Active Headcount</p>
@@ -694,16 +728,21 @@ export function CostingPricing() {
                       <Users className="size-4 text-cyan-400" />
                       {dept.headcount}
                     </p>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      {dept.headcount > 0 ? '160 hrs/mo per FTE' : 'Assign staff to compute rate'}
+                    </p>
                   </div>
                 </div>
 
-                <div className="mb-4 p-2.5 rounded-xl bg-slate-800/40 border border-slate-700/50 flex items-center justify-between text-xs">
+                <div className="mb-4 p-2.5 rounded-xl bg-slate-800/40 border border-slate-700/50 flex flex-wrap items-center justify-between gap-1.5 text-xs">
                   <span className="text-slate-400 flex items-center gap-1">
                     <Clock className="size-3.5 text-slate-400" />
                     Capacity
                   </span>
                   <span className="text-slate-200 font-medium">
-                    {dept.totalHours} hrs / mo
+                    {dept.totalHours != null && dept.headcount > 0
+                      ? `${dept.totalHours} hrs/mo (${dept.headcount} × 160h)`
+                      : '0 hrs/mo (No staff)'}
                   </span>
                   <span className="text-slate-400">|</span>
                   <span className="text-slate-400">Timesheets:</span>
@@ -779,6 +818,10 @@ export function CostingPricing() {
                   <span className={`text-sm font-bold ${dept.profit >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                     {formatCurrency(dept.profit, currency)}
                   </span>
+                </div>
+                <div className="flex items-center justify-between pt-1 text-[10px] text-slate-500">
+                  <span>Basis: {dept.capacityBasis || 'none'}</span>
+                  <span>{dept.policyVersion || 'v1.2-costing'}</span>
                 </div>
               </div>
             </motion.div>
@@ -946,7 +989,7 @@ export function CostingPricing() {
               >
                 {billableDepartments.map(dept => (
                   <option key={dept.id} value={dept.id} className="bg-slate-900 text-white">
-                    {dept.name} ({formatCurrency(dept.costPerHour, currency)}/hr)
+                    {dept.name} ({dept.costPerHour != null ? `${formatCurrency(dept.costPerHour, currency)}/hr` : 'Rate undefined'})
                   </option>
                 ))}
               </select>

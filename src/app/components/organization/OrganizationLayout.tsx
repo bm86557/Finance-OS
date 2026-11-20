@@ -209,7 +209,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
       }}></div>
 
       {/* Top Header Bar */}
-      <div className={`min-h-16 sm:min-h-20 ${theme === 'dark' ? 'bg-slate-900/80' : 'bg-white/80'} backdrop-blur-xl border-b ${theme === 'dark' ? 'border-cyan-500/30' : 'border-cyan-400/30'} flex flex-wrap items-center justify-between gap-y-2 gap-x-2 px-3 sm:px-5 lg:px-8 py-2 sm:py-0 shrink-0 relative z-30`}>
+      <div className={`min-h-16 sm:min-h-20 ${theme === 'dark' ? 'bg-slate-900/80' : 'bg-white/80'} backdrop-blur-xl border-b ${theme === 'dark' ? 'border-cyan-500/30' : 'border-cyan-400/30'} flex flex-wrap lg:flex-nowrap items-center justify-between gap-y-2 gap-x-2 px-3 sm:px-4 lg:px-6 py-2 sm:py-0 shrink-0 relative z-30`}>
         {/* Glowing Top Border */}
         <div className="absolute top-0 inset-x-0 h-px bg-gradient-to-r from-transparent via-cyan-400 to-transparent"></div>
 
@@ -282,7 +282,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
             <span>{roleBadge.label}</span>
           </div>
           
-          <div className={`hidden sm:flex items-center gap-2 md:gap-3 px-2 md:px-4 py-2 max-w-[200px] md:max-w-xs ${theme === 'dark' ? 'bg-slate-950/50' : 'bg-slate-100'} backdrop-blur-xl rounded-xl border ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} min-w-0`}>
+          <div className={`hidden sm:flex items-center gap-2 md:gap-3 px-2 md:px-3 py-1.5 max-w-[150px] xl:max-w-[220px] ${theme === 'dark' ? 'bg-slate-950/50' : 'bg-slate-100'} backdrop-blur-xl rounded-xl border ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} min-w-0`}>
             <User className="size-4 text-cyan-400 shrink-0" />
             <div className="min-w-0">
               <p className={`text-sm ${theme === 'dark' ? 'text-white' : 'text-slate-900'} font-medium truncate`}>{user?.name}</p>
@@ -316,7 +316,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
         {/* Sidebar */}
         <div
           className={cn(
-            `w-72 ${theme === 'dark' ? 'bg-slate-900/50' : 'bg-white/70'} backdrop-blur-xl border-r ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} flex flex-col shrink-0 relative`,
+            `w-64 xl:w-72 ${theme === 'dark' ? 'bg-slate-900/50' : 'bg-white/70'} backdrop-blur-xl border-r ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} flex flex-col shrink-0 relative`,
             'fixed z-50 top-[4.75rem] sm:top-20 bottom-0 left-0 lg:static lg:z-0 lg:top-auto lg:bottom-auto transition-transform duration-200 ease-out',
             mobileNavOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
           )}
@@ -388,7 +388,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
         </div>
 
         {/* Main Content */}
-        <div className="flex-1 overflow-auto relative">
+        <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden relative">
           {children}
         </div>
       </div>

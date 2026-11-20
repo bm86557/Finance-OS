@@ -148,7 +148,7 @@ export function ReportsView() {
   const [balanceData, setBalanceData] = useState<BalanceSheetReport | null>(null);
   const [cashFlowData, setCashFlowData] = useState<CashFlowReport[]>([]);
   const [deptData, setDeptData] = useState<DepartmentProfitability[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -849,12 +849,13 @@ export function ReportsView() {
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
               type="button"
-              className="px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2"
+              disabled={loading}
+              className="px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2 disabled:opacity-60"
               style={AXIOM.buttons.secondary}
               onClick={handleRefresh}
             >
-              <RefreshCw className={`size-4 ${loading ? 'animate-spin text-purple-400' : ''}`} />
-              Refresh
+              <RefreshCw className="size-4" />
+              {loading ? 'Refreshing…' : 'Refresh'}
             </motion.button>
             {featureFlags.export_to_quickbooks && (
               <motion.button
@@ -894,6 +895,13 @@ export function ReportsView() {
       </motion.div>
 
       {/* Quick Stats */}
+      {loading ? (
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, idx) => (
+            <SkeletonCard key={idx} color="#a855f7" />
+          ))}
+        </div>
+      ) : (
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
@@ -1021,6 +1029,7 @@ export function ReportsView() {
           </div>
         </motion.div>
       </div>
+      )}
 
       {/* View Selector */}
       <motion.div
@@ -1047,6 +1056,15 @@ export function ReportsView() {
 
       {/* Report Content */}
       {activeView === 'overview' && (
+        loading ? (
+          <div className="space-y-4">
+            <SkeletonChart color="#a855f7" />
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <SkeletonChart color="#2dd4ff" />
+              <SkeletonChart color="#a855f7" />
+            </div>
+          </div>
+        ) : (
         <div className="space-y-4">
           {/* Monthly Trend Chart */}
           <motion.div
@@ -1298,6 +1316,7 @@ export function ReportsView() {
             </motion.div>
           </div>
         </div>
+        )
       )}
 
       {activeView === 'pl' && (
@@ -1682,6 +1701,9 @@ export function ReportsView() {
             </motion.button>
           </div>
 
+          {loading ? (
+            <SkeletonTable rows={6} columns={2} />
+          ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
             {/* Assets */}
             <div className="space-y-6">
@@ -1853,6 +1875,7 @@ export function ReportsView() {
               </div>
             </div>
           </div>
+          )}
         </motion.div>
       )}
 
@@ -1900,6 +1923,9 @@ export function ReportsView() {
             </motion.button>
           </div>
 
+          {loading ? (
+            <SkeletonTable rows={5} columns={3} />
+          ) : (
           <div className="space-y-6">
             {/* Operating Activities */}
             {/* Monthly Cash Flow */}
@@ -1942,6 +1968,7 @@ export function ReportsView() {
             </div>
 
           </div>
+          )}
         </motion.div>
       )}
 

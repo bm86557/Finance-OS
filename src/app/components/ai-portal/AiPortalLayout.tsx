@@ -119,9 +119,9 @@ export function AiPortalLayout({ children, currentView, onViewChange }: AiPortal
       </div>
 
       {/* Main Content Area with Dedicated Sidebar */}
-      <div className="flex-1 flex overflow-hidden relative">
+      <div className="flex-1 flex overflow-hidden relative min-h-0">
         {/* Dedicated AI Portal Sidebar */}
-        <div className="w-72 backdrop-blur-xl flex flex-col shrink-0 relative" style={{
+        <div className="w-64 xl:w-72 backdrop-blur-xl flex flex-col shrink-0 relative" style={{
           background: 'rgba(15, 23, 42, 0.65)',
           borderRight: '1px solid rgba(236, 72, 153, 0.2)',
         }}>
@@ -192,7 +192,7 @@ export function AiPortalLayout({ children, currentView, onViewChange }: AiPortal
         </div>
 
         {/* Dedicated Main Content Workspace */}
-        <div className="flex-1 overflow-auto relative bg-black/40">
+        <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden relative bg-black/40">
           {children}
         </div>
       </div>

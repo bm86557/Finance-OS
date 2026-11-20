@@ -340,6 +340,8 @@ export interface InventoryTransaction {
   notes?: string;
   departmentId?: string;
   projectId?: string;
+  bankAccountId?: string;
+  idempotencyKey?: string;
 }
 
 export interface OverheadAllocation {
@@ -790,6 +792,8 @@ export interface CashFlowSummary {
   net: number;
 }
 
+export type CashFlowReport = CashFlowSummary;
+
 // Report types
 export interface ProfitLossReport {
   period: string;
@@ -827,20 +831,46 @@ export interface DepartmentProfitability {
   departmentId: string;
   departmentName: string;
   revenue: number;
+  allocatedStaffLabor?: number;
+  directDepartmentExpenses?: number;
   directCosts: number;
   allocatedOverhead: number;
+  fullDepartmentCost?: number;
   netProfit: number;
-  profitMargin: number;
+  profitMargin: number | null;
   headcount: number;
-  revenuePerHead: number;
-  /** Total hours available (headcount × standard work month) */
-  totalHours: number;
+  revenuePerHead: number | null;
+  squareFootage?: number;
+  /** Total hours available (headcount × 160h FTE) — null when headcount is 0 (§12.1 L620) */
+  totalHours: number | null;
+  totalMinutes?: number | null;
   /** Hours spent on billable/client work */
   billableHours: number;
-  /** billableHours / totalHours × 100 — null when no timesheet data */
+  /** billableHours / totalHours × 100 — null when no timesheet data or 0 capacity */
   utilization: number | null;
-  /** (directCosts + allocatedOverhead) / billableHours (or totalHours if no timesheets) */
-  costPerHour: number;
+  /** Direct cost per hour (directCosts / totalHours) — null when 0 capacity */
+  directCostPerHour?: number | null;
+  directCostPerMinute?: number | null;
+  /** Fully loaded cost per hour ((directCosts + allocatedOverhead) / totalHours) — null when 0 capacity */
+  costPerHour: number | null;
+  costPerMinute?: number | null;
+  productiveHours?: number | null;
+  productiveCostPerHour?: number | null;
+  productiveCostPerMinute?: number | null;
+  capacityBasis?: string;
+  overheadSource?: string;
+  includedPools?: Array<{ poolId: string; poolName: string; allocatedAmount: number }>;
+  costMatrixMeta?: {
+    period?: string;
+    currency?: string;
+    policyVersion?: string;
+    calculationTimestamp?: string;
+    dataFreshness?: string;
+    selectedCapacityHours?: number | null;
+    selectedCapacityBasis?: string;
+    includedPoolsCount?: number;
+    totalPoolsAmount?: number;
+  };
   /** Monthly approved department budget */
   budget?: number;
   /** Direct costs + allocated overhead spent against budget */
@@ -850,7 +880,7 @@ export interface DepartmentProfitability {
   /** Percentage of budget utilized */
   budgetUtilization?: number;
   /** Budgeted standard capacity hourly rate */
-  standardRate?: number;
+  standardRate?: number | null;
 }
 
 export interface ProjectProfitability {

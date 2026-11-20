@@ -400,4 +400,12 @@
     font-weight: var(--font-weight-numeric);
     letter-spacing: var(--letter-spacing-numeric);
   }
+
+  /* Prevent horizontal viewport overflow across 90%/100%/110% browser zoom */
+  html,
+  body,
+  #root {
+    max-width: 100%;
+    overflow-x: clip;
+  }
 }

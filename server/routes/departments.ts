@@ -547,13 +547,13 @@ export async function calculateDepartmentProfitability(
       ? Math.round((billableHours / capacityHours) * 1000) / 10
       : null;
 
-    // --- §12.2 Dual Management Views ---
+    // --- §12.2 Dual Management Views (F-04 L1069: compute minute rates from unrounded totals) ---
     // 1. Direct Cost View: direct costs only (labor + direct department expenses)
     let directCostPerHour: number | null = null;
     let directCostPerMinute: number | null = null;
     if (capacityHours != null && capacityHours > 0 && directCosts > 0) {
       directCostPerHour = Math.round((directCosts / capacityHours) * 100) / 100;
-      directCostPerMinute = Math.round((directCostPerHour / 60) * 10000) / 10000;
+      directCostPerMinute = Math.round((directCosts / (capacityHours * 60)) * 10000) / 10000;
     }
 
     // 2. Fully Loaded Cost View: direct costs + allocated shared overhead
@@ -561,7 +561,7 @@ export async function calculateDepartmentProfitability(
     let costPerMinute: number | null = null;
     if (capacityHours != null && capacityHours > 0 && fullDepartmentCost > 0) {
       costPerHour = Math.round((fullDepartmentCost / capacityHours) * 100) / 100;
-      costPerMinute = Math.round((costPerHour / 60) * 10000) / 10000;
+      costPerMinute = Math.round((fullDepartmentCost / (capacityHours * 60)) * 10000) / 10000;
     }
 
     // 3. Productive Capacity Cost Rate: based on hours actually logged on projects/timesheets
@@ -570,7 +570,7 @@ export async function calculateDepartmentProfitability(
     let productiveCostPerMinute: number | null = null;
     if (productiveHours != null && productiveHours > 0 && fullDepartmentCost > 0) {
       productiveCostPerHour = Math.round((fullDepartmentCost / productiveHours) * 100) / 100;
-      productiveCostPerMinute = Math.round((productiveCostPerHour / 60) * 10000) / 10000;
+      productiveCostPerMinute = Math.round((fullDepartmentCost / (productiveHours * 60)) * 10000) / 10000;
     }
 
     const budgetAmount = Number(dept.budget || 0);
