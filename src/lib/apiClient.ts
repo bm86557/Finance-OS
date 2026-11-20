@@ -75,6 +75,17 @@ function withTimeoutSignal(
  * - 2xx: prefers body shaped like `{ success, data, ... }`; otherwise wraps raw JSON as `{ success: true, data }`.
  * - Non-OK HTTP: maps body `error` / `message` or status to `success: false`.
  */
+let lastSessionExpiredEventAt = 0;
+
+function notifySessionExpired(path: string): void {
+  if (typeof window === 'undefined') return;
+  if (path.startsWith('/auth/')) return;
+  const now = Date.now();
+  if (now - lastSessionExpiredEventAt < 10_000) return;
+  lastSessionExpiredEventAt = now;
+  window.dispatchEvent(new CustomEvent('finance-os:session-expired', { detail: { path } }));
+}
+
 export async function apiRequest<T>(path: string, options: ApiRequestOptions = {}): Promise<ServiceResponse<T>> {
   const base = getApiBaseUrl();
   if (!base) {
@@ -130,17 +141,22 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     let res = await executeFetch(headers);
 
     if (res.status === 401 && !requestInit.signal?.aborted) {
+      let recovered = false;
       try {
         if (isSupabaseConfigured()) {
-          const refreshedToken = await refreshSupabaseAccessToken();
+          const refreshedToken = await refreshSupabaseAccessToken(activeToken);
           if (refreshedToken && refreshedToken !== activeToken) {
             const retryHeaders = new Headers(headers);
             retryHeaders.set('Authorization', `Bearer ${refreshedToken}`);
             res = await executeFetch(retryHeaders);
+            recovered = res.status !== 401;
           }
         }
       } catch {
         /* fall through with original 401 response */
+      }
+      if (!recovered && res.status === 401 && activeToken) {
+        notifySessionExpired(path);
       }
     }
 

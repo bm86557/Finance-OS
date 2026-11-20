@@ -5,7 +5,7 @@ import { authService, organizationService } from '@/services';
 import type { AuthSession } from '@/services';
 import type { PortalType } from '@/services/authSessionTypes';
 import { logUnexpectedError } from '@/lib/diagnostics';
-import { isSupabaseConfigured, getSupabaseClient } from '@/lib/supabaseClient';
+import { isSupabaseConfigured, getSupabaseClient, ensureFreshSupabaseSession } from '@/lib/supabaseClient';
 import { isHttpBackendConfigured } from '@/lib/apiClient';
 import { setupSupabaseRealtimeSync, teardownSupabaseRealtimeSync } from '@/services/realtimeSync';
 
@@ -206,8 +206,29 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
       }
     });
 
+    // Proactively keep Supabase session fresh when returning from background tab, laptop sleep, or network reconnect
+    const handleWakeUp = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void ensureFreshSupabaseSession();
+    };
+    const handleSessionExpired = () => {
+      toast.error('Your session expired. Please sign in again.');
+      void sb.auth.signOut().catch(() => {});
+    };
+
+    if (typeof window !== 'undefined') {
+      document.addEventListener('visibilitychange', handleWakeUp);
+      window.addEventListener('online', handleWakeUp);
+      window.addEventListener('finance-os:session-expired', handleSessionExpired);
+    }
+
     return () => {
       subscription.unsubscribe();
+      if (typeof window !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleWakeUp);
+        window.removeEventListener('online', handleWakeUp);
+        window.removeEventListener('finance-os:session-expired', handleSessionExpired);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

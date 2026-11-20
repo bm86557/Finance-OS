@@ -948,7 +948,7 @@ export async function supabaseGetSession(): Promise<ServiceResponse<AuthSession 
     return { success: false, data: null, error: 'Supabase client unavailable' };
   }
 
-  const {
+  let {
     data: { session },
     error,
   } = await sb.auth.getSession();
@@ -957,6 +957,18 @@ export async function supabaseGetSession(): Promise<ServiceResponse<AuthSession 
   }
   if (!session) {
     return { success: true, data: null };
+  }
+
+  // If the stored session is expired or within 2 minutes of expiry, refresh BEFORE making DB queries
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof session.expires_at === 'number' && session.expires_at <= nowSec + 120) {
+    const { data: refreshed, error: refreshErr } = await sb.auth.refreshSession();
+    if (refreshErr || !refreshed.session) {
+      // Refresh token is genuinely revoked/expired — return null session cleanly instead of 401 cascade
+      await sb.auth.signOut().catch(() => {});
+      return { success: true, data: null };
+    }
+    session = refreshed.session;
   }
 
   const mapped = await buildAuthSessionFromSupabase(session);

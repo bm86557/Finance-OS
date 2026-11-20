@@ -109,21 +109,53 @@ export function invalidateSupabaseClient(): void {
 }
 
 let inFlightRefresh: Promise<string | undefined> | null = null;
+const PROACTIVE_REFRESH_BUFFER_SEC = 120; // Refresh tokens within 2 minutes of expiry
+
+function isSessionNearExpiry(expiresAt?: number | null, bufferSec = PROACTIVE_REFRESH_BUFFER_SEC): boolean {
+  if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt)) return false;
+  const nowSec = Math.floor(Date.now() / 1000);
+  return expiresAt <= nowSec + bufferSec;
+}
 
 /**
  * Refreshes the active Supabase session using a single shared in-flight promise so concurrent
- * requests never race on refresh-token rotation.
+ * requests and multi-tab refresh rotations never race on refresh-token rotation.
  */
-export async function refreshSupabaseAccessToken(): Promise<string | undefined> {
+export async function refreshSupabaseAccessToken(failedToken?: string): Promise<string | undefined> {
   const sb = getSupabaseClient();
   if (!sb) return undefined;
+
+  // Cross-tab recovery: if another tab already rotated and stored a fresh token, use it immediately
+  if (failedToken) {
+    try {
+      const { data } = await sb.auth.getSession();
+      const latest = data.session;
+      if (latest?.access_token && latest.access_token !== failedToken && !isSessionNearExpiry(latest.expires_at, 30)) {
+        return latest.access_token;
+      }
+    } catch {
+      /* continue to refreshSession */
+    }
+  }
 
   if (!inFlightRefresh) {
     inFlightRefresh = (async () => {
       try {
         const { data, error } = await sb.auth.refreshSession();
-        if (error) return undefined;
-        return data.session?.access_token;
+        if (!error && data.session?.access_token) {
+          return data.session.access_token;
+        }
+        // If refresh failed due to a concurrent cross-tab rotation, wait briefly and re-read storage once
+        await new Promise((r) => setTimeout(r, 150));
+        const { data: retryData } = await sb.auth.getSession();
+        if (
+          retryData.session?.access_token &&
+          retryData.session.access_token !== failedToken &&
+          !isSessionNearExpiry(retryData.session.expires_at, 0)
+        ) {
+          return retryData.session.access_token;
+        }
+        return undefined;
       } catch {
         return undefined;
       } finally {
@@ -136,7 +168,15 @@ export async function refreshSupabaseAccessToken(): Promise<string | undefined> 
 }
 
 /**
- * Returns the active Supabase access token.
+ * Ensures the active Supabase session is fresh (proactively refreshing if expired or within 2 minutes of expiry).
+ * Safe to call on tab focus, visibilitychange, and network reconnect.
+ */
+export async function ensureFreshSupabaseSession(): Promise<string | undefined> {
+  return getActiveSupabaseAccessToken();
+}
+
+/**
+ * Returns the active Supabase access token, proactively refreshing if near or past expiry.
  */
 export async function getActiveSupabaseAccessToken(): Promise<string | undefined> {
   const sb = getSupabaseClient();
@@ -144,13 +184,24 @@ export async function getActiveSupabaseAccessToken(): Promise<string | undefined
 
   try {
     const { data } = await sb.auth.getSession();
-    return data.session?.access_token;
+    const session = data.session;
+    if (!session?.access_token) return undefined;
+
+    if (isSessionNearExpiry(session.expires_at)) {
+      const refreshed = await refreshSupabaseAccessToken(session.access_token);
+      if (refreshed) return refreshed;
+    }
+    return session.access_token;
   } catch {
     return undefined;
   }
 }
 
-function normalizeSessionJsonClockSkew(raw: string | null, isWrite: boolean): string | null {
+export function normalizeSessionJsonClockSkew(
+  raw: string | null,
+  isWrite: boolean,
+  previousRaw?: string | null,
+): string | null {
   if (!raw) return raw;
   try {
     const parsed = JSON.parse(raw);
@@ -163,13 +214,29 @@ function normalizeSessionJsonClockSkew(raw: string | null, isWrite: boolean): st
       const nowSec = Math.round(Date.now() / 1000);
       const expiresIn = typeof parsed.expires_in === 'number' && parsed.expires_in > 0 ? parsed.expires_in : 3600;
       if (isWrite) {
-        // On write (fresh sign-in or token refresh), anchor expires_at to browser clock + expires_in
-        parsed.expires_at = nowSec + expiresIn;
+        // Anchor expires_at to browser clock + expires_in ONLY when a genuinely new access_token is written
+        // (sign-in or refresh). Never extend an already-stored token's expiry on re-writes.
+        let prevAccessToken: string | undefined;
+        let prevExpiresAt: number | undefined;
+        if (previousRaw) {
+          try {
+            const prev = JSON.parse(previousRaw);
+            prevAccessToken = prev?.access_token;
+            prevExpiresAt = typeof prev?.expires_at === 'number' ? prev.expires_at : undefined;
+          } catch {
+            /* ignore */
+          }
+        }
+        if (prevAccessToken && prevAccessToken === parsed.access_token && prevExpiresAt !== undefined) {
+          parsed.expires_at = prevExpiresAt;
+        } else {
+          parsed.expires_at = nowSec + expiresIn;
+        }
         return JSON.stringify(parsed);
       }
-      // On read, if local PC clock is skewed more than 10 minutes ahead of stored server expires_at,
-      // re-anchor so GoTrueClient does not treat a valid session as expired on every read.
-      if (parsed.expires_at < nowSec - 600 || parsed.expires_at > nowSec + expiresIn * 2) {
+      // On read: NEVER rewrite an expired expires_at into the future (that would sabotage GoTrueClient autoRefreshToken!).
+      // Only clamp obviously corrupt far-future timestamps (> 2x expires_in ahead of browser clock).
+      if (parsed.expires_at > nowSec + expiresIn * 2) {
         parsed.expires_at = nowSec + expiresIn;
         return JSON.stringify(parsed);
       }
@@ -180,7 +247,7 @@ function normalizeSessionJsonClockSkew(raw: string | null, isWrite: boolean): st
   return raw;
 }
 
-const clockSkewSafeStorage = {
+export const clockSkewSafeStorage = {
   getItem(key: string): string | null {
     if (typeof localStorage === 'undefined') return null;
     try {
@@ -200,8 +267,9 @@ const clockSkewSafeStorage = {
   setItem(key: string, value: string): void {
     if (typeof localStorage === 'undefined') return;
     try {
+      const prevRaw = /^sb-.*-auth-token$/.test(key) ? localStorage.getItem(key) : null;
       const toStore = /^sb-.*-auth-token$/.test(key)
-        ? (normalizeSessionJsonClockSkew(value, true) ?? value)
+        ? (normalizeSessionJsonClockSkew(value, true, prevRaw) ?? value)
         : value;
       localStorage.setItem(key, toStore);
     } catch {
