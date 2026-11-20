@@ -342,8 +342,27 @@
   */
 
   html {
-    font-size: var(--font-size);
+    font-size: 15px;
     font-family: var(--font-family);
+  }
+
+  /* Optimize 100% browser zoom density on standard 1024px-1440px laptops */
+  @media (min-width: 1024px) and (max-width: 1440px) {
+    html {
+      font-size: 14px;
+    }
+  }
+
+  @media (min-width: 1441px) and (max-width: 1680px) {
+    html {
+      font-size: 15px;
+    }
+  }
+
+  @media (min-width: 1681px) {
+    html {
+      font-size: var(--font-size);
+    }
   }
 
   h1 {

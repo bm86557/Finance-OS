@@ -183,7 +183,9 @@ export function AIAssistantChat() {
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={{ opacity: 0, y: 20, scale: 0.95 }}
           className={`fixed z-50 shadow-2xl border border-primary/15 overflow-hidden flex flex-col ${
-            isMinimized ? 'bottom-6 right-6 w-80 h-auto' : 'bottom-6 right-6 w-[500px] h-[700px]'
+            isMinimized
+              ? 'bottom-3 right-3 sm:bottom-6 sm:right-6 w-[calc(100vw-1.5rem)] sm:w-80 h-auto'
+              : 'bottom-3 right-3 sm:bottom-6 sm:right-6 w-[calc(100vw-1.5rem)] sm:w-[440px] lg:w-[500px] h-[min(680px,calc(100vh-3rem))]'
           }`}
           style={{
             background: '#121826',

@@ -316,7 +316,7 @@ export function OrganizationLayout({ children, currentView, onViewChange }: Orga
         {/* Sidebar */}
         <div
           className={cn(
-            `w-64 xl:w-72 ${theme === 'dark' ? 'bg-slate-900/50' : 'bg-white/70'} backdrop-blur-xl border-r ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} flex flex-col shrink-0 relative`,
+            `w-64 lg:w-60 2xl:w-64 ${theme === 'dark' ? 'bg-slate-900/50' : 'bg-white/70'} backdrop-blur-xl border-r ${theme === 'dark' ? 'border-cyan-500/20' : 'border-cyan-400/30'} flex flex-col shrink-0 relative`,
             'fixed z-50 top-[4.75rem] sm:top-20 bottom-0 left-0 lg:static lg:z-0 lg:top-auto lg:bottom-auto transition-transform duration-200 ease-out',
             mobileNavOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
           )}

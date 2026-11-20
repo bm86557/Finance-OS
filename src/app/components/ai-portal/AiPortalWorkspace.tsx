@@ -242,7 +242,7 @@ export function AiPortalWorkspace() {
 
   return (
     <AiPortalLayout currentView={currentView} onViewChange={handleViewChange}>
-      <div className="p-8 space-y-8 max-w-7xl mx-auto">
+      <div className="p-3 sm:p-5 lg:p-6 space-y-6 sm:space-y-8 max-w-7xl mx-auto">
         {/* Top Control Header */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
@@ -655,8 +655,8 @@ export function AiPortalWorkspace() {
               </p>
             </div>
 
-            <div className="rounded-xl border border-pink-500/20 overflow-hidden bg-slate-900/40 backdrop-blur-xl">
-              <table className="w-full text-left text-sm font-mono">
+            <div className="rounded-xl border border-pink-500/20 overflow-x-auto bg-slate-900/40 backdrop-blur-xl">
+              <table className="w-full min-w-[800px] text-left text-sm font-mono">
                 <thead className="bg-slate-950/70 border-b border-pink-500/20 text-slate-400 text-xs">
                   <tr>
                     <th className="py-3 px-4">Organization</th>
@@ -997,11 +997,11 @@ export function AiPortalWorkspace() {
                       {node.name}
                     </CardTitle>
                     <CardDescription className="font-mono text-xs text-slate-400 space-y-0.5">
-                      <div>Model: <span className="text-pink-300">{node.modelName}</span></div>
+                      <span className="block">Model: <span className="text-pink-300">{node.modelName}</span></span>
                       {node.baseUrl && (
-                        <div className="truncate text-[10px] text-slate-500" title={node.baseUrl}>
+                        <span className="block truncate text-[10px] text-slate-500" title={node.baseUrl}>
                           Endpoint: {node.baseUrl}
-                        </div>
+                        </span>
                       )}
                     </CardDescription>
                   </CardHeader>

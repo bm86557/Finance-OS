@@ -173,7 +173,7 @@ export function AdvancedFilter() {
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
-              className="absolute right-0 top-12 w-[500px] bg-slate-900 border border-white/10 rounded-xl shadow-2xl z-50"
+              className="absolute right-0 top-12 w-[min(500px,calc(100vw-2rem))] max-h-[80vh] overflow-y-auto bg-slate-900 border border-white/10 rounded-xl shadow-2xl z-50"
             >
               <Card className="bg-slate-900 border-0">
                 <CardContent className="p-0">
