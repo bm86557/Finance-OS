@@ -603,17 +603,28 @@ export const detectTransactionType = (
   return amount > 0 ? 'credit' : 'debit';
 };
 
-// Duplicate detection using fuzzy matching (null-safe on existing ledger rows)
+// Duplicate detection using 1-to-1 consumed matching (prevents destroying two legitimate same-day purchases)
 export const findDuplicates = (
   newTransactions: ImportedTransaction[],
-  existingTransactions: any[] | null | undefined
+  existingTransactions: any[] | null | undefined,
+  bankAccountId?: string,
 ): string[] => {
   const duplicateIds: string[] = [];
   const ledger = Array.isArray(existingTransactions) ? existingTransactions : [];
+  const consumedExistingIds = new Set<string>();
 
   for (const newTxn of newTransactions) {
     for (const existingTxn of ledger) {
       if (!existingTxn) continue;
+      const exId = String(existingTxn.id ?? '');
+      if (exId && consumedExistingIds.has(exId)) continue;
+      if (bankAccountId && existingTxn.bankAccountId && existingTxn.bankAccountId !== bankAccountId) {
+        continue;
+      }
+      const exStatus = String(existingTxn.status || '').toLowerCase();
+      if (exStatus === 'reversed' || exStatus === 'cancelled' || exStatus === 'rejected') {
+        continue;
+      }
 
       const exDate = existingTxn.date;
       const exAmt = existingTxn.amount;
@@ -644,6 +655,7 @@ export const findDuplicates = (
         (narration1.includes(narration2) || narration2.includes(narration1));
 
       if (daysDiff <= 2 && amountMatch && narrationSimilar) {
+        if (exId) consumedExistingIds.add(exId);
         duplicateIds.push(newTxn.id);
         newTxn.isDuplicate = true;
         newTxn.duplicateMatchId = existingTxn.id;

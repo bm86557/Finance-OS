@@ -83,10 +83,10 @@ export function AiPortalWorkspace() {
 
   const handleToggleCircuit = async (provider: string, action: 'trip_circuit' | 'reset_circuit') => {
     try {
-      setActionMessage(`Updating circuit for ${provider}...`);
+      setActionMessage(`Updating status for ${provider}...`);
       await platformAiService.toggleGatewayProvider(provider, action);
       await loadData(true);
-      setActionMessage(`Provider ${provider} ${action === 'trip_circuit' ? 'circuit tripped (failover active)' : 'circuit reset to normal'}.`);
+      setActionMessage(`${provider} ${action === 'trip_circuit' ? 'is now paused — requests will use the next backup AI' : 'is turned back on and ready to use'}.`);
       setTimeout(() => setActionMessage(null), 4000);
     } catch (e: any) {
       setActionMessage(`Error: ${e.message}`);
@@ -95,10 +95,10 @@ export function AiPortalWorkspace() {
 
   const handleSetPrimary = async (modelName: string) => {
     try {
-      setActionMessage(`Switching primary gateway model to ${modelName}...`);
+      setActionMessage(`Setting ${modelName} as your Main AI...`);
       await platformAiService.setPrimaryModel(modelName);
       await loadData(true);
-      setActionMessage(`Primary model successfully switched to ${modelName}.`);
+      setActionMessage(`${modelName} is now your Main AI.`);
       setTimeout(() => setActionMessage(null), 4000);
     } catch (e: any) {
       setActionMessage(`Error: ${e.message}`);
@@ -118,7 +118,7 @@ export function AiPortalWorkspace() {
           latencyMs: res.data.latencyMs,
           model: res.data.model || modelName || 'gemini-flash-lite-latest',
         });
-        setActionMessage(`Gateway ping succeeded: ${res.data.latencyMs}ms round-trip to ${res.data.model || 'Gemini'}. Verified Free Tier Active.`);
+        setActionMessage(`Main AI is working! Responded in ${res.data.latencyMs}ms (${res.data.model || 'Gemini'}).`);
         await loadData(true);
       } else {
         setPingResult({
@@ -126,7 +126,7 @@ export function AiPortalWorkspace() {
           latencyMs: 0,
           model: modelName || 'gemini-flash-lite-latest',
         });
-        setActionMessage(`Gateway ping warning: ${res.error || 'Connection timed out'}.`);
+        setActionMessage(`Main AI test failed: ${res.error || 'Connection timed out'}.`);
       }
       setTimeout(() => setActionMessage(null), 6000);
     } catch (e: any) {
@@ -166,15 +166,15 @@ export function AiPortalWorkspace() {
 
   const handleDeleteProvider = async (id: string | undefined, name: string) => {
     if (!id) return;
-    if (!confirm(`Are you sure you want to remove "${name}" from the gateway failover cascade?`)) {
+    if (!confirm(`Remove "${name}" from your AI backup list?`)) {
       return;
     }
     try {
-      setActionMessage(`Removing ${name} from cascade...`);
+      setActionMessage(`Removing ${name}...`);
       const res = await platformAiService.deleteGatewayProvider(id);
       if (res.success) {
         await loadData(true);
-        setActionMessage(`Provider ${name} removed from cascade.`);
+        setActionMessage(`${name} removed from your AI backup list.`);
       } else {
         setActionMessage(`Failed to remove: ${res.error}`);
       }
@@ -190,10 +190,10 @@ export function AiPortalWorkspace() {
     try {
       const res = await platformAiService.testGatewayNode(targetId);
       if (res.success && res.data?.success) {
-        setActionMessage(`Node "${node.name}" connected! Latency: ${res.data.latencyMs}ms`);
+        setActionMessage(`"${node.name}" is working! Response time: ${res.data.latencyMs}ms`);
         await loadData(true);
       } else {
-        setActionMessage(`Node "${node.name}" test failed: ${res.data?.error || res.error || 'Connection failed'}`);
+        setActionMessage(`"${node.name}" test failed: ${res.data?.error || res.error || 'Connection failed'}`);
       }
     } catch (err: any) {
       setActionMessage(`Test failed: ${err.message}`);
@@ -821,7 +821,7 @@ export function AiPortalWorkspace() {
               <div className="flex items-center gap-3">
                 <Zap className="size-5 text-pink-400 animate-pulse shrink-0" />
                 <span>
-                  Universal Gateway Active: Primary model is <strong className="text-white">{stats?.activeModel || 'gemini-flash-lite-latest'}</strong>. SaaS failover automatically steps down on 429 rate limit or upstream 5xx outages.
+                  Smart AI Backup Active: Currently using <strong className="text-white">{stats?.activeModel || 'gemini-flash-lite-latest'}</strong> as your main AI. If it gets busy or goes down, the system automatically switches to your backup models in order.
                 </span>
               </div>
               <div className="flex items-center gap-2">
@@ -835,12 +835,12 @@ export function AiPortalWorkspace() {
                   {pinging ? (
                     <>
                       <Loader2 className="size-3 animate-spin mr-1.5" />
-                      Pinging...
+                      Testing...
                     </>
                   ) : (
                     <>
                       <Activity className="size-3 mr-1.5" />
-                      Test Primary Node
+                      Test Main AI
                     </>
                   )}
                 </Button>
@@ -850,7 +850,7 @@ export function AiPortalWorkspace() {
                   className="bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white text-xs font-mono font-semibold"
                 >
                   <Plus className="size-3.5 mr-1" />
-                  Add LLM Provider
+                  Add AI Model
                 </Button>
               </div>
             </div>
@@ -860,10 +860,10 @@ export function AiPortalWorkspace() {
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-xs font-mono text-slate-300 font-semibold">
                   <Radio className="size-4 text-pink-400 animate-pulse" />
-                  <span>ACTIVE FAILOVER CASCADE RADAR (WHOLE SAAS)</span>
+                  <span>AI BACKUP ORDER (AUTOMATIC SWITCHING)</span>
                 </div>
                 <span className="text-[10px] font-mono text-slate-500">
-                  {gatewayNodes.length} providers in failover chain (§18, §20)
+                  {gatewayNodes.length} AI models in backup chain
                 </span>
               </div>
               <div className="flex items-center gap-2 overflow-x-auto pb-1">
@@ -887,22 +887,22 @@ export function AiPortalWorkspace() {
                             : 'bg-cyan-400'
                         }`}
                       />
-                      <span className="text-[10px] font-bold text-pink-400">P{node.priority}</span>
+                      <span className="text-[10px] font-bold text-pink-400">#{node.priority}</span>
                       <span className="font-medium text-white">{node.name}</span>
                       <span className="text-[10px] text-slate-400 truncate max-w-[120px]">
                         ({node.modelName})
                       </span>
                       {node.circuitOpen ? (
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-red-500/30 text-red-300 font-bold">
-                          TRIPPED
+                          PAUSED (ERROR)
                         </span>
                       ) : node.priority === 1 ? (
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
-                          PRIMARY
+                          MAIN AI
                         </span>
                       ) : (
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
-                          STANDBY
+                          BACKUP READY
                         </span>
                       )}
                     </div>
@@ -929,29 +929,31 @@ export function AiPortalWorkspace() {
                 >
                   <CardHeader>
                     <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="text-xs px-2 py-0.5 rounded font-mono bg-pink-500/10 text-pink-300 border border-pink-500/20 font-bold">
-                          P{node.priority} {node.priority === 1 ? '(PRIMARY)' : '(FAILOVER)'}
+                          #{node.priority} {node.priority === 1 ? 'Main AI' : 'Backup'}
                         </span>
-                        {/* Priority Reordering Buttons */}
-                        <div className="flex items-center bg-slate-950/60 rounded border border-slate-800">
+                        {/* Order Reordering Buttons */}
+                        <div className="flex items-center bg-slate-950/60 rounded border border-slate-800 divide-x divide-slate-800">
                           <button
                             type="button"
                             onClick={() => handleMovePriority(index, 'up')}
                             disabled={index === 0}
-                            className="p-1 text-slate-400 hover:text-white disabled:opacity-30 disabled:hover:text-slate-400 transition-colors"
-                            title="Move priority up"
+                            className="px-1.5 py-0.5 text-[10px] text-slate-300 hover:text-white disabled:opacity-30 disabled:hover:text-slate-300 transition-colors flex items-center gap-0.5"
+                            title="Move earlier (higher priority)"
                           >
                             <ChevronUp className="size-3" />
+                            <span>Up</span>
                           </button>
                           <button
                             type="button"
                             onClick={() => handleMovePriority(index, 'down')}
                             disabled={index === gatewayNodes.length - 1}
-                            className="p-1 text-slate-400 hover:text-white disabled:opacity-30 disabled:hover:text-slate-400 transition-colors"
-                            title="Move priority down"
+                            className="px-1.5 py-0.5 text-[10px] text-slate-300 hover:text-white disabled:opacity-30 disabled:hover:text-slate-300 transition-colors flex items-center gap-0.5"
+                            title="Move later (lower priority)"
                           >
                             <ChevronDown className="size-3" />
+                            <span>Down</span>
                           </button>
                         </div>
                       </div>
@@ -968,14 +970,20 @@ export function AiPortalWorkspace() {
                               : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                           }`}
                         >
-                          {node.circuitOpen ? 'TRIPPED' : node.status.toUpperCase().replace('_', ' ')}
+                          {node.circuitOpen
+                            ? 'PAUSED (ERROR)'
+                            : node.status === 'online'
+                            ? 'ACTIVE'
+                            : node.status === 'not_configured'
+                            ? 'NEEDS API KEY'
+                            : 'BACKUP READY'}
                         </span>
                         {/* Edit Button */}
                         <button
                           type="button"
                           onClick={() => handleEditProvider(node)}
                           className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-800 transition-colors ml-1"
-                          title="Edit Provider Node"
+                          title="Edit AI Model Settings"
                         >
                           <Pencil className="size-3.5" />
                         </button>
@@ -985,7 +993,7 @@ export function AiPortalWorkspace() {
                             type="button"
                             onClick={() => handleDeleteProvider(node.id, node.name)}
                             className="p-1 text-slate-400 hover:text-red-400 rounded hover:bg-red-950/40 transition-colors"
-                            title="Remove from Cascade"
+                            title="Remove Backup AI"
                           >
                             <Trash2 className="size-3.5" />
                           </button>
@@ -1037,7 +1045,7 @@ export function AiPortalWorkspace() {
                         </span>
                       </div>
                       <div className="flex justify-between items-center text-slate-400">
-                        <span>Billing Tier:</span>
+                        <span>Plan Type:</span>
                         <span className={`text-[10px] px-2 py-0.5 rounded font-mono font-bold border ${
                           (node.detectedTier || (node.billingTier === 'paid' ? 'paid' : node.provider === 'gemini' ? 'free' : 'paid')) === 'free'
                             ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
@@ -1045,40 +1053,40 @@ export function AiPortalWorkspace() {
                         }`}>
                           {node.detectedBadge ||
                             (node.billingTier === 'free'
-                              ? 'FREE TIER · Manual ($0 Billed)'
+                              ? 'FREE PLAN ($0 Billed)'
                               : node.billingTier === 'paid'
-                              ? 'PAID TIER · Manual (Commercial)'
+                              ? 'PAID PLAN'
                               : node.provider === 'gemini'
-                              ? 'FREE TIER · Auto-Detected'
-                              : 'PAID TIER · Auto-Detected')}
+                              ? 'FREE PLAN (Auto-Detected)'
+                              : 'PAID PLAN (Auto-Detected)')}
                         </span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Rate Limits:</span>
+                        <span>Speed Limit:</span>
                         <span className="text-slate-300">
-                          {node.rateLimitRpm || 60} RPM · {((node.rateLimitTpm || 1000000) / 1000).toLocaleString()}k TPM
+                          {node.rateLimitRpm || 60} req/min · {((node.rateLimitTpm || 1000000) / 1000).toLocaleString()}k tok/min
                         </span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Latency:</span>
-                        <span className="text-white">{node.latencyMs ? `${node.latencyMs}ms` : '—'}</span>
+                        <span>Response Speed:</span>
+                        <span className="text-white">{node.latencyMs ? `${node.latencyMs}ms` : 'Not tested yet'}</span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Success Rate:</span>
+                        <span>Reliability:</span>
                         <span className="text-emerald-400">{node.callCount > 0 ? `${node.successRate ?? 100}%` : '100%'}</span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Rate (1M In / Out):</span>
+                        <span>Price (per 1M tokens):</span>
                         <span className="text-white">${node.costPer1MInput} / ${node.costPer1MOutput}</span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Invocations / Tokens:</span>
+                        <span>Total Usage:</span>
                         <span className="text-pink-300">
-                          {node.callCount} calls · {(node.tokensUsed ?? 0).toLocaleString()} tok
+                          {node.callCount} requests · {(node.tokensUsed ?? 0).toLocaleString()} tok
                         </span>
                       </div>
                       <div className="flex justify-between text-slate-400">
-                        <span>Billed / Commercial:</span>
+                        <span>Estimated Cost:</span>
                         <span className="text-emerald-400">
                           ${(node.actualCostUsd ?? 0).toFixed(4)}{' '}
                           <span className="text-slate-500">/ ${(node.commercialCostUsd ?? 0).toFixed(4)}</span>
@@ -1098,12 +1106,12 @@ export function AiPortalWorkspace() {
                         {testingNodeId === (node.id || node.modelName) ? (
                           <>
                             <Loader2 className="size-3 animate-spin mr-1.5" />
-                            Testing Node...
+                            Testing...
                           </>
                         ) : (
                           <>
                             <Activity className="size-3 mr-1.5 text-cyan-400" />
-                            Test Node Live
+                            Test Connection
                           </>
                         )}
                       </Button>
@@ -1113,7 +1121,7 @@ export function AiPortalWorkspace() {
                           onClick={() => handleSetPrimary(node.modelName)}
                           className="w-full bg-pink-950/60 hover:bg-pink-900 text-pink-200 border border-pink-500/30 font-mono text-xs"
                         >
-                          Make Primary Model
+                          Set as Main AI
                         </Button>
                       )}
 
@@ -1122,14 +1130,15 @@ export function AiPortalWorkspace() {
                           onClick={() => handleToggleCircuit(node.modelName, 'reset_circuit')}
                           className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-mono text-xs font-semibold"
                         >
-                          Reset Circuit & Re-enable
+                          Turn Back On (Reset)
                         </Button>
                       ) : (
                         <Button
                           onClick={() => handleToggleCircuit(node.modelName, 'trip_circuit')}
+                          title="Temporarily pause this AI to test switching to the next backup"
                           className="w-full bg-slate-800 hover:bg-red-950 text-slate-300 hover:text-red-300 border border-slate-700 font-mono text-xs"
                         >
-                          Simulate Failover Trip
+                          Pause &amp; Test Backup
                         </Button>
                       )}
                     </div>

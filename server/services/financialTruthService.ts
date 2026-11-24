@@ -971,6 +971,7 @@ export function computeUpcomingObligations(params: {
   allOrgBanks: Record<string, any>[];
   bankWorldMap: Map<string, 'business' | 'personal'>;
   recurringRows: Record<string, any>[];
+  recurringOccurrenceRows?: Record<string, any>[];
   loanRows: Record<string, any>[];
   loanPaymentRows?: Record<string, any>[];
   memberRows: Record<string, any>[];
@@ -987,6 +988,7 @@ export function computeUpcomingObligations(params: {
     allOrgBanks,
     bankWorldMap,
     recurringRows,
+    recurringOccurrenceRows = [],
     loanRows,
     loanPaymentRows = [],
     memberRows,
@@ -1012,6 +1014,21 @@ export function computeUpcomingObligations(params: {
   const overdueExpenses: UpcomingItem[] = [];
 
   const allBankIds = new Set((allOrgBanks || []).map((b) => String(b.id)));
+
+  // Index already-settled/skipped recurring occurrences so they never re-appear as overdue/upcoming
+  const settledRecurringOccurrences = new Set<string>();
+  for (const occ of recurringOccurrenceRows || []) {
+    const st = String(occ.status || '').toLowerCase().trim();
+    if (st === 'posted' || st === 'skipped') {
+      if (occ.template_id && occ.scheduled_date) {
+        const dIso = toIsoDateUtc(occ.scheduled_date);
+        if (dIso) settledRecurringOccurrences.add(`${String(occ.template_id)}:${dIso}`);
+      }
+      if (occ.template_id && occ.scheduled_period_key) {
+        settledRecurringOccurrences.add(`${String(occ.template_id)}:${String(occ.scheduled_period_key)}`);
+      }
+    }
+  }
 
   // ── 1. Recurring Transactions ────────────────────────────────────────────
   for (const rec of recurringRows || []) {
@@ -1049,7 +1066,9 @@ export function computeUpcomingObligations(params: {
 
     const origCurr = String(rec.currency || baseCurr).toUpperCase().trim();
     const convAmt = round2(convertCurrency(rawAmt, origCurr, baseCurr));
-    const direction: 'credit' | 'debit' = rec.type === 'credit' ? 'credit' : 'debit';
+    const recTypeNorm = String(rec.type || '').toLowerCase().trim();
+    const direction: 'credit' | 'debit' =
+      recTypeNorm === 'credit' || recTypeNorm === 'income' ? 'credit' : 'debit';
     const freq = String(rec.frequency || 'monthly').toLowerCase().trim();
     const title = String(rec.description || 'Recurring Transaction').trim() || 'Recurring Transaction';
 
@@ -1059,18 +1078,43 @@ export function computeUpcomingObligations(params: {
         : 120;
 
     let curIso = nextIso;
-    let runIndex = 0;
+    let emittedRuns = 0;
+    let safetySteps = 0;
     let overdueEmitted = false;
 
-    while (curIso <= horizonEndStr && runIndex < maxRemainingRuns && runIndex < 120) {
+    while (curIso <= horizonEndStr && emittedRuns < maxRemainingRuns && safetySteps < 120) {
+      safetySteps++;
       if (endDateIso && curIso > endDateIso) break;
 
-      if (curIso < todayStr) {
-        // Emit the overdue occurrence once (matches recurring_generate_due semantics)
-        if (!overdueEmitted) {
-          overdueEmitted = true;
+      const isAlreadySettled = settledRecurringOccurrences.has(`${String(rec.id)}:${curIso}`);
+      if (!isAlreadySettled) {
+        if (curIso < todayStr) {
+          // Emit the overdue occurrence once (matches recurring_generate_due semantics)
+          if (!overdueEmitted) {
+            overdueEmitted = true;
+            emittedRuns++;
+            const item: UpcomingItem = {
+              id: `rec-overdue-${rec.id}-${curIso}`,
+              date: formatDisplayDateUtc(curIso),
+              isoDate: curIso,
+              title,
+              amount: convAmt,
+              rawAmount: round2(rawAmt),
+              currency: baseCurr,
+              originalCurrency: origCurr,
+              type: direction,
+              sourceType: 'recurring',
+              sourceId: String(rec.id),
+              isOverdue: true,
+              daysOverdue: diffDaysUtc(curIso, todayStr),
+            };
+            if (direction === 'credit') overduePayments.push(item);
+            else overdueExpenses.push(item);
+          }
+        } else {
+          emittedRuns++;
           const item: UpcomingItem = {
-            id: `rec-overdue-${rec.id}-${curIso}`,
+            id: `rec-${rec.id}-${curIso}`,
             date: formatDisplayDateUtc(curIso),
             isoDate: curIso,
             title,
@@ -1081,32 +1125,13 @@ export function computeUpcomingObligations(params: {
             type: direction,
             sourceType: 'recurring',
             sourceId: String(rec.id),
-            isOverdue: true,
-            daysOverdue: diffDaysUtc(curIso, todayStr),
+            isOverdue: false,
           };
-          if (direction === 'credit') overduePayments.push(item);
-          else overdueExpenses.push(item);
+          if (direction === 'credit') upcomingPayments.push(item);
+          else upcomingExpenses.push(item);
         }
-      } else {
-        const item: UpcomingItem = {
-          id: `rec-${rec.id}-${curIso}`,
-          date: formatDisplayDateUtc(curIso),
-          isoDate: curIso,
-          title,
-          amount: convAmt,
-          rawAmount: round2(rawAmt),
-          currency: baseCurr,
-          originalCurrency: origCurr,
-          type: direction,
-          sourceType: 'recurring',
-          sourceId: String(rec.id),
-          isOverdue: false,
-        };
-        if (direction === 'credit') upcomingPayments.push(item);
-        else upcomingExpenses.push(item);
       }
 
-      runIndex++;
       const nextStep = advanceIsoByFrequency(curIso, freq);
       if (nextStep <= curIso) break; // safety guard
       curIso = nextStep;
@@ -1132,7 +1157,6 @@ export function computeUpcomingObligations(params: {
       if (!Number.isFinite(remaining) || remaining <= 0) continue;
 
       const declaredInst = Number(loan.installment_amount ?? 0);
-      if (!Number.isFinite(declaredInst) || declaredInst <= 0) continue;
 
       // Require a valid date — never fabricate an undated "Upcoming" row
       let nextIso = toIsoDateUtc(loan.next_payment_date || loan.due_date);
@@ -1152,9 +1176,13 @@ export function computeUpcomingObligations(params: {
 
       if (nextIso > horizonEndStr) continue;
 
-      // Cap final installment to remaining balance + accrued interest
+      // Cap final installment to remaining balance + accrued interest; fall back to full remaining obligation for bullet loans
       const accruedInterest = Math.max(0, Number(loan.accrued_interest || 0));
-      const effectiveInst = Math.min(declaredInst, remaining + accruedInterest);
+      const totalRemainingObligation = remaining + accruedInterest;
+      const effectiveInst =
+        Number.isFinite(declaredInst) && declaredInst > 0
+          ? Math.min(declaredInst, totalRemainingObligation)
+          : totalRemainingObligation;
       if (effectiveInst <= 0) continue;
 
       const origCurr = String(loan.currency || baseCurr).toUpperCase().trim();
@@ -1238,7 +1266,7 @@ export function computeUpcomingObligations(params: {
   // ── 4. Remaining Unpaid Team Payroll (§5, §20, §29 X-07, §33 #1/#3/#11) ──
   let remainingMonthlyPayroll = 0;
   if (worldFilter !== 'personal' && includePayrollConfidential) {
-    const hasRecurringPayrollInWindow = upcomingExpenses.some(
+    const hasRecurringPayrollInWindow = [...upcomingExpenses, ...overdueExpenses].some(
       (e) => e.sourceType === 'recurring' && /\b(payroll|salaries|team\s+payroll)\b/i.test(e.title),
     );
 
@@ -1358,7 +1386,8 @@ export function computeUpcomingObligations(params: {
       const origCurr = String(exp.currency || baseCurr).toUpperCase().trim();
       const convAmt = round2(convertCurrency(rawAmt, origCurr, baseCurr));
       const expDateIso = toIsoDateUtc(exp.date);
-      const dueIso = expDateIso && expDateIso > todayStr && expDateIso <= horizonEndStr ? expDateIso : todayStr;
+      if (expDateIso && expDateIso > horizonEndStr) continue;
+      const dueIso = expDateIso && expDateIso > todayStr ? expDateIso : todayStr;
 
       upcomingExpenses.push({
         id: `reimb-${exp.id}`,

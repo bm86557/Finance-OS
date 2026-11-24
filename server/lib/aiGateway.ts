@@ -2167,8 +2167,17 @@ async function callOpenAiCompatibleJSONDirect<T>(params: {
 
   const resJson: any = await response.json();
   const rawText = resJson.choices?.[0]?.message?.content || '{}';
-  const cleaned = rawText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
-  const parsed = JSON.parse(cleaned) as T;
+  // Strip <think>...</think> reasoning blocks emitted by Qwen3 / DeepSeek models before JSON parsing
+  const withoutThink = rawText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const cleaned = withoutThink.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  let parsed: T;
+  try {
+    parsed = JSON.parse(cleaned) as T;
+  } catch {
+    const jsonMatch = cleaned.match(/(\{[\s\S]*\}|\[[\s\S]*\])/);
+    if (!jsonMatch) throw new Error(`Invalid JSON response from ${model}: ${cleaned.slice(0, 120)}`);
+    parsed = JSON.parse(jsonMatch[1]) as T;
+  }
 
   const promptTokens = resJson.usage?.prompt_tokens || Math.ceil(prompt.length / 4);
   const completionTokens = resJson.usage?.completion_tokens || Math.ceil(cleaned.length / 4);

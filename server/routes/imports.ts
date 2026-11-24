@@ -10,6 +10,26 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { postTransactionToJournal } from '../lib/ledgerService.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { recomputeServerBankBalance } from './transactions.js';
+import { requirePermission } from '../middleware/auth.js';
+
+async function isImportDateInLockedPeriod(sb: any, orgId: string, dates: string[]): Promise<string | null> {
+  if (!sb || !orgId || dates.length === 0) return null;
+  try {
+    const { data: periods } = await sb
+      .from('accounting_periods')
+      .select('start_date, end_date, status')
+      .eq('organization_id', orgId)
+      .in('status', ['soft_closed', 'locked']);
+    if (!Array.isArray(periods) || periods.length === 0) return null;
+    for (const d of dates) {
+      const hit = periods.find((p: any) => d >= String(p.start_date) && d <= String(p.end_date));
+      if (hit) return d;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 import { detectAndIssuePayslipsForTransactions } from '../lib/aiPayrollDetector.js';
 import {
   classifyTransaction,
@@ -139,7 +159,7 @@ export function createImportsRouter(): Router {
   const r = Router({ mergeParams: true });
 
   // Check for duplicate transactions before import
-  r.post('/check-duplicates', async (req: Request, res: Response) => {
+  r.post('/check-duplicates', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
     const { bankAccountId, rows } = req.body as { bankAccountId: string; rows: ImportedRow[] };
 
@@ -170,7 +190,7 @@ export function createImportsRouter(): Router {
     }
   });
 
-  r.post('/commit-parsed', async (req: Request, res: Response) => {
+  r.post('/commit-parsed', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
     
     const {
@@ -192,7 +212,7 @@ export function createImportsRouter(): Router {
     }
 
     const safeName = fileName.slice(0, 80) || 'statement.csv';
-    const detectedFileType = fileType || (safeName.toLowerCase().endsWith('.pdf') ? 'pdf' : 'csv');
+    const detectedFileType = fileType || (safeName.toLowerCase().endsWith('.pdf') ? 'pdf' : (safeName.toLowerCase().endsWith('.xlsx') || safeName.toLowerCase().endsWith('.xls')) ? 'xlsx' : 'csv');
 
     if (rows.length === 0) {
       return fail(res, 400, 'No rows to import');
@@ -202,6 +222,20 @@ export function createImportsRouter(): Router {
       const sb = getSupabaseAdminClient();
       if (!sb) {
         return fail(res, 500, 'Supabase not configured');
+      }
+
+      // Locked accounting period check (§8, §33 #5)
+      const nonSkippedDates = Array.from(
+        new Set(
+          rows
+            .filter(r => !(skipDuplicates && r.isDuplicate))
+            .map(r => String(r.date || '').slice(0, 10))
+            .filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)),
+        ),
+      );
+      const lockedDate = await isImportDateInLockedPeriod(sb, orgId, nonSkippedDates);
+      if (lockedDate) {
+        return fail(res, 409, `PERIOD_CLOSED: Cannot import transactions into locked or soft-closed accounting period (${lockedDate}).`);
       }
 
       // Enforce Plan Statements, Storage & Transactions Quotas (§32)
@@ -906,6 +940,8 @@ export function createImportsRouter(): Router {
           .is('journal_entry_id', null);
 
         if (batchRows && batchRows.length > 0) {
+          let glPostedCount = 0;
+          const glErrors: string[] = [];
           for (const txn of batchRows) {
             const narr = (txn.narration || txn.description || '').toLowerCase();
             const isAtm = /\b(atm|cash wdl|cash withdrawal|atm w\/d)\b/i.test(narr);
@@ -923,21 +959,32 @@ export function createImportsRouter(): Router {
 
             // Post classified transactions to General Ledger (§10, idempotent via ledgerService)
             if (txn.status === 'classified' || txn.category_id) {
-              void postTransactionToJournal(sb, {
-                id: txn.id,
-                organization_id: orgId,
-                bank_account_id: txn.bank_account_id,
-                category_id: txn.category_id,
-                department_id: txn.department_id,
-                project_id: txn.project_id,
-                date: txn.date,
-                amount: txn.amount,
-                base_amount: txn.base_amount ?? txn.amount,
-                currency: txn.currency,
-                type: txn.type,
-                description: txn.description || txn.narration,
-                world_scope: txn.world_scope || 'business',
-              }, (req as any).authUser?.id);
+              try {
+                await postTransactionToJournal(sb, {
+                  id: txn.id,
+                  organization_id: orgId,
+                  bank_account_id: txn.bank_account_id,
+                  category_id: txn.category_id,
+                  department_id: txn.department_id,
+                  project_id: txn.project_id,
+                  date: txn.date,
+                  amount: txn.amount,
+                  base_amount: txn.base_amount ?? txn.amount,
+                  currency: txn.currency,
+                  type: txn.type,
+                  description: txn.description || txn.narration,
+                  world_scope: txn.world_scope || 'business',
+                }, (req as any).authUser?.id);
+                glPostedCount++;
+              } catch (glErr: any) {
+                glErrors.push(`${txn.id}: ${glErr?.message || 'Journal post failed'}`);
+              }
+            }
+          }
+          if (data && typeof data === 'object') {
+            data.glPostedCount = glPostedCount;
+            if (glErrors.length > 0) {
+              data.glErrors = glErrors;
             }
           }
 
@@ -1124,7 +1171,7 @@ export function createImportsRouter(): Router {
     }
   });
 
-  r.delete('/history/:id', async (req: Request, res: Response) => {
+  r.delete('/history/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id ?? '');
     
@@ -1165,11 +1212,155 @@ export function createImportsRouter(): Router {
         await sb.storage.from(STATEMENTS_BUCKET).remove([filePath]);
       }
 
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'delete_import_history',
+        entityType: 'import_batch',
+        entityId: id,
+        description: `Deleted import history record ${(existing as HistoryRow | null)?.file_name || id}`,
+      }).catch(() => {});
+
       ok(res, null, 'Statement record deleted');
     } catch (err: any) {
       console.error('Error deleting import history:', err);
       return fail(res, 500, err.message || 'Failed to delete import record');
     }
+  });
+
+  // ── Versioned Org-Scoped Import Mapping Templates (§7 L287, §10 L428, L470) ──
+  r.get('/templates', async (req: Request, res: Response) => {
+    const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 500, 'Supabase not configured');
+
+    const { data, error } = await sb
+      .from('import_templates')
+      .select('*')
+      .eq('organization_id', orgId)
+      .eq('is_active', true)
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      if (error.message?.includes('does not exist') || error.code === '42P01') {
+        return ok(res, []);
+      }
+      return fail(res, 500, error.message);
+    }
+    ok(res, data || []);
+  });
+
+  r.post('/templates', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
+    const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 500, 'Supabase not configured');
+
+    const { name, institution, fileType = 'csv', columnMapping } = req.body as {
+      name?: string;
+      institution?: string;
+      fileType?: string;
+      columnMapping?: Record<string, unknown>;
+    };
+    if (!name?.trim() || !columnMapping || typeof columnMapping !== 'object') {
+      return fail(res, 400, 'name and columnMapping are required');
+    }
+
+    const templateId = `imptpl-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const actor = req.authUser?.id || null;
+    const { data: tpl, error } = await sb
+      .from('import_templates')
+      .insert({
+        id: templateId,
+        organization_id: orgId,
+        name: name.trim(),
+        institution: institution?.trim() || null,
+        file_type: fileType,
+        current_version: 1,
+        column_mapping: columnMapping,
+        is_active: true,
+        created_by: actor,
+      })
+      .select()
+      .single();
+
+    if (error) return fail(res, 500, error.message);
+
+    await sb.from('import_template_versions').insert({
+      id: `${templateId}-v1`,
+      template_id: templateId,
+      organization_id: orgId,
+      version: 1,
+      column_mapping: columnMapping,
+      created_by: actor,
+    });
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'create_import_template',
+      entityType: 'import_template',
+      entityId: templateId,
+      description: `Created import mapping template "${name.trim()}" (v1)`,
+      afterState: tpl,
+    }).catch(() => {});
+
+    ok(res, tpl, 'Import template created');
+  });
+
+  r.patch('/templates/:templateId', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
+    const orgId = Array.isArray(req.params.organizationId) ? req.params.organizationId[0] : (req.params.organizationId ?? '');
+    const templateId = Array.isArray(req.params.templateId) ? req.params.templateId[0] : (req.params.templateId ?? '');
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 500, 'Supabase not configured');
+
+    const { data: existing, error: fetchErr } = await sb
+      .from('import_templates')
+      .select('*')
+      .eq('id', templateId)
+      .eq('organization_id', orgId)
+      .maybeSingle();
+
+    if (fetchErr) return fail(res, 500, fetchErr.message);
+    if (!existing) return fail(res, 404, 'Import template not found');
+
+    const nextVersion = Number(existing.current_version || 1) + 1;
+    const nextMapping = req.body?.columnMapping || existing.column_mapping;
+    const actor = req.authUser?.id || null;
+
+    const { data: updated, error: updErr } = await sb
+      .from('import_templates')
+      .update({
+        ...(req.body?.name ? { name: String(req.body.name).trim() } : {}),
+        ...(req.body?.institution !== undefined ? { institution: req.body.institution } : {}),
+        column_mapping: nextMapping,
+        current_version: nextVersion,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', templateId)
+      .eq('organization_id', orgId)
+      .select()
+      .single();
+
+    if (updErr) return fail(res, 500, updErr.message);
+
+    await sb.from('import_template_versions').insert({
+      id: `${templateId}-v${nextVersion}`,
+      template_id: templateId,
+      organization_id: orgId,
+      version: nextVersion,
+      column_mapping: nextMapping,
+      created_by: actor,
+    });
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'version_import_template',
+      entityType: 'import_template',
+      entityId: templateId,
+      description: `Created import template "${updated.name}" v${nextVersion}`,
+      beforeState: existing,
+      afterState: updated,
+    }).catch(() => {});
+
+    ok(res, updated, `Updated import template to v${nextVersion}`);
   });
 
   return r;

@@ -20,6 +20,26 @@ import { postTransactionToJournal } from '../lib/ledgerService.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { getEstimatedFxRate } from '../lib/fxConverter.js';
 import { filterAccessibleBanks, type WorldFilter } from '../services/financialTruthService.js';
+import { requirePermission } from '../middleware/auth.js';
+
+async function isPersonalWorldEnabled(sb: any, orgId: string): Promise<boolean> {
+  if (!sb || !orgId) return true;
+  try {
+    const { data: orgRow } = await sb
+      .from('organizations')
+      .select('personal_world_enabled, settings')
+      .eq('id', orgId)
+      .maybeSingle();
+    const enabled =
+      orgRow?.personal_world_enabled ??
+      orgRow?.settings?.personal_world_enabled ??
+      orgRow?.settings?.features?.personal_finance ??
+      true;
+    return enabled !== false;
+  } catch {
+    return true;
+  }
+}
 import {
   computeExpectedOccurrencesCount,
   computeMultiCurrencyRecurringTotals,
@@ -559,10 +579,13 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /suggestions/promote — Confirm a detected recurring candidate into a saved recurring template
-  r.post('/suggestions/promote', async (req: Request, res: Response) => {
+  r.post('/suggestions/promote', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient()!;
     const body = req.body || {};
+    if (body.worldScope === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization.');
+    }
 
     const description = String(body.suggestedTitle || body.description || '').trim();
     const amount = Math.abs(Number(body.suggestedAmount ?? body.amount ?? 0));
@@ -679,7 +702,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /occurrences/:occurrenceId/approve — Approve & post a pending recurring occurrence (§9, §16, §33 #3)
-  r.post('/occurrences/:occurrenceId/approve', async (req: Request, res: Response) => {
+  r.post('/occurrences/:occurrenceId/approve', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const occId = String(req.params.occurrenceId);
     const sb = getSupabaseAdminClient()!;
@@ -815,7 +838,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /occurrences/:occurrenceId/reject — Reject/skip a pending recurring occurrence (zero ledger impact)
-  r.post('/occurrences/:occurrenceId/reject', async (req: Request, res: Response) => {
+  r.post('/occurrences/:occurrenceId/reject', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const occId = String(req.params.occurrenceId);
     const reason = String(req.body?.reason || 'Skipped by reviewer').trim();
@@ -876,7 +899,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST / — create new recurring schedule
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<RecurringTransaction, 'id' | 'organizationId'>;
 
@@ -904,6 +927,9 @@ export function createRecurringRouter(): Router {
         .eq('organization_id', orgId)
         .maybeSingle();
       if (bankRow?.usage === 'personal') resolvedWorld = 'personal';
+    }
+    if (resolvedWorld === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization.');
     }
 
     const item: RecurringTransaction = {
@@ -945,7 +971,7 @@ export function createRecurringRouter(): Router {
   });
 
   // PATCH /:id — update existing recurring schedule
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
     const sb = getSupabaseAdminClient()!;
@@ -963,6 +989,9 @@ export function createRecurringRouter(): Router {
       ...mapDbToDomain(existing),
       ...(req.body as Partial<RecurringTransaction>),
     };
+    if (merged.worldScope === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization.');
+    }
 
     const dateErr = validateRecurringScheduleDates({
       startDate: merged.startDate,
@@ -1008,7 +1037,7 @@ export function createRecurringRouter(): Router {
   });
 
   // DELETE /:id — delete recurring schedule
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
     const sb = getSupabaseAdminClient()!;
@@ -1041,7 +1070,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /:id/toggle — toggle isActive status
-  r.post('/:id/toggle', async (req: Request, res: Response) => {
+  r.post('/:id/toggle', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
     const sb = getSupabaseAdminClient()!;
@@ -1079,7 +1108,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /generate — generate due occurrences up to asOfDate (Handoff v1.2 safe, idempotent, approval-aware, GL-posted)
-  r.post('/generate', async (req: Request, res: Response) => {
+  r.post('/generate', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const rawAsOf = req.body?.asOfDate;
     const asOfDate = normalizeIsoDate(rawAsOf) || new Date().toISOString().slice(0, 10);
@@ -1155,7 +1184,7 @@ export function createRecurringRouter(): Router {
   });
 
   // POST /:id/generate — generate single recurring occurrence (strictly validated + idempotent + GL-posted)
-  r.post('/:id/generate', async (req: Request, res: Response) => {
+  r.post('/:id/generate', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = String(req.params.id);
     const sb = getSupabaseAdminClient()!;

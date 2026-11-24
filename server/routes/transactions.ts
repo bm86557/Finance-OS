@@ -11,6 +11,26 @@ import { postTransactionToJournal, reverseTransactionJournal } from '../lib/ledg
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { detectAndIssuePayslipsForTransactions } from '../lib/aiPayrollDetector.js';
 import { isCurrencyEnabledGlobally } from './platformSettings.js';
+import { requirePermission } from '../middleware/auth.js';
+
+async function isPersonalWorldEnabledForOrg(sb: any, orgId: string): Promise<boolean> {
+  if (!sb || !orgId) return true;
+  try {
+    const { data: orgRow } = await sb
+      .from('organizations')
+      .select('personal_world_enabled, settings')
+      .eq('id', orgId)
+      .maybeSingle();
+    const enabled =
+      orgRow?.personal_world_enabled ??
+      orgRow?.settings?.personal_world_enabled ??
+      orgRow?.settings?.features?.personal_finance ??
+      true;
+    return enabled !== false;
+  } catch {
+    return true;
+  }
+}
 
 function parseTags(q: unknown): string[] | undefined {
   if (q == null) return undefined;
@@ -21,6 +41,15 @@ function parseTags(q: unknown): string[] | undefined {
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
   return Array.isArray(p) ? p[0] : (p ?? '');
+}
+
+function canAccessTransactionWorld(req: Request, row: { world_scope?: string | null; owner_user_id?: string | null } | null | undefined): boolean {
+  if (!row) return true;
+  if (req.orgMembership?.role === 'owner') return true;
+  if (row.world_scope === 'personal' && row.owner_user_id && row.owner_user_id !== req.authUser?.id) {
+    return false;
+  }
+  return true;
 }
 
 async function isPeriodLocked(sb: any, orgId: string, date: string): Promise<boolean> {
@@ -281,7 +310,7 @@ export function createTransactionsRouter(): Router {
       try {
         const { data: orgRow } = await sb.from('organizations').select('currency').eq('id', orgId).maybeSingle();
         if (orgRow?.currency) orgCurrency = orgRow.currency;
-      } catch {}
+      } catch { }
 
       let q = sb.from('transactions').select('*').eq('organization_id', orgId);
       if (dateFrom) q = q.gte('date', dateFrom);
@@ -293,7 +322,10 @@ export function createTransactionsRouter(): Router {
     }
 
     const nonEligibleStatuses = new Set(['draft', 'pending', 'rejected', 'reversed', 'cancelled']);
+    const isOwner = req.orgMembership?.role === 'owner';
+    const callerId = req.authUser?.id;
     const eligibleTxns = txns.filter(t => {
+      if (!isOwner && t.worldScope === 'personal' && t.ownerUserId && t.ownerUserId !== callerId) return false;
       const st = String(t.status || 'classified').toLowerCase();
       if (nonEligibleStatuses.has(st)) return false;
       const isTransfer = (t as any).isTransfer || (t as any).is_transfer || (t.tags || []).includes('transfer') || (t.tags || []).includes('pending-transfer');
@@ -331,7 +363,7 @@ export function createTransactionsRouter(): Router {
     });
   });
 
-  r.post('/bulk-categorize', async (req: Request, res: Response) => {
+  r.post('/bulk-categorize', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const { ids, categoryId, classifiedBy = 'user' } = req.body as {
       ids: string[]; categoryId: string; classifiedBy?: string;
@@ -350,12 +382,12 @@ export function createTransactionsRouter(): Router {
       const now = new Date().toISOString();
       const { data: existingRows } = await sb
         .from('transactions')
-        .select('id, status')
+        .select('id, status, world_scope, owner_user_id')
         .in('id', ids)
         .eq('organization_id', orgId);
 
       const modifiableIds = (existingRows || [])
-        .filter((r: any) => !['posted', 'reconciled'].includes(r.status))
+        .filter((r: any) => !['posted', 'reconciled'].includes(r.status) && canAccessTransactionWorld(req, r))
         .map((r: any) => r.id);
 
       skippedPosted = ids.length - modifiableIds.length;
@@ -448,6 +480,14 @@ export function createTransactionsRouter(): Router {
 
         let mappedItems = (data || []).map(mapDbToDomainTransaction);
 
+        // Handoff §5 #5: Personal-world records are isolated to owner/creator unless caller is org owner
+        if (req.orgMembership?.role !== 'owner') {
+          const callerId = req.authUser?.id;
+          mappedItems = mappedItems.filter(
+            t => !(t.worldScope === 'personal' && t.ownerUserId && t.ownerUserId !== callerId),
+          );
+        }
+
         if (q.search) {
           const s = q.search.toLowerCase();
           mappedItems = mappedItems.filter(t =>
@@ -487,6 +527,9 @@ export function createTransactionsRouter(): Router {
         .eq('organization_id', orgId)
         .maybeSingle();
       if (!error && data) {
+        if (!canAccessTransactionWorld(req, data)) {
+          return fail(res, 403, 'Access denied to another member\'s personal transaction');
+        }
         return ok(res, mapDbToDomainTransaction(data));
       }
     }
@@ -497,13 +540,38 @@ export function createTransactionsRouter(): Router {
     return notFound(res, 'Transaction');
   });
 
-  r.post('/bulk', async (req: Request, res: Response) => {
+  r.post('/bulk', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body as { lines?: Array<Omit<Transaction, 'id' | 'organizationId' | 'createdAt'>>; transactions?: Array<Omit<Transaction, 'id' | 'organizationId' | 'createdAt'>> };
     const rawList = body.transactions || body.lines;
 
     if (!Array.isArray(rawList) || rawList.length === 0) {
       return fail(res, 400, 'Transactions array is required and must not be empty');
+    }
+
+    const sb = getSupabaseAdminClient();
+    if (sb) {
+      const { checkOrgQuota } = await import('../services/planEntitlementService.js');
+      const txQuota = await checkOrgQuota(sb, orgId, 'transactions', rawList.length);
+      if (!txQuota.allowed) {
+        return fail(res, 403, txQuota.reason || 'Monthly transaction quota reached for your current plan.');
+      }
+
+      // Check personal world policy if any line targets personal world (§5 #4)
+      const hasPersonal = rawList.some(
+        d => d.worldScope === 'personal' || (Array.isArray(d.tags) && d.tags.includes('personal')),
+      );
+      if (hasPersonal && !(await isPersonalWorldEnabledForOrg(sb, orgId))) {
+        return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization in Org Settings.');
+      }
+
+      // Check accounting period locks for all distinct dates (§8, §33 #5)
+      const distinctDates = Array.from(new Set(rawList.map(d => String(d.date || '').slice(0, 10)).filter(Boolean)));
+      for (const dt of distinctDates) {
+        if (await isPeriodLocked(sb, orgId, dt)) {
+          return fail(res, 400, `PERIOD_CLOSED: Cannot create transactions in a locked or soft-closed accounting period (${dt}).`);
+        }
+      }
     }
 
     const inserted: Transaction[] = [];
@@ -539,6 +607,8 @@ export function createTransactionsRouter(): Router {
         status: resolvedStatus as Transaction['status'],
         tags: Array.isArray(data.tags) ? data.tags : ['quick-add', 'bulk'],
         attachments: Array.isArray(data.attachments) ? data.attachments : [],
+        createdBy: req.authUser?.id || data.createdBy,
+        ownerUserId: req.authUser?.id || data.ownerUserId,
         createdAt: new Date().toISOString(),
         ...(resolvedStatus === 'classified' && data.categoryId ? {
           classifiedAt: data.classifiedAt || new Date().toISOString(),
@@ -550,10 +620,9 @@ export function createTransactionsRouter(): Router {
     });
 
     // Sync to Supabase if connected
-    const sb = getSupabaseAdminClient();
     if (sb && inserted.length > 0) {
       try {
-        const dbRows = inserted.map(t => mapDomainToDbTransaction(t));
+        const dbRows = inserted.map(t => mapDomainToDbTransaction(t, req.authUser?.id));
         const { error: sbError } = await sb.from('transactions').upsert(dbRows, { onConflict: 'id' });
         if (sbError) {
           console.warn('[transactions.bulk] Supabase upsert error, attempting fallback without department/project:', sbError);
@@ -564,6 +633,27 @@ export function createTransactionsRouter(): Router {
             return copy;
           });
           await sb.from('transactions').upsert(strippedRows, { onConflict: 'id' });
+        }
+
+        // Post balanced double-entry journals for classified/posted rows (§8, §33)
+        for (const t of inserted) {
+          if (t.status === ('posted' as any) || t.status === 'classified') {
+            void postTransactionToJournal(sb, {
+              id: t.id,
+              organization_id: orgId,
+              bank_account_id: t.bankAccountId,
+              category_id: t.categoryId,
+              department_id: t.departmentId,
+              project_id: t.projectId,
+              date: t.date,
+              amount: t.amount,
+              base_amount: (t as any).baseAmount ?? t.amount,
+              currency: t.currency,
+              type: t.type,
+              description: t.description || t.narration,
+              world_scope: (t as any).worldScope || 'business',
+            }, req.authUser?.id);
+          }
         }
       } catch (err) {
         console.error('[transactions.bulk] Supabase sync error:', err);
@@ -577,6 +667,14 @@ export function createTransactionsRouter(): Router {
     }
     void recomputeBudgetsIfSupabase(orgId);
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'bulk_create_transactions',
+      entityType: 'transaction',
+      description: `Bulk created ${inserted.length} transactions (${errors.length} failed)`,
+      metadata: { count: inserted.length, failed: errors.length },
+    }).catch(() => { });
+
     ok(res, {
       inserted: inserted.length,
       failed: errors.length,
@@ -585,7 +683,7 @@ export function createTransactionsRouter(): Router {
     });
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Transaction, 'id' | 'organizationId' | 'createdAt'> & { idempotencyKey?: string };
 
@@ -616,6 +714,19 @@ export function createTransactionsRouter(): Router {
     }
 
     const sb = getSupabaseAdminClient();
+
+    // True Idempotency Check (§9, §17 L860, §33 #7): Return existing transaction on replay without double-posting
+    if (sb && idempotencyKey) {
+      const { data: existingIdem } = await sb
+        .from('transactions')
+        .select('*')
+        .eq('organization_id', orgId)
+        .eq('idempotency_key', idempotencyKey)
+        .maybeSingle();
+      if (existingIdem) {
+        return ok(res, mapDbToDomainTransaction(existingIdem), 'Transaction already recorded (idempotent replay)');
+      }
+    }
 
     // Enforce Plan Transactions Quota (§32)
     if (sb) {
@@ -702,6 +813,8 @@ export function createTransactionsRouter(): Router {
       amount: amt,
       counterpartyId: resolvedCounterpartyId || data.counterpartyId,
       status: resolvedStatus as Transaction['status'],
+      createdBy: req.authUser?.id || data.createdBy,
+      ownerUserId: req.authUser?.id || data.ownerUserId,
       createdAt: new Date().toISOString(),
       ...(idempotencyKey ? { idempotencyKey } as any : {}),
       ...(resolvedStatus === 'classified' && data.categoryId ? {
@@ -765,7 +878,7 @@ export function createTransactionsRouter(): Router {
   });
 
   // ── First-Class Two-Legged Transfers (§1, §8, §23 F-01) ─────────────────
-  r.post('/transfers', async (req: Request, res: Response) => {
+  r.post('/transfers', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const {
       fromBankAccountId,
@@ -789,6 +902,23 @@ export function createTransactionsRouter(): Router {
     }
 
     const sb = getSupabaseAdminClient();
+    if (sb) {
+      // Period lock guard (§8, §33 #5)
+      if (date && (await isPeriodLocked(sb, orgId, date))) {
+        return fail(res, 400, `PERIOD_CLOSED: Cannot post transfer to locked accounting period (${date}).`);
+      }
+      // Verify both bank accounts belong to this organization (§5, §33 #11)
+      const { data: orgBanks } = await sb
+        .from('bank_accounts')
+        .select('id')
+        .eq('organization_id', orgId)
+        .in('id', [fromBankAccountId, toBankAccountId]);
+      const foundIds = new Set((orgBanks || []).map((b: any) => String(b.id)));
+      if (!foundIds.has(fromBankAccountId) || !foundIds.has(toBankAccountId)) {
+        return fail(res, 404, 'Source or destination bank account not found in this organization');
+      }
+    }
+
     const transferGroupId = `trf-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const effectiveConvertedAmount = Number(convertedAmount || numAmount * fxRate);
     const targetCurrency = toCurrency || currency;
@@ -855,6 +985,35 @@ export function createTransactionsRouter(): Router {
           status: 'posted',
           created_by: req.authUser?.id || null,
         });
+
+        // Post balanced Asset-clearing journals for both transfer legs (§8, §23 F-01)
+        await postTransactionToJournal(sb, {
+          id: outflowTxn.id,
+          organization_id: orgId,
+          bank_account_id: fromBankAccountId,
+          date,
+          amount: numAmount,
+          base_amount: numAmount,
+          currency,
+          type: 'debit',
+          description: outflowTxn.description,
+          isTransfer: true,
+          tags: outflowTxn.tags,
+        } as any, req.authUser?.id);
+
+        await postTransactionToJournal(sb, {
+          id: inflowTxn.id,
+          organization_id: orgId,
+          bank_account_id: toBankAccountId,
+          date,
+          amount: effectiveConvertedAmount,
+          base_amount: effectiveConvertedAmount,
+          currency: targetCurrency,
+          type: 'credit',
+          description: inflowTxn.description,
+          isTransfer: true,
+          tags: inflowTxn.tags,
+        } as any, req.authUser?.id);
       } catch (err) {
         console.warn('[transactions.transfers] Supabase transfer insert warning:', err);
       }
@@ -881,7 +1040,7 @@ export function createTransactionsRouter(): Router {
   });
 
   // ── Post / Approve Transaction to General Ledger (§7, §8, §33) ─────────
-  r.post('/:id/post', async (req: Request, res: Response) => {
+  r.post('/:id/post', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const txnId = req.params.id;
     const sb = getSupabaseAdminClient();
@@ -941,7 +1100,7 @@ export function createTransactionsRouter(): Router {
   });
 
   // ── Immutable Reversal of Transaction (§7, §8, §33) ─────────────────────
-  r.post('/:id/reverse', async (req: Request, res: Response) => {
+  r.post('/:id/reverse', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const txnId = req.params.id;
     const { reason = 'Transaction reversed by user' } = req.body;
@@ -980,7 +1139,7 @@ export function createTransactionsRouter(): Router {
     ok(res, { id: txnId, status: 'reversed', reason }, 'Transaction reversed successfully');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const updates = req.body as Partial<Transaction>;
 
@@ -998,6 +1157,9 @@ export function createTransactionsRouter(): Router {
       }
       if (!existing) {
         return notFound(res, 'Transaction');
+      }
+      if (!canAccessTransactionWorld(req, existing)) {
+        return fail(res, 403, 'Access denied to another member\'s personal transaction');
       }
 
       const isFinancialMutation = updates.amount !== undefined ||
@@ -1092,6 +1254,14 @@ export function createTransactionsRouter(): Router {
           void recomputeServerBankBalance(orgId, domain.bankAccountId);
         }
         void recomputeBudgetsIfSupabase(orgId);
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'update_transaction',
+          entityType: 'transaction',
+          entityId: String(req.params.id),
+          description: `Updated transaction ${domain.id}`,
+          afterState: data,
+        }).catch(() => { });
         return ok(res, domain, 'Transaction updated');
       }
     }
@@ -1101,7 +1271,7 @@ export function createTransactionsRouter(): Router {
     notFound(res, 'Transaction');
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     let bankAccountId: string | undefined;
@@ -1111,12 +1281,15 @@ export function createTransactionsRouter(): Router {
     if (sb) {
       const { data: existing } = await sb
         .from('transactions')
-        .select('bank_account_id, status')
+        .select('bank_account_id, status, world_scope, owner_user_id')
         .eq('id', req.params.id)
         .eq('organization_id', orgId)
         .maybeSingle();
 
       if (existing) {
+        if (!canAccessTransactionWorld(req, existing)) {
+          return fail(res, 403, 'Access denied to another member\'s personal transaction');
+        }
         if (['posted', 'reconciled'].includes(existing.status)) {
           return fail(res, 400, 'Cannot delete a posted or reconciled transaction. Use POST /api/transactions/:id/reverse instead.');
         }
@@ -1133,6 +1306,14 @@ export function createTransactionsRouter(): Router {
     if (bankAccountId) {
       void recomputeServerBankBalance(orgId, bankAccountId);
     }
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'delete_transaction',
+      entityType: 'transaction',
+      entityId: String(req.params.id),
+      description: `Deleted draft/pending transaction ${req.params.id}`,
+    }).catch(() => { });
 
     ok(res, null, 'Transaction deleted');
   });

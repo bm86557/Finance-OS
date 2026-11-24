@@ -5,7 +5,7 @@ import { useService, useServiceArray } from '@/hooks/useService';
 import { formatCurrency, formatDate } from '@/lib/formatters';
 import { useTheme } from '@/contexts/ThemeContext';
 import { AXIOM } from '@/styles/axiom-tokens';
-import { apiPostJson } from '@/lib/apiClient';
+import { apiGet, apiPostJson } from '@/lib/apiClient';
 import {
   Upload,
   FileText,
@@ -128,6 +128,11 @@ export function EnhancedStatementImport({
   const [filterDuplicates, setFilterDuplicates] = useState(false); // Changed to false so duplicates show by default
   const [searchQuery, setSearchQuery] = useState('');
   const [lastImportedCount, setLastImportedCount] = useState(0);
+  const [savedTemplates, setSavedTemplates] = useState<Array<{ id: string; name: string; current_version?: number; column_mapping: ColumnMapping }>>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState('');
+  const [templateNameInput, setTemplateNameInput] = useState('');
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [commitSummary, setCommitSummary] = useState<{ glPostedCount?: number; glErrors?: string[] } | null>(null);
   const [reviewMode, setReviewMode] = useState<'tiers' | 'step' | 'list'>('tiers');
   const [reviewStepIndex, setReviewStepIndex] = useState(0);
 
@@ -148,6 +153,56 @@ export function EnhancedStatementImport({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const svc = useOrgServices();
+
+  useEffect(() => {
+    if (!svc.orgId) return;
+    let active = true;
+    void apiGet<Array<{ id: string; name: string; current_version?: number; column_mapping: ColumnMapping }>>(
+      `/organizations/${svc.orgId}/imports/templates`,
+    ).then((res) => {
+      if (active && res.success && Array.isArray(res.data)) {
+        setSavedTemplates(res.data);
+      }
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [svc.orgId]);
+
+  const handleApplyTemplate = (templateId: string) => {
+    setSelectedTemplateId(templateId);
+    const tpl = savedTemplates.find((t) => t.id === templateId);
+    if (tpl?.column_mapping) {
+      setColumnMapping(tpl.column_mapping);
+      toast.success(`Applied mapping template "${tpl.name}" (v${tpl.current_version ?? 1})`);
+    }
+  };
+
+  const handleSaveMappingTemplate = async () => {
+    if (!svc.orgId || !templateNameInput.trim()) {
+      toast.error('Enter a template name first');
+      return;
+    }
+    setSavingTemplate(true);
+    try {
+      const res = await apiPostJson<
+        { name: string; fileType: string; columnMapping: ColumnMapping },
+        { id: string; name: string; current_version?: number; column_mapping: ColumnMapping }
+      >(`/organizations/${svc.orgId}/imports/templates`, {
+        name: templateNameInput.trim(),
+        fileType: selectedFile?.name.toLowerCase().endsWith('.xlsx') || selectedFile?.name.toLowerCase().endsWith('.xls') ? 'xlsx' : 'csv',
+        columnMapping,
+      });
+      if (res.success && res.data) {
+        setSavedTemplates((prev) => [res.data, ...prev]);
+        setSelectedTemplateId(res.data.id);
+        setTemplateNameInput('');
+        toast.success(`Saved mapping template "${res.data.name}"`);
+      } else {
+        toast.error(res.error || 'Failed to save template');
+      }
+    } finally {
+      setSavingTemplate(false);
+    }
+  };
 
   // Bank accounts for account selector
   const { data: bankAccounts } = useServiceArray(
@@ -204,8 +259,9 @@ export function EnhancedStatementImport({
     const name = file.name.toLowerCase();
     const isCsv = name.endsWith('.csv');
     const isPdf = name.endsWith('.pdf');
-    if (!isCsv && !isPdf) {
-      toast.error('Please use a CSV or PDF bank statement');
+    const isExcel = name.endsWith('.xlsx') || name.endsWith('.xls');
+    if (!isCsv && !isPdf && !isExcel) {
+      toast.error('Please use a CSV, Excel (.xlsx/.xls), or PDF bank statement');
       return;
     }
 
@@ -215,7 +271,26 @@ export function EnhancedStatementImport({
     try {
       let data: string[][];
 
-      if (isPdf) {
+      if (isExcel) {
+        const XLSX = await import('xlsx');
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array' });
+        const firstSheet = wb.SheetNames[0];
+        if (!firstSheet) {
+          toast.error('This Excel workbook has no sheets.');
+          setProcessing(false);
+          return;
+        }
+        const sheetRows = XLSX.utils.sheet_to_json<any[]>(wb.Sheets[firstSheet], { header: 1, raw: false, defval: '' });
+        data = (sheetRows || [])
+          .map((row) => (Array.isArray(row) ? row.map((c) => String(c ?? '').trim()) : []))
+          .filter((row) => row.some((c) => c.length > 0));
+        if (!data.length) {
+          toast.error('This Excel sheet looks empty.');
+          setProcessing(false);
+          return;
+        }
+      } else if (isPdf) {
         data = await parsePdfFileToGrid(file);
         if (!data.length || data.length < 2) {
           let stats = { lineCount: 0, charCount: 0 };
@@ -285,10 +360,10 @@ export function EnhancedStatementImport({
       const file = files[0];
 
       const n = file?.name.toLowerCase() ?? '';
-      if (file && (n.endsWith('.csv') || n.endsWith('.pdf'))) {
+      if (file && (n.endsWith('.csv') || n.endsWith('.pdf') || n.endsWith('.xlsx') || n.endsWith('.xls'))) {
         await handleFileSelected(file);
       } else {
-        toast.error('Please upload a CSV or PDF file');
+        toast.error('Please upload a CSV, Excel, or PDF file');
       }
     },
     [handleFileSelected]
@@ -345,8 +420,8 @@ export function EnhancedStatementImport({
       // Process CSV data
       const transactions = processCSVData(csvData, columnMapping, csvHeaders);
 
-      // Detect duplicates (ledger rows may omit fields — handled in importUtils)
-      findDuplicates(transactions, existingTransactions);
+      // Detect duplicates (1-to-1 consumed matching scoped to selectedAccount)
+      findDuplicates(transactions, existingTransactions, selectedAccount);
 
       // Try to classify with AI (don't fail import if this fails)
       try {
@@ -516,7 +591,7 @@ export function EnhancedStatementImport({
       selectedFile.name,  // fileName
       rowsToCommit,  // rows
 {
-      skipDuplicates: false,
+      skipDuplicates: true,
       autoClassify: true,
       fileSize: selectedFile.size,
       fileContent,
@@ -544,7 +619,7 @@ export function EnhancedStatementImport({
             selectedFile.name,
             rowsToCommit,
             {
-              skipDuplicates: false,
+              skipDuplicates: true,
               autoClassify: true,
               fileSize: selectedFile.size,
               fileContent,
@@ -568,11 +643,20 @@ export function EnhancedStatementImport({
       return;
     }
 
+    const resData = res.data as any;
     setLastImportedCount(res.data.imported);
+    setCommitSummary({
+      glPostedCount: resData?.glPostedCount,
+      glErrors: Array.isArray(resData?.glErrors) ? resData.glErrors : undefined,
+    });
     setCurrentStep('complete');
     await refetchTransactions();
     await refetchHistory();
-    toast.success(res.message || 'Import completed and saved to Supabase database');
+    if (Array.isArray(resData?.glErrors) && resData.glErrors.length > 0) {
+      toast.warning(`Imported, but ${resData.glErrors.length} ledger journal post(s) reported an error.`);
+    } else {
+      toast.success(res.message || 'Import completed and saved to Supabase database');
+    }
   };
 
   const triggerDownload = (href: string, fileName: string) => {
@@ -1371,7 +1455,7 @@ export function EnhancedStatementImport({
                   type="file"
                   id="file-upload"
                   className="sr-only"
-                  accept=".csv,.pdf,text/csv,application/pdf"
+                  accept=".csv,.xlsx,.xls,.pdf,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/pdf"
                   onChange={handleFileInputChange}
                 />
                 <div
@@ -1513,6 +1597,49 @@ export function EnhancedStatementImport({
                 field — works even when bank headers differ. Common layouts: Date, Description, Debit, Credit,
                 Balance.
               </p>
+
+              <div className="mb-4 p-3 rounded-xl border border-slate-700/60 bg-slate-900/40 flex flex-col sm:flex-row sm:items-center gap-3 justify-between">
+                <div className="flex items-center gap-2 flex-1">
+                  <BookmarkPlus className="size-4 text-cyan-400 shrink-0" />
+                  <select
+                    value={selectedTemplateId}
+                    onChange={(e) => handleApplyTemplate(e.target.value)}
+                    className="px-3 py-1.5 rounded-lg text-xs text-white focus:outline-none min-w-[200px]"
+                    style={{
+                      background: AXIOM.inputs.background,
+                      border: AXIOM.inputs.border,
+                    }}
+                  >
+                    <option value="">Load saved mapping template…</option>
+                    {savedTemplates.map((tpl) => (
+                      <option key={tpl.id} value={tpl.id}>
+                        {tpl.name} (v{tpl.current_version ?? 1})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={templateNameInput}
+                    onChange={(e) => setTemplateNameInput(e.target.value)}
+                    placeholder="Template name (e.g. Meezan CSV)"
+                    className="px-3 py-1.5 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-none"
+                    style={{
+                      background: AXIOM.inputs.background,
+                      border: AXIOM.inputs.border,
+                    }}
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveMappingTemplate}
+                    disabled={savingTemplate || !templateNameInput.trim()}
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 disabled:opacity-40"
+                  >
+                    {savingTemplate ? 'Saving…' : 'Save Template'}
+                  </button>
+                </div>
+              </div>
 
               <div className="mb-6 p-4 rounded-xl border border-slate-600/60 bg-slate-900/40">
                 <p className="text-sm font-medium text-slate-300 mb-3">How amounts appear in this file</p>
@@ -2890,9 +3017,19 @@ export function EnhancedStatementImport({
               <CheckCircle2 className="size-12 text-white" />
             </div>
             <h2 className="text-3xl font-bold text-white mb-2">Import Complete!</h2>
-            <p className="text-slate-400 mb-8">
+            <p className="text-slate-400 mb-4">
               Successfully imported {lastImportedCount} transaction{lastImportedCount === 1 ? '' : 's'}
             </p>
+            {commitSummary?.glPostedCount !== undefined && (
+              <p className="text-xs text-slate-400 mb-6">
+                Posted {commitSummary.glPostedCount} balanced journal entr{commitSummary.glPostedCount === 1 ? 'y' : 'ies'} to the General Ledger.
+                {commitSummary.glErrors && commitSummary.glErrors.length > 0 && (
+                  <span className="text-amber-400 block mt-1">
+                    {commitSummary.glErrors.length} journal post warning(s): {commitSummary.glErrors[0]}
+                  </span>
+                )}
+              </p>
+            )}
             <motion.button
               type="button"
               whileHover={{ scale: 1.05 }}
