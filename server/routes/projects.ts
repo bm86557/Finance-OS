@@ -19,6 +19,15 @@ import {
   isValidProjectTransaction,
   isDirectProjectDebit,
 } from '../../src/lib/projectTransactionFilter.js';
+import {
+  computeOrgProjectsProfitability,
+  type ComputedProjectProfitability,
+} from '../services/projectScheduleCostEngine.js';
+import {
+  countBusinessDaysInclusive,
+  todayYmdCalendar,
+  normalizeYmd,
+} from '../../src/lib/projectScheduleHours.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -29,191 +38,12 @@ function callerId(req: Request): string {
   return (req as any).user?.id || (req as any).userId || (req.headers['x-user-id'] as string) || '';
 }
 
-/**
- * §12.1 Loaded Labor Cost & Capacity Hourly Rate Engine
- * loadedLaborCost = baseSalary + employerTaxes (7.65% FICA) + benefits + bonus + overhead
- * capacityHours = hours_per_day * days_per_month (defaults to 160h)
- */
-function calculateMemberLoadedHourlyRate(member: any, deptRateMap: Map<string, number>, deptId?: string): number {
-  if (!member) {
-    return (deptId && deptRateMap.get(deptId)) || 50;
-  }
-  if (member.hourly_rate && Number(member.hourly_rate) > 0) {
-    return Number(member.hourly_rate);
-  }
-  const baseSalary = Number(member.fixed_salary || member.salary || 0);
-  if (baseSalary > 0) {
-    const hoursPerDay = Number(member.hours_per_day || 8);
-    const daysPerMonth = Number(member.working_days_per_month || 20);
-    const capacityHours = (hoursPerDay > 0 && daysPerMonth > 0) ? (hoursPerDay * daysPerMonth) : 160;
-    return capacityHours > 0 ? Math.round((baseSalary / capacityHours) * 100) / 100 : 50;
-  }
-  const memDeptId = String(member.department_id || member.departmentId || member.department || deptId || '');
-  return deptRateMap.get(memDeptId) || 50;
-}
-
-/**
- * §12.3 & §33.10 Multi-Driver Shared Overhead Allocation Engine
- * Supports 8 allocation drivers: headcount, revenue, direct_cost, square_footage,
- * time_utilization, department_ratio/manual_weight, custom, and balance lookup.
- * Uses Hamilton-Hare deterministic integer-cent allocation to conserve every cent of overhead.
- */
-interface DeptOverheadResult {
-  deptPools: Map<string, number>;
-  deptRatesPerHour: Map<string, number>;
-  deptRatesPerMinute: Map<string, number>;
-  deptCapacities: Map<string, number>;
-  deptHeadcounts: Map<string, number>;
-}
-
-function calculateMultiDriverDepartmentOverhead(
-  departments: any[],
-  allocations: any[],
-  activeMembers: any[],
-  transactions: any[],
-  timesheets: any[],
-  bankAccounts: any[] = []
-): DeptOverheadResult {
-  const numDepts = Math.max(1, (departments || []).length);
-  const deptHeadcounts = new Map<string, number>();
-  const deptDirectCosts = new Map<string, number>();
-  const deptRevenues = new Map<string, number>();
-  const deptBillableHours = new Map<string, number>();
-  const deptSquareFootage = new Map<string, number>();
-  const deptCustomWeights = new Map<string, number>();
-  const deptPools = new Map<string, number>();
-
-  for (const d of (departments || [])) {
-    const dId = String(d.id);
-    deptPools.set(dId, 0);
-    deptSquareFootage.set(dId, Number(d.square_footage || d.squareFootage || 0));
-    deptCustomWeights.set(dId, Number(d.custom_weight || d.customWeight || 1));
-    deptDirectCosts.set(dId, 0);
-    deptRevenues.set(dId, 0);
-    deptBillableHours.set(dId, 0);
-
-    const count = (activeMembers || []).filter((m: any) => {
-      const memDept = String(m.department_id || m.departmentId || m.department || '').toLowerCase();
-      const thisId = dId.toLowerCase();
-      const thisName = String(d.name || '').toLowerCase();
-      return memDept === thisId || (thisName.length >= 3 && memDept.includes(thisName));
-    }).length;
-    deptHeadcounts.set(dId, count);
-  }
-
-  // Aggregate departmental stats for drivers
-  for (const t of (transactions || [])) {
-    if (!t.department_id && !t.departmentId) continue;
-    const dId = String(t.department_id || t.departmentId);
-    if (!deptPools.has(dId)) continue;
-    const amt = Math.abs(Number(t.amount || 0));
-    if (t.type === 'credit') {
-      deptRevenues.set(dId, (deptRevenues.get(dId) || 0) + amt);
-    } else if (t.type === 'debit') {
-      deptDirectCosts.set(dId, (deptDirectCosts.get(dId) || 0) + amt);
-    }
-  }
-
-  for (const ts of (timesheets || [])) {
-    if (ts.status !== 'approved' || ts.billable === false) continue;
-    const uId = String(ts.user_id || ts.userId);
-    const mem = (activeMembers || []).find((m: any) => String(m.user_id || m.userId || m.id) === uId);
-    const dId = String(mem?.department_id || mem?.departmentId || mem?.department || '');
-    if (dId && deptBillableHours.has(dId)) {
-      deptBillableHours.set(dId, (deptBillableHours.get(dId) || 0) + Number(ts.hours || 0));
-    }
-  }
-
-  for (const alloc of (allocations || [])) {
-    let pool = Number(alloc.amount || alloc.allocated_amount || 0);
-    if (pool <= 0 && Array.isArray(alloc.account_ids || alloc.accountIds)) {
-      const accIds = alloc.account_ids || alloc.accountIds;
-      pool = accIds.reduce((sum: number, aId: string) => {
-        const acc = (bankAccounts || []).find((b: any) => String(b.id) === String(aId));
-        return sum + Math.abs(Number(acc?.balance || 0));
-      }, 0);
-    }
-    if (pool <= 0) continue;
-
-    const directDeptId = String(alloc.department_id || alloc.departmentId || '');
-    if (directDeptId && deptPools.has(directDeptId)) {
-      deptPools.set(directDeptId, (deptPools.get(directDeptId) || 0) + pool);
-      continue;
-    }
-
-    const base = String(alloc.allocation_base || alloc.allocation_driver || alloc.allocationBase || 'headcount').toLowerCase();
-    const driverEntries: Array<{ deptId: string; driverValue: number }> = [];
-    let totalDriverValue = 0;
-
-    for (const d of (departments || [])) {
-      const dId = String(d.id);
-      let val = 0;
-      if (base === 'headcount') {
-        val = deptHeadcounts.get(dId) || 0;
-      } else if (base === 'revenue') {
-        val = Math.max(0, deptRevenues.get(dId) || 0);
-      } else if (base === 'direct_cost') {
-        val = Math.max(0, deptDirectCosts.get(dId) || 0);
-      } else if (base === 'square_footage') {
-        val = Math.max(0, deptSquareFootage.get(dId) || 0);
-      } else if (base === 'time_utilization') {
-        val = Math.max(0, deptBillableHours.get(dId) || 0);
-      } else if (base === 'department_ratio' || base === 'manual_weight') {
-        val = Math.max(0, deptCustomWeights.get(dId) || 1);
-      } else if (base === 'custom') {
-        const customAlloc = (alloc.departments || []).find((x: any) => String(x.departmentId || x.department_id) === dId);
-        val = Math.max(0, Number(customAlloc?.percentage || customAlloc?.weight || 0));
-      } else {
-        val = 1;
-      }
-      driverEntries.push({ deptId: dId, driverValue: val });
-      totalDriverValue += val;
-    }
-
-    const effectiveTotalDriver = totalDriverValue > 0 ? totalDriverValue : numDepts;
-    const poolCents = Math.round(pool * 100);
-    let distributedCents = 0;
-
-    const intermediate = driverEntries.map(entry => {
-      const share = totalDriverValue > 0 ? entry.driverValue / effectiveTotalDriver : 1 / numDepts;
-      const exactCents = poolCents * share;
-      const floorCents = Math.floor(exactCents);
-      const remainder = exactCents - floorCents;
-      distributedCents += floorCents;
-      return { deptId: entry.deptId, share, cents: floorCents, remainder };
-    });
-
-    let leftoverCents = poolCents - distributedCents;
-    intermediate.sort((a, b) => b.remainder - a.remainder);
-    for (const item of intermediate) {
-      if (leftoverCents > 0) {
-        item.cents += 1;
-        leftoverCents -= 1;
-      }
-      const existing = deptPools.get(item.deptId) || 0;
-      deptPools.set(item.deptId, existing + (item.cents / 100));
-    }
-  }
-
-  const deptCapacities = new Map<string, number>();
-  const deptRatesPerHour = new Map<string, number>();
-  const deptRatesPerMinute = new Map<string, number>();
-
-  for (const d of (departments || [])) {
-    const dId = String(d.id);
-    const headcount = deptHeadcounts.get(dId) || 0;
-    const capacityHours = headcount > 0 ? headcount * 160 : 160;
-    const pool = deptPools.get(dId) || 0;
-    const ratePerHour = capacityHours > 0 ? pool / capacityHours : 0;
-    deptCapacities.set(dId, capacityHours);
-    deptRatesPerHour.set(dId, ratePerHour);
-    deptRatesPerMinute.set(dId, ratePerHour / 60);
-  }
-
-  return { deptPools, deptRatesPerHour, deptRatesPerMinute, deptCapacities, deptHeadcounts };
-}
-
 function mapDbToDomainProject(row: Record<string, any>): Project {
+  const rawAssignments = Array.isArray(row.member_assignments)
+    ? row.member_assignments
+    : (typeof row.member_assignments === 'string'
+      ? (() => { try { const p = JSON.parse(row.member_assignments); return Array.isArray(p) ? p : []; } catch { return []; } })()
+      : []);
   return {
     id: String(row.id),
     organizationId: String(row.organization_id),
@@ -224,12 +54,45 @@ function mapDbToDomainProject(row: Record<string, any>): Project {
     status: row.status as Project['status'],
     startDate: String(row.start_date ?? ''),
     endDate: row.end_date ? String(row.end_date) : undefined,
+    completedAt: row.completed_at ? String(row.completed_at).slice(0, 10) : undefined,
+    pausedAt: row.paused_at ? String(row.paused_at).slice(0, 10) : undefined,
+    pausedBusinessDays: Number(row.paused_business_days ?? 0),
+    plannedTeamSize: Number(row.planned_team_size ?? 1),
+    budgetedHours: row.budgeted_hours != null ? Number(row.budgeted_hours) : null,
+    hoursPerDay: Number(row.hours_per_day ?? 8),
+    monthlyCapacityHours: Number(row.monthly_capacity_hours ?? 160),
+    memberAssignments: rawAssignments,
     quotedAmount: Number(row.quoted_amount ?? 0),
     actualCost: Number(row.actual_cost ?? 0),
     currency: String(row.currency ?? 'USD'),
     initialBaselineCost: Number(row.initial_baseline_cost ?? 0),
     committedRemainingWork: Number(row.committed_remaining_work ?? 0),
   };
+}
+
+const OPTIONAL_SCHEDULE_COLUMNS = [
+  'completed_at',
+  'paused_at',
+  'paused_business_days',
+  'planned_team_size',
+  'budgeted_hours',
+  'hours_per_day',
+  'monthly_capacity_hours',
+  'member_assignments',
+];
+
+function stripOptionalScheduleColumns(row: Record<string, unknown>): Record<string, unknown> {
+  const copy = { ...row };
+  for (const col of OPTIONAL_SCHEDULE_COLUMNS) {
+    delete copy[col];
+  }
+  return copy;
+}
+
+function isMissingColumnError(err: any): boolean {
+  const msg = String(err?.message || '').toLowerCase();
+  const code = String(err?.code || '');
+  return code === '42703' || code === 'PGRST204' || msg.includes('column') || msg.includes('schema cache');
 }
 
 function mapDomainToDbProject(proj: Project): Record<string, unknown> {
@@ -240,15 +103,131 @@ function mapDomainToDbProject(proj: Project): Record<string, unknown> {
     code: proj.code || '',
     client_name: proj.clientName || '',
     department_id: proj.departmentId || null,
-    status: proj.status || 'active',
-    start_date: proj.startDate || new Date().toISOString().slice(0, 10),
+    status: proj.status || 'quoted',
+    start_date: proj.startDate || todayYmdCalendar(),
     end_date: proj.endDate || null,
+    completed_at: proj.completedAt || (proj.status === 'completed' ? todayYmdCalendar() : null),
+    paused_at: proj.pausedAt || (proj.status === 'on_hold' ? todayYmdCalendar() : null),
+    paused_business_days: Number(proj.pausedBusinessDays ?? 0),
+    planned_team_size: Math.max(1, Number(proj.plannedTeamSize ?? 1)),
+    budgeted_hours: proj.budgetedHours != null && Number(proj.budgetedHours) > 0 ? Number(proj.budgetedHours) : null,
+    hours_per_day: Number(proj.hoursPerDay ?? 8),
+    monthly_capacity_hours: Number(proj.monthlyCapacityHours ?? 160),
+    member_assignments: Array.isArray(proj.memberAssignments) ? proj.memberAssignments : [],
     quoted_amount: proj.quotedAmount || 0,
     actual_cost: proj.actualCost || 0,
     currency: proj.currency || 'USD',
     initial_baseline_cost: proj.initialBaselineCost ?? 0,
     committed_remaining_work: proj.committedRemainingWork ?? 0,
   };
+}
+
+/**
+ * Bidirectionally syncs project team roster into `organization_members.assigned_projects`
+ * so Team & Permissions and Employee Portal `My Projects` remain 100% consistent.
+ */
+async function syncProjectMembersToOrgMembers(
+  sb: any,
+  orgId: string,
+  projectId: string,
+  targetUserIds: string[],
+): Promise<void> {
+  try {
+    const targetSet = new Set(targetUserIds.map(String).filter(Boolean));
+    const { data: orgMembers } = await sb
+      .from('organization_members')
+      .select('id, user_id, assigned_projects')
+      .eq('organization_id', orgId);
+
+    if (!Array.isArray(orgMembers)) return;
+
+    const updates: Promise<any>[] = [];
+    for (const m of orgMembers) {
+      const uid = String(m.user_id || '');
+      if (!uid) continue;
+      const current: string[] = Array.isArray(m.assigned_projects)
+        ? m.assigned_projects.map(String)
+        : [];
+      const hasProject = current.includes(projectId);
+      const shouldHave = targetSet.has(uid);
+
+      if (shouldHave && !hasProject) {
+        const next = [...current, projectId];
+        updates.push(
+          sb.from('organization_members')
+            .update({ assigned_projects: next })
+            .eq('id', m.id)
+            .eq('organization_id', orgId),
+        );
+      } else if (!shouldHave && hasProject) {
+        const next = current.filter((pid) => pid !== projectId);
+        updates.push(
+          sb.from('organization_members')
+            .update({ assigned_projects: next })
+            .eq('id', m.id)
+            .eq('organization_id', orgId),
+        );
+      }
+    }
+    if (updates.length > 0) {
+      await Promise.allSettled(updates);
+    }
+  } catch (err: any) {
+    console.warn('[projects.syncMembers] Non-fatal sync warning:', err?.message);
+  }
+}
+
+/**
+ * Emits a deduplicated server-owned alert in `organization_notifications` (§29 X-11)
+ * when an active project enters `in_loss` or `overtime`.
+ */
+async function emitProjectHealthNotifications(
+  sb: any,
+  orgId: string,
+  computedProjects: ComputedProjectProfitability[],
+): Promise<void> {
+  try {
+    const alertProjects = computedProjects.filter(
+      (p) => p.healthStatus === 'in_loss' || p.healthStatus === 'overtime',
+    );
+    if (alertProjects.length === 0) return;
+
+    const { data: existingNotifs } = await sb
+      .from('organization_notifications')
+      .select('id, title, type')
+      .eq('organization_id', orgId)
+      .in('type', ['project_loss', 'project_overtime'])
+      .limit(100);
+
+    const existingTitles = new Set((existingNotifs || []).map((n: any) => String(n.title || '')));
+    const inserts: any[] = [];
+
+    for (const p of alertProjects) {
+      const notifType = p.healthStatus === 'in_loss' ? 'project_loss' : 'project_overtime';
+      const title = p.healthStatus === 'in_loss'
+        ? `Project In Loss: ${p.projectName}`
+        : `Project Overtime Alert: ${p.projectName}`;
+      if (existingTitles.has(title)) continue;
+      existingTitles.add(title);
+      inserts.push({
+        id: `notif-proj-${p.projectId}-${p.healthStatus}-${Date.now()}`,
+        organization_id: orgId,
+        type: notifType,
+        title,
+        message: p.alertMessage || `${p.projectName} requires attention.`,
+        priority: p.healthStatus === 'in_loss' ? 'high' : 'medium',
+        read: false,
+        action_url: `/dashboard?view=projects&projectId=${encodeURIComponent(p.projectId)}`,
+        created_at: new Date().toISOString(),
+      });
+    }
+
+    if (inserts.length > 0) {
+      await sb.from('organization_notifications').insert(inserts);
+    }
+  } catch {
+    /* Non-fatal if organization_notifications table/schema differs */
+  }
 }
 
 
@@ -276,7 +255,7 @@ export function createProjectsRouter(): Router {
   const r = Router({ mergeParams: true });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // GET /profitability - Multi-project summary with §12.4 costing formulas
+  // GET /profitability - Schedule-Driven Mon–Fri 40h/wk, 160h/mo Engine (§12.4)
   // ─────────────────────────────────────────────────────────────────────────────
   r.get('/profitability', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
@@ -290,363 +269,78 @@ export function createProjectsRouter(): Router {
       const d = new Date();
       d.setDate(d.getDate() - daysBack);
       fromDate = d.toISOString().slice(0, 10);
-      toDate = new Date().toISOString().slice(0, 10);
+      toDate = todayYmdCalendar();
     } else {
       if (typeof from === 'string' && from) fromDate = from;
       if (typeof to === 'string' && to) toDate = to;
     }
 
     const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        const [
-          { data: pData },
-          { data: tData },
-          { data: tsData },
-          { data: mData },
-          { data: dData },
-          { data: oaData },
-          { data: profData },
-          { data: tasksData },
-          { data: bankAccountsData },
-        ] = await Promise.all([
-          sb.from('projects').select('*').eq('organization_id', orgId).order('name', { ascending: true }),
-          sb.from('transactions').select('*').eq('organization_id', orgId),
-          sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
-          sb.from('organization_members').select('*').eq('organization_id', orgId),
-          sb.from('departments').select('*').eq('organization_id', orgId),
-          sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
-          sb.from('profiles').select('id, full_name, email, avatar_url'),
-          sb.from('project_tasks').select('*').eq('organization_id', orgId),
-          sb.from('bank_accounts').select('id, balance, currency').eq('organization_id', orgId),
-        ]);
-
-        if (pData && pData.length > 0) {
-          const profileMap = new Map<string, { name: string; email: string; avatarUrl?: string }>();
-          (profData || []).forEach((p: any) => {
-            profileMap.set(String(p.id), {
-              name: p.full_name || p.email?.split('@')[0] || 'Team Member',
-              email: p.email || '',
-              avatarUrl: p.avatar_url,
-            });
-          });
-
-          const deptRateMap = new Map((dData || []).map((d: any) => {
-            const budget = Number(d.budget || 0);
-            const rate = budget > 0 ? (budget / 160) : 50;
-            return [String(d.id), rate];
-          }));
-
-          const memberRateMap = new Map((mData || []).map((m: any) => [
-            String(m.user_id || m.userId),
-            calculateMemberLoadedHourlyRate(m, deptRateMap, m.department_id)
-          ]));
-
-          const activeMembers = (mData || []).filter((m: any) => (m.status || 'active') === 'active');
-          const userDeptMap = new Map<string, string>();
-          for (const m of activeMembers) {
-            const uid = String(m.user_id || m.userId || m.id || '');
-            let dId = String(m.department_id || m.departmentId || m.department || '');
-            for (const d of (dData || [])) {
-              if (dId === String(d.id) || (d.name && dId.toLowerCase() === d.name.toLowerCase())) {
-                dId = String(d.id);
-                break;
-              }
-            }
-            if (uid && dId) userDeptMap.set(uid, dId);
-          }
-
-          // Compute deterministic multi-driver shared overhead allocation
-          const overheadEngine = calculateMultiDriverDepartmentOverhead(
-            dData || [],
-            oaData || [],
-            activeMembers,
-            tData || [],
-            tsData || [],
-            bankAccountsData || []
-          );
-
-          const profitability = pData.map((proj: any) => {
-            const projCurrency = proj.currency || 'USD';
-            const quotedAmount = Number(proj.quoted_amount || 0);
-            const initialBaseline = Number(proj.initial_baseline_cost || 0);
-
-            // Filter transactions strictly adhering to §5, §8, §12.4
-            const projTxnMap = new Map<string, any>();
-            for (const t of (tData || [])) {
-              if (t.project_id === proj.id && isValidProjectTransaction(t, fromDate, toDate)) {
-                projTxnMap.set(t.id, t);
-              }
-            }
-            const projTxns = Array.from(projTxnMap.values());
-
-            // Direct Expenses (debits converted to project currency, excluding reimbursements/payroll)
-            const directCost = projTxns
-              .filter((t: any) => isDirectProjectDebit(t))
-              .reduce((sum: number, t: any) => {
-                const amt = Math.abs(Number(t.amount || 0));
-                const converted = convertCurrency(amt, t.currency || projCurrency, projCurrency);
-                return sum + converted;
-              }, 0);
-
-            // Recognized Revenue from credits (converted to project currency)
-            const revenueFromTxns = projTxns
-              .filter((t: any) => t.type === 'credit')
-              .reduce((sum: number, t: any) => {
-                const amt = Number(t.amount || 0);
-                const converted = convertCurrency(amt, t.currency || projCurrency, projCurrency);
-                return sum + converted;
-              }, 0);
-
-            // Timesheet entries for this project with date filtering
-            const projTs = (tsData || []).filter((t: any) => {
-              if (t.project_id !== proj.id) return false;
-              const tDate = t.date || t.work_date;
-              if (fromDate && tDate && tDate < fromDate) return false;
-              if (toDate && tDate && tDate > toDate) return false;
-              return true;
-            });
-
-            const loggedHours = projTs.reduce((s: number, t: any) => s + Number(t.hours || 0), 0);
-            const billableHours = projTs.filter((t: any) => t.billable !== false).reduce((s: number, t: any) => s + Number(t.hours || 0), 0);
-            const nonBillableHours = projTs.filter((t: any) => t.billable === false).reduce((s: number, t: any) => s + Number(t.hours || 0), 0);
-            const contributorCount = new Set(projTs.map((t: any) => t.user_id)).size;
-
-            let laborCost = 0;
-            let pendingLaborCost = 0;
-            let approvedHours = 0;
-            let pendingHours = 0;
-            const projectContributorsMap = new Map<string, { userId: string; name: string; email?: string; avatarUrl?: string; hours: number; approvedHours: number; laborCost: number }>();
-
-            for (const t of projTs) {
-              const uId = String(t.user_id);
-              const isApproved = t.status === 'approved';
-              const tHours = Number(t.hours || 0);
-              const durationMins = Number(t.duration_minutes || Math.round(tHours * 60));
-
-              let costPerMinute = Number(t.effective_cost_per_minute || 0);
-              if (costPerMinute <= 0) {
-                const hourlyRate = memberRateMap.get(uId) || 50;
-                costPerMinute = hourlyRate / 60;
-              }
-
-              const entryLabor = Number(t.calculated_labor_cost || 0) > 0
-                ? Number(t.calculated_labor_cost)
-                : Math.round(durationMins * costPerMinute * 100) / 100;
-
-              // Only approved time is recognized financial labor burn per §12.4 & §13
-              if (isApproved) {
-                laborCost += entryLabor;
-                approvedHours += tHours;
-              } else {
-                pendingHours += tHours;
-                pendingLaborCost += entryLabor;
-              }
-
-              const prof = profileMap.get(uId);
-              const mem = (mData || []).find((m: any) => String(m.user_id || m.userId || m.id) === uId);
-              const memName = prof?.name || mem?.user?.name || mem?.name || mem?.email?.split('@')[0] || (uId.includes('-') ? 'Team Member' : uId);
-
-              const existing = projectContributorsMap.get(uId) || {
-                userId: uId,
-                name: memName,
-                email: prof?.email || mem?.email || '',
-                avatarUrl: prof?.avatarUrl,
-                hours: 0,
-                approvedHours: 0,
-                laborCost: 0,
-              };
-              existing.hours += tHours;
-              if (isApproved) {
-                existing.laborCost += entryLabor;
-                existing.approvedHours += tHours;
-              }
-              projectContributorsMap.set(uId, existing);
-            }
-            laborCost = Math.round(laborCost * 100) / 100;
-            pendingLaborCost = Math.round(pendingLaborCost * 100) / 100;
-
-            // Project Status Lifecycle (§13)
-            let projectStatus = proj.status || 'quoted';
-            if (projectStatus === 'quoted' && (approvedHours > 0 || projTxns.length > 0)) {
-              projectStatus = 'active';
-            }
-
-            // Multi-Department Project Assigned Overhead (§§12.4, 12.5)
-            // ONLY approved delivery minutes absorb overhead into actual project cost
-            let projectOverheadSum = 0;
-            for (const t of projTs) {
-              if (t.status !== 'approved') continue;
-              const uId = String(t.user_id);
-              const deptId = userDeptMap.get(uId) || String(proj.department_id || '');
-              const durMins = Number(t.duration_minutes || Math.round(Number(t.hours || 0) * 60));
-              const rPerMin = overheadEngine.deptRatesPerMinute.get(deptId) || 0;
-              projectOverheadSum += durMins * rPerMin;
-            }
-            const assignedOverhead = Math.round(projectOverheadSum * 100) / 100;
-
-            // §12.4 actual_project_cost = initial_baseline + labor + direct_expenses + assigned_overhead
-            const actualCost = Math.round((initialBaseline + directCost + laborCost + assignedOverhead) * 100) / 100;
-
-            // Synchronize computed actual_cost & lifecycle status back to DB only if approved work exists
-            if (Number(proj.actual_cost) !== actualCost || (approvedHours > 0 && proj.status !== projectStatus)) {
-              Promise.resolve(
-                sb.from('projects')
-                  .update({
-                    actual_cost: actualCost,
-                    status: projectStatus,
-                    updated_at: new Date().toISOString(),
-                  })
-                  .eq('id', proj.id)
-              ).catch((e: any) => console.warn('[projects.syncDb] Error syncing project actual_cost to DB:', e?.message));
-            }
-
-            // Operating Profit = Recognized Revenue - Actual Cost (§12.4, §14)
-            // If project is quoted or has $0 recognized revenue, recognized revenue is $0
-            const recognizedRevenue = Math.round(revenueFromTxns * 100) / 100;
-            const directCosts = Math.round((directCost + laborCost) * 100) / 100;
-            const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
-            const operatingProfit = Math.round((recognizedRevenue - actualCost) * 100) / 100;
-            const profitMargin = recognizedRevenue > 0
-              ? Math.round(((operatingProfit / recognizedRevenue) * 100) * 10) / 10
-              : 0;
-            const budgetVariance = quotedAmount > 0
-              ? Math.round((((actualCost - quotedAmount) / quotedAmount) * 100) * 10) / 10
-              : 0;
-
-            // Target/Planned Baseline Metrics (for quoted comparison)
-            const targetProfit = Math.round((quotedAmount - initialBaseline) * 100) / 100;
-            const targetMargin = quotedAmount > 0
-              ? Math.round(((targetProfit / quotedAmount) * 100) * 10) / 10
-              : 0;
-
-            // Cost-to-complete (ETC), Projected at Completion (EAC), Margin at Risk (§12.4)
-            const committedRemainingWork = Number(proj.committed_remaining_work || 0);
-            const projOpenTasks = (tasksData || []).filter((task: any) => task.project_id === proj.id && task.status !== 'completed');
-            const openTasksRemainingCost = projOpenTasks.reduce((sum: number, task: any) => {
-              const estHours = Number(task.estimated_hours || 0);
-              const logHours = Number(task.logged_hours || 0);
-              const remHours = Math.max(0, estHours - logHours);
-              const taskRate = (task.assigned_to && memberRateMap.get(String(task.assigned_to))) || 50;
-              return sum + (remHours * taskRate);
-            }, 0);
-
-            let costToComplete = 0;
-            if (committedRemainingWork > 0) {
-              costToComplete = committedRemainingWork;
-            } else if (openTasksRemainingCost > 0) {
-              costToComplete = openTasksRemainingCost;
-            } else if (projectStatus === 'completed') {
-              costToComplete = 0;
-            } else {
-              costToComplete = Math.max(0, quotedAmount - actualCost);
-            }
-            costToComplete = Math.round(costToComplete * 100) / 100;
-
-            const projectedAtCompletion = Math.round((actualCost + costToComplete) * 100) / 100;
-            const marginAtRisk = Math.round((quotedAmount - projectedAtCompletion) * 100) / 100;
-
-            // Burn as consumed cost to date & planned daily budget (§12.4)
-            const consumedBurn = actualCost;
-            let daysElapsed = 0;
-            let daysRemaining = 0;
-            let totalSpanDays = 0;
-            let completionPct = 0;
-            let plannedDailyBudget = 0;
-            let burnRatePerDay = 0;
-
-            if (proj.start_date) {
-              const startMs = new Date(proj.start_date).getTime();
-              const nowMs = Date.now();
-              const diffDays = Math.floor((nowMs - startMs) / (1000 * 60 * 60 * 24));
-              daysElapsed = Math.max(0, diffDays);
-
-              if (proj.end_date) {
-                const endMs = new Date(proj.end_date).getTime();
-                daysRemaining = Math.max(0, Math.floor((endMs - nowMs) / (1000 * 60 * 60 * 24)));
-                totalSpanDays = Math.max(1, Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24)));
-                completionPct = totalSpanDays > 0 ? Math.min(100, Math.max(0, Math.round((daysElapsed / totalSpanDays) * 100))) : 0;
-                plannedDailyBudget = Math.round((quotedAmount / totalSpanDays) * 100) / 100;
-              }
-            }
-
-            if (daysElapsed > 0) {
-              burnRatePerDay = Math.round((consumedBurn / daysElapsed) * 100) / 100;
-            } else if (laborCost > 0) {
-              burnRatePerDay = laborCost;
-            }
-
-            return {
-              projectId: proj.id,
-              projectName: proj.name,
-              code: proj.code || '',
-              clientName: proj.client_name || '',
-              departmentId: proj.department_id || '',
-              status: projectStatus,
-              currency: projCurrency,
-              startDate: proj.start_date,
-              endDate: proj.end_date,
-              quotedAmount,
-              initialBaselineCost: initialBaseline,
-              directCost: Math.round(directCost * 100) / 100,
-              laborCost,
-              pendingLaborCost,
-              assignedOverhead,
-              actualCost,
-              consumedBurn,
-              burnRatePerDay,
-              daysElapsed,
-              daysRemaining,
-              completionPct,
-              revenue: recognizedRevenue,
-              profit: operatingProfit,
-              operatingProfit,
-              profitMargin,
-              targetProfit,
-              targetMargin,
-              projectContribution,
-              costToComplete,
-              projectedAtCompletion,
-              marginAtRisk,
-              budgetVariance,
-              loggedHours: Math.round(loggedHours * 100) / 100,
-              approvedHours: Math.round(approvedHours * 100) / 100,
-              pendingHours: Math.round(pendingHours * 100) / 100,
-              billableHours: Math.round(billableHours * 100) / 100,
-              nonBillableHours: Math.round(nonBillableHours * 100) / 100,
-              committedRemainingWork,
-              contributorCount,
-              contributors: Array.from(projectContributorsMap.values()).map(c => ({
-                userId: c.userId,
-                name: c.name,
-                email: c.email || '',
-                avatarUrl: c.avatarUrl || null,
-                hours: Math.round(c.hours * 10) / 10,
-                approvedHours: Math.round(c.approvedHours * 10) / 10,
-                laborCost: Math.round(c.laborCost * 100) / 100,
-              })),
-              totalSpanDays,
-              plannedDailyBudget,
-            };
-          });
-
-          return ok(res, profitability);
-        }
-      } catch (err) {
-        console.error('[projects.profitability] Supabase error:', err);
-      }
-    }
-
     if (!sb) return fail(res, 503, 'Database unavailable');
-    return ok(res, []);
+
+    try {
+      const [
+        { data: pData },
+        { data: tData },
+        { data: mData },
+        { data: dData },
+        { data: oaData },
+        { data: profData },
+        { data: bankAccountsData },
+        { data: teamsData },
+        { data: teamMembersData },
+        { data: orgRow },
+      ] = await Promise.all([
+        sb.from('projects').select('*').eq('organization_id', orgId).order('name', { ascending: true }),
+        sb.from('transactions').select('*').eq('organization_id', orgId),
+        sb.from('organization_members').select('*').eq('organization_id', orgId),
+        sb.from('departments').select('*').eq('organization_id', orgId),
+        sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
+        sb.from('profiles').select('id, full_name, email, avatar_url'),
+        sb.from('bank_accounts').select('id, balance, currency').eq('organization_id', orgId),
+        sb.from('agency_teams').select('*').eq('organization_id', orgId),
+        sb.from('agency_team_members').select('*').eq('organization_id', orgId),
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
+      ]);
+
+      if (!pData || pData.length === 0) {
+        return ok(res, []);
+      }
+
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+
+      const engineResult = computeOrgProjectsProfitability({
+        projects: pData,
+        transactions: tData || [],
+        members: mData || [],
+        departments: dData || [],
+        overheadAllocations: oaData || [],
+        agencyTeams: teamsData || [],
+        agencyTeamMembers: teamMembersData || [],
+        bankAccounts: bankAccountsData || [],
+        profiles: profData || [],
+        orgCurrency,
+        fromDate,
+        toDate,
+      });
+
+      // Strictly read-only GET handler (Handoff §14 L739 & §16: never mutate DB state on GET)
+      // Emit deduplicated server-side alerts for IN LOSS / OVERTIME projects (§29 X-11)
+      void emitProjectHealthNotifications(sb, orgId, engineResult.projects);
+
+      return ok(res, engineResult.projects);
+    } catch (err) {
+      console.error('[projects.profitability] Supabase error:', err);
+      return fail(res, 500, 'Failed to compute project profitability');
+    }
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // GET /:id/profitability-details - Deep drilldown for dedicated tracking page
+  // GET /:id/profitability-details - Schedule & Cost Breakdown (No Timesheets)
   // ─────────────────────────────────────────────────────────────────────────────
   r.get('/:id/profitability-details', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
-    const projectId = req.params.id;
+    const projectId = String(req.params.id);
     const { from, to } = req.query;
 
     const fromDate = typeof from === 'string' && from ? from : undefined;
@@ -657,66 +351,63 @@ export function createProjectsRouter(): Router {
 
     try {
       const [
-        { data: projectData, error: projError },
+        { data: allProjects },
         { data: txnData },
-        { data: tsData },
         { data: memData },
         { data: deptData },
         { data: oaData },
         { data: profData },
         { data: tasksData },
         { data: bankAccountsData },
+        { data: teamsData },
+        { data: teamMembersData },
+        { data: orgRow },
       ] = await Promise.all([
-        sb.from('projects').select('*').eq('id', projectId).eq('organization_id', orgId).maybeSingle(),
+        sb.from('projects').select('*').eq('organization_id', orgId),
         sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('timesheet_entries').select('*').eq('project_id', projectId).eq('organization_id', orgId).order('date', { ascending: false }),
         sb.from('organization_members').select('*').eq('organization_id', orgId),
         sb.from('departments').select('*').eq('organization_id', orgId),
         sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
         sb.from('profiles').select('id, full_name, email, avatar_url'),
-        sb.from('project_tasks').select('*').eq('organization_id', orgId),
+        sb.from('project_tasks').select('*').eq('organization_id', orgId).eq('project_id', projectId),
         sb.from('bank_accounts').select('id, balance, currency').eq('organization_id', orgId),
+        sb.from('agency_teams').select('*').eq('organization_id', orgId),
+        sb.from('agency_team_members').select('*').eq('organization_id', orgId),
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
       ]);
 
-      if (projError || !projectData) {
+      const projectData = (allProjects || []).find((p: any) => String(p.id) === projectId);
+      if (!projectData) {
         return notFound(res, 'Project');
       }
 
-      const projCurrency = projectData.currency || 'USD';
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+      const projCurrency = String(projectData.currency || orgCurrency).toUpperCase();
 
-      const profileMap = new Map<string, { name: string; email: string; avatarUrl?: string }>();
-      (profData || []).forEach((p: any) => {
-        profileMap.set(String(p.id), {
-          name: p.full_name || p.email?.split('@')[0] || 'Team Member',
-          email: p.email || '',
-          avatarUrl: p.avatar_url,
-        });
+      const engineResult = computeOrgProjectsProfitability({
+        projects: allProjects || [],
+        transactions: txnData || [],
+        members: memData || [],
+        departments: deptData || [],
+        overheadAllocations: oaData || [],
+        agencyTeams: teamsData || [],
+        agencyTeamMembers: teamMembersData || [],
+        bankAccounts: bankAccountsData || [],
+        profiles: profData || [],
+        orgCurrency,
+        fromDate,
+        toDate,
       });
 
-      // 1. Build lookup tables
-      const memberMap = new Map((memData || []).map((m: any) => [
-        String(m.user_id || m.userId),
-        m
-      ]));
-      const deptMap = new Map((deptData || []).map((d: any) => [
-        String(d.id),
-        d.name
-      ]));
-      const deptRateMap = new Map((deptData || []).map((d: any) => {
-        const budget = Number(d.budget || 0);
-        const rate = budget > 0 ? (budget / 160) : 50;
-        return [String(d.id), rate];
-      }));
+      const computed = engineResult.projects.find((p) => p.projectId === projectId);
+      if (!computed) {
+        return notFound(res, 'Project');
+      }
 
-      const memberRateMap = new Map((memData || []).map((m: any) => [
-        String(m.user_id || m.userId),
-        calculateMemberLoadedHourlyRate(m, deptRateMap, m.department_id)
-      ]));
-
-      // 2. Transactions linked to project with multi-currency & status filters (§5, §8, §12.4)
+      // Direct ledger transactions for drill-down
       const txnMap = new Map<string, any>();
       for (const t of (txnData || [])) {
-        if (t.project_id === projectId && isValidProjectTransaction(t, fromDate, toDate)) {
+        if (String(t.project_id || '') === projectId && isValidProjectTransaction(t, fromDate, toDate)) {
           txnMap.set(t.id, t);
         }
       }
@@ -724,458 +415,134 @@ export function createProjectsRouter(): Router {
 
       const income = projectTxns
         .filter((t: any) => t.type === 'credit')
-        .map((t: any) => {
-          const rawAmt = Number(t.amount || 0);
-          const converted = convertCurrency(rawAmt, t.currency || projCurrency, projCurrency);
-          return {
-            id: t.id,
-            date: t.date,
-            description: t.description || t.narration || 'Project credit',
-            amount: converted,
-            type: t.type,
-            categoryId: t.category_id,
-            status: t.status,
-            currency: projCurrency,
-          };
-        });
+        .map((t: any) => ({
+          id: t.id,
+          date: t.date,
+          description: t.description || t.narration || 'Project credit',
+          narration: t.narration || undefined,
+          amount: convertCurrency(Number(t.amount || 0), t.currency || projCurrency, projCurrency),
+          type: t.type,
+          categoryId: t.category_id,
+          status: t.status,
+          currency: projCurrency,
+        }));
 
       const expenses = projectTxns
         .filter((t: any) => isDirectProjectDebit(t))
-        .map((t: any) => {
-          const rawAmt = Math.abs(Number(t.amount || 0));
-          const converted = convertCurrency(rawAmt, t.currency || projCurrency, projCurrency);
-          return {
-            id: t.id,
-            date: t.date,
-            description: t.description || t.narration || 'Direct expense',
-            amount: converted,
-            type: t.type,
-            categoryId: t.category_id,
-            status: t.status,
-            currency: projCurrency,
-          };
-        });
+        .map((t: any) => ({
+          id: t.id,
+          date: t.date,
+          description: t.description || t.narration || 'Direct expense',
+          narration: t.narration || undefined,
+          amount: convertCurrency(Math.abs(Number(t.amount || 0)), t.currency || projCurrency, projCurrency),
+          type: t.type,
+          categoryId: t.category_id,
+          status: t.status,
+          currency: projCurrency,
+        }));
 
-      const directExpenses = Math.round(expenses.reduce((sum, e) => sum + e.amount, 0) * 100) / 100;
-      // Recognized revenue is from credit ledger postings (§12.4, §14)
-      const recognizedRevenue = Math.round(income.reduce((sum, i) => sum + i.amount, 0) * 100) / 100;
-
-      // 3. Timesheets, minute precision, rate lookup, and contributor rollups
-      let totalLoggedMinutes = 0;
-      let totalApprovedMinutes = 0;
-      let totalBillableMinutes = 0;
-      let totalNonBillableMinutes = 0;
-      let laborCost = 0;
-      let pendingLaborCost = 0;
-
-      interface ContributorRollup {
-        userId: string;
-        name: string;
-        email: string;
-        avatar?: string;
-        department?: string;
-        role?: string;
-        firstDate: string;
-        lastDate: string;
-        totalHours: number;
-        approvedMinutes: number;
-        ratePerMinute: number;
-        ratePerHour: number;
-        totalLaborCost: number;
-        approvedCount: number;
-        pendingCount: number;
-      }
-      const contributorMap = new Map<string, ContributorRollup>();
-
-      // Filter project timesheets with optional date range
-      const rawTimesheets = (tsData || []).filter((ts: any) => {
-        const tDate = ts.date || ts.work_date;
-        if (fromDate && tDate && tDate < fromDate) return false;
-        if (toDate && tDate && tDate > toDate) return false;
-        return true;
-      });
-
-      const rawProjectTasks = (tasksData || []).filter((t: any) => t.project_id === projectId);
-      const reconciledTasks = rawProjectTasks.map((t: any) => reconcileTask(t, tsData || []));
-
-      const timesheetEntries = rawTimesheets.map((ts: any) => {
-        const uId = String(ts.user_id);
-        const prof = profileMap.get(uId);
-        const mem = memberMap.get(uId);
-        const memName = prof?.name || mem?.user?.name || mem?.name || mem?.email?.split('@')[0] || (uId.includes('-') ? 'Team Member' : uId);
-        const memEmail = prof?.email || mem?.user?.email || mem?.email || '';
-
-        const hours = Number(ts.hours || 0);
-        const durationMinutes = Number(ts.duration_minutes || Math.round(hours * 60));
-
-        let costPerHour = Number(ts.effective_cost_per_hour || 0);
-        let costPerMinute = Number(ts.effective_cost_per_minute || 0);
-
-        if (costPerHour <= 0 || costPerMinute <= 0) {
-          costPerHour = memberRateMap.get(uId) || 50.0;
-          costPerMinute = costPerHour / 60;
-        }
-
-        const entryLaborCost = Number(ts.calculated_labor_cost || 0) > 0
-          ? Number(ts.calculated_labor_cost)
-          : Math.round(durationMinutes * costPerMinute * 100) / 100;
-
-        totalLoggedMinutes += durationMinutes;
-        const isApproved = ts.status === 'approved';
-        if (isApproved) {
-          totalApprovedMinutes += durationMinutes;
-          laborCost += entryLaborCost;
-        } else {
-          pendingLaborCost += entryLaborCost;
-        }
-
-        if (ts.billable !== false) {
-          totalBillableMinutes += durationMinutes;
-        } else {
-          totalNonBillableMinutes += durationMinutes;
-        }
-
-        // Roll up contributor stats
-        let contrib = contributorMap.get(uId);
-        if (!contrib) {
-          contrib = {
-            userId: uId,
-            name: memName,
-            email: memEmail,
-            avatar: mem?.user?.avatar,
-            department: mem?.department ? deptMap.get(mem.department) || mem.department : undefined,
-            role: mem?.role || mem?.position || 'Team Member',
-            firstDate: ts.date,
-            lastDate: ts.date,
-            totalHours: 0,
-            approvedMinutes: 0,
-            ratePerMinute: Math.round(costPerMinute * 10000) / 10000,
-            ratePerHour: Math.round(costPerHour * 100) / 100,
-            totalLaborCost: 0,
-            approvedCount: 0,
-            pendingCount: 0,
-          };
-          contributorMap.set(uId, contrib);
-        }
-
-        contrib.totalHours += hours;
-        if (isApproved) {
-          contrib.approvedMinutes += durationMinutes;
-          contrib.approvedCount += 1;
-          contrib.totalLaborCost += entryLaborCost;
-        } else {
-          contrib.pendingCount += 1;
-        }
-
-        if (ts.date < contrib.firstDate) contrib.firstDate = ts.date;
-        if (ts.date > contrib.lastDate) contrib.lastDate = ts.date;
-
-        const linkedTask = reconciledTasks.find((t) =>
-          doesEntryMatchTask(
-            { taskId: ts.task_id, projectId, description: ts.description },
-            t,
-          ),
-        );
-
-        return {
-          id: ts.id,
-          date: ts.date,
-          startTime: ts.start_time || undefined,
-          endTime: ts.end_time || undefined,
-          hours,
-          durationMinutes,
-          description: ts.description || 'Logged time',
-          billable: Boolean(ts.billable ?? true),
-          status: ts.status || 'draft',
-          userId: uId,
-          userName: memName,
-          taskId: ts.task_id || linkedTask?.id || undefined,
-          taskEstimatedHours: linkedTask?.estimatedHours ?? undefined,
-          taskLoggedHours: linkedTask?.loggedHours ?? undefined,
-          taskApprovedHours: linkedTask?.approvedHours ?? undefined,
-          taskIncompleteHours: linkedTask?.incompleteHours ?? undefined,
-          taskCompletionStatus: linkedTask?.completionStatus ?? undefined,
-          taskCompletionNote: linkedTask?.completionNote ?? undefined,
-          ratePerMinute: Math.round(costPerMinute * 10000) / 10000,
-          ratePerHour: Math.round(costPerHour * 100) / 100,
-          calculatedLaborCost: entryLaborCost,
-          approvedAt: ts.approved_at || undefined,
-          approvedBy: ts.approved_by || undefined,
-          rejectionReason: ts.rejection_reason || undefined,
-          revisionHistory: Array.isArray(ts.revision_history) ? ts.revision_history : [],
-        };
-      });
-
-      laborCost = Math.round(laborCost * 100) / 100;
-      pendingLaborCost = Math.round(pendingLaborCost * 100) / 100;
-
-      // 4. Multi-Department Multi-Driver Shared Overhead Allocation Engine (§§12.2, 12.3, 12.4, 12.5)
-      const activeMembers = (memData || []).filter((m: any) => (m.status || 'active') === 'active');
-      const userDeptMap = new Map<string, string>();
-      for (const m of activeMembers) {
-        const uid = String(m.user_id || m.userId || m.id || '');
-        let dId = String(m.department_id || m.departmentId || m.department || '');
-        for (const d of (deptData || [])) {
-          if (dId === String(d.id) || (d.name && dId.toLowerCase() === d.name.toLowerCase())) {
-            dId = String(d.id);
-            break;
-          }
-        }
-        if (uid && dId) userDeptMap.set(uid, dId);
-      }
-
-      const overheadEngine = calculateMultiDriverDepartmentOverhead(
-        deptData || [],
-        oaData || [],
-        activeMembers,
-        txnData || [],
-        tsData || [],
-        bankAccountsData || []
-      );
-
-      const deptHoursMap = new Map<string, number>();
-      const deptAbsorbedMap = new Map<string, number>();
-      for (const entry of timesheetEntries) {
-        // ONLY approved timesheets absorb overhead into actual recognized cost
-        if (entry.status !== 'approved') continue;
-        const uId = String(entry.userId);
-        const dId = userDeptMap.get(uId) || String(projectData.department_id || '');
-        const rPerMin = overheadEngine.deptRatesPerMinute.get(dId) || 0;
-        const dur = Number(entry.durationMinutes || Math.round(Number(entry.hours || 0) * 60));
-        const hrs = Number(entry.hours || dur / 60);
-
-        deptHoursMap.set(dId, (deptHoursMap.get(dId) || 0) + hrs);
-        deptAbsorbedMap.set(dId, (deptAbsorbedMap.get(dId) || 0) + (dur * rPerMin));
-      }
-
-      const overheadBreakdown: any[] = [];
-      for (const d of (deptData || [])) {
-        const dId = String(d.id);
-        const loggedHrs = Math.round((deptHoursMap.get(dId) || 0) * 10) / 10;
-        const absorbed = Math.round((deptAbsorbedMap.get(dId) || 0) * 100) / 100;
-        const pool = Math.round((overheadEngine.deptPools.get(dId) || 0) * 100) / 100;
-        const cap = overheadEngine.deptCapacities.get(dId) || 160;
-        const rH = Math.round((overheadEngine.deptRatesPerHour.get(dId) || 0) * 100) / 100;
-
-        if (loggedHrs > 0 || dId === String(projectData.department_id || '')) {
-          overheadBreakdown.push({
-            departmentId: dId,
-            departmentName: d.name || 'Department',
-            headcount: overheadEngine.deptHeadcounts.get(dId) || 0,
-            departmentOverheadPool: pool,
-            departmentCapacityHours: cap,
-            overheadRatePerHour: rH,
-            loggedHours: loggedHrs,
-            allocatedOverhead: absorbed,
-            absorptionPercent: pool > 0 ? Math.round((absorbed / pool) * 1000) / 10 : 0,
-          });
-        }
-      }
-
-      const assignedOverhead = Math.round(
-        Array.from(deptAbsorbedMap.values()).reduce((sum, v) => sum + v, 0) * 100
-      ) / 100;
-
-      // 5. Section 12.4 Financial Summaries
-      const initialBaseline = Number(projectData.initial_baseline_cost || 0);
-      const actualProjectCost = Math.round((initialBaseline + directExpenses + laborCost + assignedOverhead) * 100) / 100;
-      const directCosts = Math.round((directExpenses + laborCost) * 100) / 100;
-      const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
-      const projectOperatingProfit = Math.round((recognizedRevenue - actualProjectCost) * 100) / 100;
-
-      // Synchronize computed actual_cost & lifecycle status back to Supabase DB only on approved activity
-      const pStatus = (totalApprovedMinutes > 0 && projectData.status === 'quoted') ? 'active' : (projectData.status || 'quoted');
-      if (Number(projectData.actual_cost) !== actualProjectCost || (totalApprovedMinutes > 0 && projectData.status !== pStatus)) {
-        Promise.resolve(
-          sb.from('projects')
-            .update({
-              actual_cost: actualProjectCost,
-              status: pStatus,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', projectId)
-        ).catch(() => { });
-      }
-      const projectMarginPercent = recognizedRevenue > 0
-        ? Math.round(((projectOperatingProfit / recognizedRevenue) * 100) * 10) / 10
-        : 0;
-
-      const quotedAmount = Number(projectData.quoted_amount || 0);
-      const committedRemainingWork = Number(projectData.committed_remaining_work || 0);
-
-      // Incomplete tasks estimate from project_tasks
-      const projOpenTasks = (tasksData || []).filter((task: any) => task.project_id === projectId && task.status !== 'completed');
-      const openTasksRemainingCost = projOpenTasks.reduce((sum: number, task: any) => {
-        const estHours = Number(task.estimated_hours || 0);
-        const logHours = Number(task.logged_hours || 0);
-        const remHours = Math.max(0, estHours - logHours);
-        const taskRate = (task.assigned_to && memberRateMap.get(String(task.assigned_to))) || 50;
-        return sum + (remHours * taskRate);
-      }, 0);
-
-      let costToComplete = 0;
-      if (committedRemainingWork > 0) {
-        costToComplete = committedRemainingWork;
-      } else if (openTasksRemainingCost > 0) {
-        costToComplete = openTasksRemainingCost;
-      } else if (projectData.status === 'completed') {
-        costToComplete = 0;
-      } else {
-        costToComplete = Math.max(0, quotedAmount - actualProjectCost);
-      }
-      costToComplete = Math.round(costToComplete * 100) / 100;
-
-      const projectedAtCompletion = Math.round((actualProjectCost + costToComplete) * 100) / 100;
-      const marginAtRisk = Math.round((quotedAmount - projectedAtCompletion) * 100) / 100;
-
-      const targetProfit = Math.round((quotedAmount - initialBaseline) * 100) / 100;
-      const targetMarginPercent = quotedAmount > 0
-        ? Math.round(((targetProfit / quotedAmount) * 100) * 10) / 10
-        : 0;
-
-      // 6. Labor Allocation vs Payroll GL Reconciliation Trace (§1338)
-      let totalOrgPayrollExpense = 0;
-      let totalOrgAllocatedLabor = 0;
-      try {
-        const { data: allMembers } = await sb
-          .from('organization_members')
-          .select('fixed_salary, hourly_rate')
-          .eq('organization_id', orgId);
-        if (allMembers) {
-          totalOrgPayrollExpense = allMembers.reduce((sum: number, m: any) => {
-            const fix = Number(m.fixed_salary || 0);
-            return sum + (fix > 0 ? fix : Number(m.hourly_rate || 0) * 160);
-          }, 0);
-        }
-        const { data: allOrgTs } = await sb
-          .from('timesheet_entries')
-          .select('hours, duration_minutes, effective_cost_per_minute, effective_cost_per_hour, status, calculated_labor_cost')
-          .eq('organization_id', orgId);
-        if (allOrgTs) {
-          for (const ts of allOrgTs) {
-            // Reconcile approved timesheets
-            if (ts.status !== 'approved') continue;
-            const dur = Number(ts.duration_minutes || Math.round(Number(ts.hours || 0) * 60));
-            let rM = Number(ts.effective_cost_per_minute || 0);
-            if (rM <= 0) {
-              const rH = Number(ts.effective_cost_per_hour || 50);
-              rM = rH / 60;
-            }
-            totalOrgAllocatedLabor += Number(ts.calculated_labor_cost || dur * rM);
-          }
-          totalOrgAllocatedLabor = Math.round(totalOrgAllocatedLabor * 100) / 100;
-        }
-      } catch (e) {
-        console.warn('[projects.profitability-details] Reconciliation trace query error:', e);
-      }
-      const unallocatedPayrollBench = Math.max(0, Math.round((totalOrgPayrollExpense - totalOrgAllocatedLabor) * 100) / 100);
-      const reconciliationTrace = {
-        totalOrgPayrollExpense: Math.round(totalOrgPayrollExpense * 100) / 100,
-        totalOrgAllocatedLabor,
-        projectAllocatedLabor: laborCost,
-        unallocatedPayrollBench,
-        reconciliationEquation: 'Total Payroll Expense = Allocated Project Labor + Unallocated Bench/General Overhead',
-        status: 'balanced',
-      };
-
-      // Timeline & Burn calculation (§12.4)
-      let daysElapsed = 0;
-      let daysRemaining = 0;
-      let totalSpanDays = 0;
-      let completionPct = 0;
-      let plannedDailyBudget = 0;
-      let burnRatePerDay = 0;
-
-      if (projectData.start_date) {
-        const startMs = new Date(projectData.start_date).getTime();
-        const nowMs = Date.now();
-        const diffDays = Math.floor((nowMs - startMs) / (1000 * 60 * 60 * 24));
-        daysElapsed = Math.max(0, diffDays);
-
-        if (projectData.end_date) {
-          const endMs = new Date(projectData.end_date).getTime();
-          daysRemaining = Math.max(0, Math.floor((endMs - nowMs) / (1000 * 60 * 60 * 24)));
-          totalSpanDays = Math.max(1, Math.floor((endMs - startMs) / (1000 * 60 * 60 * 24)));
-          completionPct = totalSpanDays > 0 ? Math.min(100, Math.max(0, Math.round((daysElapsed / totalSpanDays) * 100))) : 0;
-          plannedDailyBudget = Math.round((quotedAmount / totalSpanDays) * 100) / 100;
-        }
-      }
-
-      const consumedBurn = actualProjectCost;
-      if (daysElapsed > 0) {
-        burnRatePerDay = Math.round((consumedBurn / daysElapsed) * 100) / 100;
-      } else if (laborCost > 0) {
-        burnRatePerDay = laborCost;
-      }
-
-      const contributors = Array.from(contributorMap.values()).map(c => {
-        const userTasks = reconciledTasks.filter(t => t.assignedTo === c.userId);
-        const allocatedTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.estimatedHours || 0), 0) * 100) / 100;
-        const approvedTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.approvedHours || 0), 0) * 100) / 100;
-        const incompleteTaskHours = Math.round(userTasks.reduce((s, t) => s + Number(t.incompleteHours || 0), 0) * 100) / 100;
-        const completedOnTimeCount = userTasks.filter(t => t.completionStatus === 'completed_on_time').length;
-        const partialClosedCount = userTasks.filter(t => t.completionStatus === 'closed_partial').length;
-        const overdueCount = userTasks.filter(t => t.completionStatus === 'overdue' || t.completionStatus === 'completed_late').length;
-
-        return {
-          ...c,
-          totalHours: Math.round(c.totalHours * 100) / 100,
-          totalLaborCost: Math.round(c.totalLaborCost * 100) / 100,
-          assignedTasksCount: userTasks.length,
-          allocatedTaskHours,
-          approvedTaskHours,
-          incompleteTaskHours,
-          completedOnTimeCount,
-          partialClosedCount,
-          overdueCount,
-        };
-      });
+      // Schedule-allocated labor entries (backwards-compatible shape for ProfitIntelligenceView drilldown)
+      const laborEntries = computed.teamAllocations.map((ta) => ({
+        id: `sched-${projectId}-${ta.userId}`,
+        userId: ta.userId,
+        userName: ta.name,
+        departmentName: ta.departmentName,
+        date: ta.assignedFrom || computed.startDate,
+        hours: ta.elapsedHours,
+        plannedHours: ta.plannedHours,
+        overrunHours: ta.overrunHours,
+        allocationSharePct: ta.allocationSharePct,
+        effectiveHourlyRate: ta.hourlyRate,
+        cost: ta.laborCost,
+        salaryMissing: ta.salaryMissing,
+      }));
 
       return ok(res, {
         project: mapDbToDomainProject(projectData),
         summary: {
-          quotedAmount,
-          initialBaselineCost: initialBaseline,
-          committedRemainingWork,
-          directExpenses: Math.round(directExpenses * 100) / 100,
-          laborCost,
-          pendingLaborCost,
-          assignedOverhead,
-          actualProjectCost,
-          consumedBurn,
-          burnRatePerDay,
-          recognizedRevenue,
-          targetProfit,
-          targetMarginPercent,
-          projectContribution,
-          projectOperatingProfit,
-          projectMarginPercent,
-          costToComplete: Math.round(costToComplete * 100) / 100,
-          projectedAtCompletion: Math.round(projectedAtCompletion * 100) / 100,
-          marginAtRisk,
-          totalLoggedHours: Math.round((totalLoggedMinutes / 60) * 100) / 100,
-          totalApprovedHours: Math.round((totalApprovedMinutes / 60) * 100) / 100,
-          totalBillableHours: Math.round((totalBillableMinutes / 60) * 100) / 100,
-          totalNonBillableHours: Math.round((totalNonBillableMinutes / 60) * 100) / 100,
-          contributorCount: contributors.length,
+          quotedAmount: computed.quotedAmount,
+          initialBaselineCost: computed.initialBaselineCost,
+          committedRemainingWork: computed.committedRemainingWork,
+          directExpenses: computed.directCost,
+          directCosts: computed.directCost,
+          laborCost: computed.laborCost,
+          overrunLaborCost: computed.overrunLaborCost,
+          pendingLaborCost: 0,
+          assignedOverhead: computed.assignedOverhead,
+          actualProjectCost: computed.actualCost,
+          actualCost: computed.actualCost,
+          totalCosts: computed.actualCost,
+          consumedBurn: computed.consumedBurn,
+          hourlyBurnRate: computed.hourlyBurnRate,
+          burnRatePerDay: computed.burnRatePerDay,
+          recognizedRevenue: computed.revenue,
+          totalRevenue: computed.revenue,
+          quoteProfit: computed.quoteProfit,
+          quoteMarginPct: computed.quoteMarginPct,
+          targetProfit: computed.targetProfit,
+          targetMarginPercent: computed.targetMargin,
+          projectContribution: computed.projectContribution,
+          projectOperatingProfit: computed.operatingProfit,
+          netProfit: computed.operatingProfit,
+          projectMarginPercent: computed.profitMargin,
+          operatingMarginPct: computed.operatingMarginPct,
+          variancePct: computed.budgetVariance,
+          costToComplete: computed.costToComplete,
+          projectedAtCompletion: computed.projectedAtCompletion,
+          marginAtRisk: computed.marginAtRisk,
+          plannedHours: computed.plannedHours,
+          elapsedHours: computed.elapsedHours,
+          remainingHours: computed.remainingHours,
+          overrunHours: computed.overrunHours,
+          exactCompletionHours: computed.exactCompletionHours,
+          maxProfitableHours: computed.maxProfitableHours,
+          breakEvenDate: computed.breakEvenDate,
+          daysUntilLoss: computed.daysUntilLoss,
+          healthStatus: computed.healthStatus,
+          lossAmount: computed.lossAmount,
+          alertMessage: computed.alertMessage,
+          capacityBasis: computed.capacityBasis,
+          isUsingDeptFallback: computed.isUsingDeptFallback,
+          missingSalaryMembers: computed.missingSalaryMembers,
+          loggedHours: computed.elapsedHours,
+          totalLoggedHours: computed.elapsedHours,
+          totalApprovedHours: computed.elapsedHours,
+          totalBillableHours: computed.elapsedHours,
+          totalNonBillableHours: 0,
+          contributorCount: computed.contributorCount,
         },
-        reconciliationTrace,
+        reconciliationTrace: {
+          ...engineResult.reconciliationTrace,
+          projectAllocatedLabor: computed.laborCost,
+        },
         timeline: {
-          startDate: projectData.start_date,
-          endDate: projectData.end_date,
-          daysElapsed,
-          daysRemaining,
-          totalSpanDays,
-          completionPct,
-          plannedDailyBudget,
+          startDate: computed.startDate,
+          endDate: computed.endDate,
+          completedAt: computed.completedAt,
+          pausedAt: computed.pausedAt,
+          pausedBusinessDays: computed.pausedBusinessDays,
+          plannedBusinessDays: computed.plannedBusinessDays,
+          elapsedBusinessDays: computed.elapsedBusinessDays,
+          remainingBusinessDays: computed.remainingBusinessDays,
+          overdueBusinessDays: computed.overdueBusinessDays,
+          daysElapsed: computed.elapsedBusinessDays,
+          daysRemaining: computed.remainingBusinessDays,
+          totalSpanDays: computed.plannedBusinessDays,
+          completionPct: computed.completionPct,
+          scheduleProgressPct: computed.scheduleProgressPct,
+          plannedDailyBudget: computed.plannedDailyBudget,
+          isOverdue: computed.isOverdue,
+          isOpenEnded: computed.isOpenEnded,
         },
-        contributors,
-        timesheetEntries,
-        tasks: reconciledTasks,
+        teamAllocations: computed.teamAllocations,
+        contributors: computed.contributors,
+        laborEntries,
+        timesheetEntries: [],
+        tasks: (tasksData || []).map(mapDbToDomainTask),
         income,
         expenses,
         overheadAllocations: oaData || [],
-        overheadBreakdown,
+        overheadBreakdown: computed.overheadBreakdown,
       });
     } catch (err: any) {
       console.error('[projects.profitability-details] Exception:', err);
@@ -1235,9 +602,20 @@ export function createProjectsRouter(): Router {
 
       const hours = Number(entry.hours || 0);
       const durationMinutes = Number(entry.duration_minutes || Math.round(hours * 60));
-      const costPerHour = calculateMemberLoadedHourlyRate(mem, new Map());
-      const costPerMinute = Math.round((costPerHour / 60) * 10000) / 10000;
-      const calculatedLaborCost = Math.round(durationMinutes * costPerMinute * 100) / 100;
+      const hPerDay = Number(mem?.hours_per_day || 8);
+      const dPerMonth = Number(mem?.working_days_per_month || 20);
+      const capHours = hPerDay > 0 && dPerMonth > 0 ? hPerDay * dPerMonth : 160;
+      const baseSalary = Number(mem?.fixed_salary || 0);
+      const explicitHourly = Number(mem?.hourly_rate || 0);
+      const exactCostPerHour = explicitHourly > 0
+        ? explicitHourly
+        : baseSalary > 0
+          ? baseSalary / capHours
+          : 0;
+      const costPerHour = Math.round(exactCostPerHour * 100) / 100;
+      const costPerMinute = Math.round((exactCostPerHour / 60) * 10000) / 10000;
+      // Compute total from exact unrounded per-minute rate to avoid F-04 cent drift
+      const calculatedLaborCost = Math.round(durationMinutes * (exactCostPerHour / 60) * 100) / 100;
 
       const { data: updated, error: updateErr } = await sb
         .from('timesheet_entries')
@@ -1532,56 +910,234 @@ export function createProjectsRouter(): Router {
     if (!sb) return fail(res, 503, 'Database unavailable');
 
     const newId = (data as any).id || ('proj-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9));
-    const newProject: Project = { ...data, id: newId, organizationId: orgId };
+    const startDate = normalizeYmd(data.startDate) || todayYmdCalendar();
+
+    // Normalize memberAssignments from either explicit array or assignedMemberIds
+    const explicitAssignments = Array.isArray(data.memberAssignments) && data.memberAssignments.length > 0
+      ? data.memberAssignments.map((a) => ({
+        userId: String(a.userId),
+        assignedFrom: normalizeYmd(a.assignedFrom) || startDate,
+        assignedTo: normalizeYmd(a.assignedTo) || undefined,
+        allocationPct: a.allocationPct != null && Number(a.allocationPct) > 0 ? Math.min(100, Number(a.allocationPct)) : null,
+      }))
+      : (Array.isArray(data.assignedMemberIds)
+        ? data.assignedMemberIds.filter(Boolean).map((uid) => ({
+          userId: String(uid),
+          assignedFrom: startDate,
+          allocationPct: null,
+        }))
+        : []);
+
+    const newProject: Project = {
+      ...data,
+      id: newId,
+      organizationId: orgId,
+      startDate,
+      memberAssignments: explicitAssignments,
+    };
 
     const dbRow = mapDomainToDbProject(newProject);
-    const { data: insertedData, error } = await sb
+    let { data: insertedData, error } = await sb
       .from('projects')
       .insert(dbRow)
       .select()
       .single();
 
+    if (error && isMissingColumnError(error)) {
+      const retry = await sb
+        .from('projects')
+        .insert(stripOptionalScheduleColumns(dbRow))
+        .select()
+        .single();
+      insertedData = retry.data;
+      error = retry.error;
+    }
+
     if (error) {
       console.error('[projects.post] Supabase insert error:', error);
       return fail(res, 500, error.message);
     }
+
+    if (explicitAssignments.length > 0) {
+      await syncProjectMembersToOrgMembers(
+        sb,
+        orgId,
+        newId,
+        explicitAssignments.map((a) => a.userId),
+      );
+    }
+
     return created(res, mapDbToDomainProject(insertedData), 'Project created');
   });
 
   r.patch('/:id', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
+    const projectId = String(req.params.id);
     const updates = req.body as Partial<Project>;
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
-    const dbUpdates: Record<string, unknown> = {};
+    // Fetch current row for lifecycle transitions (pause/resume/complete)
+    const { data: existingRow } = await sb
+      .from('projects')
+      .select('*')
+      .eq('id', projectId)
+      .eq('organization_id', orgId)
+      .maybeSingle();
+
+    if (!existingRow) return notFound(res, 'Project');
+
+    const today = todayYmdCalendar();
+    const dbUpdates: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
     if (updates.name !== undefined) dbUpdates.name = updates.name;
     if (updates.code !== undefined) dbUpdates.code = updates.code;
     if (updates.clientName !== undefined) dbUpdates.client_name = updates.clientName;
     if (updates.departmentId !== undefined) dbUpdates.department_id = updates.departmentId;
     if (updates.status !== undefined) dbUpdates.status = updates.status;
     if (updates.startDate !== undefined) dbUpdates.start_date = updates.startDate;
-    if (updates.endDate !== undefined) dbUpdates.end_date = updates.endDate;
+    if (updates.endDate !== undefined) dbUpdates.end_date = updates.endDate || null;
     if (updates.quotedAmount !== undefined) dbUpdates.quoted_amount = updates.quotedAmount;
     if (updates.actualCost !== undefined) dbUpdates.actual_cost = updates.actualCost;
     if (updates.currency !== undefined) dbUpdates.currency = updates.currency;
     if (updates.initialBaselineCost !== undefined) dbUpdates.initial_baseline_cost = updates.initialBaselineCost;
     if (updates.committedRemainingWork !== undefined) dbUpdates.committed_remaining_work = updates.committedRemainingWork;
+    if (updates.plannedTeamSize !== undefined) dbUpdates.planned_team_size = Math.max(1, Number(updates.plannedTeamSize || 1));
+    if (updates.budgetedHours !== undefined) dbUpdates.budgeted_hours = updates.budgetedHours != null && Number(updates.budgetedHours) > 0 ? Number(updates.budgetedHours) : null;
+    if (updates.hoursPerDay !== undefined) dbUpdates.hours_per_day = Number(updates.hoursPerDay || 8);
+    if (updates.monthlyCapacityHours !== undefined) dbUpdates.monthly_capacity_hours = Number(updates.monthlyCapacityHours || 160);
+    if (updates.pausedBusinessDays !== undefined) dbUpdates.paused_business_days = Math.max(0, Number(updates.pausedBusinessDays || 0));
 
-    const { data, error } = await sb
+    // Lifecycle transitions: Completed / On Hold / Resume
+    const prevStatus = String(existingRow.status || 'quoted');
+    const nextStatus = updates.status || prevStatus;
+
+    if (updates.completedAt !== undefined) {
+      dbUpdates.completed_at = normalizeYmd(updates.completedAt) || null;
+    } else if (nextStatus === 'completed' && prevStatus !== 'completed') {
+      dbUpdates.completed_at = today;
+    } else if (nextStatus === 'active' && prevStatus === 'completed') {
+      dbUpdates.completed_at = null;
+    }
+
+    if (nextStatus === 'on_hold' && prevStatus !== 'on_hold') {
+      dbUpdates.paused_at = normalizeYmd(updates.pausedAt) || today;
+    } else if (prevStatus === 'on_hold' && nextStatus === 'active') {
+      const pausedStart = normalizeYmd(existingRow.paused_at);
+      const prevPaused = Math.max(0, Number(existingRow.paused_business_days || 0));
+      const addedPaused = pausedStart && pausedStart < today
+        ? Math.max(0, countBusinessDaysInclusive(pausedStart, today) - 1)
+        : 0;
+      dbUpdates.paused_business_days = prevPaused + addedPaused;
+      dbUpdates.paused_at = null;
+    } else if (updates.pausedAt !== undefined) {
+      dbUpdates.paused_at = normalizeYmd(updates.pausedAt) || null;
+    }
+
+    // Member assignments & bidirectional organization_members.assigned_projects sync
+    let syncedMemberIds: string[] | null = null;
+    if (updates.memberAssignments !== undefined) {
+      const normalized = (updates.memberAssignments || []).map((a) => ({
+        userId: String(a.userId),
+        assignedFrom: normalizeYmd(a.assignedFrom) || normalizeYmd(existingRow.start_date) || today,
+        assignedTo: normalizeYmd(a.assignedTo) || undefined,
+        allocationPct: a.allocationPct != null && Number(a.allocationPct) > 0 ? Math.min(100, Number(a.allocationPct)) : null,
+      }));
+      dbUpdates.member_assignments = normalized;
+      syncedMemberIds = normalized.map((a) => a.userId);
+    } else if (updates.assignedMemberIds !== undefined) {
+      const prevMap = new Map<string, any>();
+      const prevList = Array.isArray(existingRow.member_assignments) ? existingRow.member_assignments : [];
+      for (const item of prevList) {
+        if (item?.userId) prevMap.set(String(item.userId), item);
+      }
+      const nextList = (updates.assignedMemberIds || []).filter(Boolean).map((uid) => {
+        const key = String(uid);
+        const existing = prevMap.get(key);
+        return existing || {
+          userId: key,
+          assignedFrom: prevStatus === 'quoted' ? (normalizeYmd(existingRow.start_date) || today) : today,
+          allocationPct: null,
+        };
+      });
+      dbUpdates.member_assignments = nextList;
+      syncedMemberIds = nextList.map((a) => a.userId);
+    }
+
+    let { data, error } = await sb
       .from('projects')
       .update(dbUpdates)
-      .eq('id', req.params.id)
+      .eq('id', projectId)
       .eq('organization_id', orgId)
       .select()
       .maybeSingle();
+
+    if (error && isMissingColumnError(error)) {
+      const retry = await sb
+        .from('projects')
+        .update(stripOptionalScheduleColumns(dbUpdates))
+        .eq('id', projectId)
+        .eq('organization_id', orgId)
+        .select()
+        .maybeSingle();
+      data = retry.data;
+      error = retry.error;
+    }
 
     if (error) {
       console.error('[projects.patch] Supabase update error:', error);
       return fail(res, 500, error.message);
     }
     if (!data) return notFound(res, 'Project');
+
+    if (syncedMemberIds !== null) {
+      await syncProjectMembersToOrgMembers(sb, orgId, projectId, syncedMemberIds);
+    }
+
     return ok(res, mapDbToDomainProject(data));
+  });
+
+  // POST /:id/complete — Lock exact completion date & freeze Mon–Fri hours permanently
+  r.post('/:id/complete', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const projectId = String(req.params.id);
+    const body = (req.body || {}) as { completedAt?: string };
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const completedAt = normalizeYmd(body.completedAt) || todayYmdCalendar();
+    const dbUpdates: Record<string, unknown> = {
+      status: 'completed',
+      completed_at: completedAt,
+      paused_at: null,
+      updated_at: new Date().toISOString(),
+    };
+
+    let { data, error } = await sb
+      .from('projects')
+      .update(dbUpdates)
+      .eq('id', projectId)
+      .eq('organization_id', orgId)
+      .select()
+      .maybeSingle();
+
+    if (error && isMissingColumnError(error)) {
+      const retry = await sb
+        .from('projects')
+        .update(stripOptionalScheduleColumns(dbUpdates))
+        .eq('id', projectId)
+        .eq('organization_id', orgId)
+        .select()
+        .maybeSingle();
+      data = retry.data;
+      error = retry.error;
+    }
+
+    if (error) return fail(res, 500, error.message);
+    if (!data) return notFound(res, 'Project');
+
+    return ok(res, mapDbToDomainProject(data), `Project marked completed on ${completedAt}. Hours are now frozen.`);
   });
 
   r.delete('/:id', async (req: Request, res: Response) => {

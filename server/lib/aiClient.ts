@@ -5,7 +5,7 @@
  */
 
 import type { AIConfig } from '../config/aiConfig.js';
-import { calculateTokenCost, fingerprintApiKey, recordAiTelemetryEvent } from './aiGateway.js';
+import { calculateTokenCost, executeAIJSON, fingerprintApiKey, recordAiTelemetryEvent } from './aiGateway.js';
 import { classifyTransaction } from '../../src/lib/classificationEngine.js';
 
 export interface CategorySuggestion {
@@ -14,11 +14,19 @@ export interface CategorySuggestion {
   reasoning: string;
 }
 
+export interface OrgLearningContext {
+  learnedRules?: Array<{ pattern: string; categoryName: string; world?: 'business' | 'personal' }>;
+  recentCorrections?: Array<{ narration: string; categoryName: string; world?: 'business' | 'personal' }>;
+  departments?: Array<{ id: string; name: string }>;
+  personalWorldEnabled?: boolean;
+}
+
 export interface TransactionClassificationInput {
   narration: string;
   amount: number;
   type: 'debit' | 'credit';
   availableCategories: Array<{ id: string; name: string; type: string }>;
+  learningContext?: OrgLearningContext;
 }
 
 export interface TransactionClassificationResult {
@@ -26,6 +34,13 @@ export interface TransactionClassificationResult {
   confidence: number;
   reasoning: string;
   alternatives: CategorySuggestion[];
+  world?: 'business' | 'personal';
+  worldReason?: string;
+  suggestedDepartment?: string;
+  createNewCategory?: boolean;
+  newCategoryName?: string;
+  usedAI?: boolean;
+  modelUsed?: string;
 }
 
 // ── Quota exhaustion tracker ────────────────────────────────────────────────
@@ -70,16 +85,17 @@ const KEYWORD_PATTERNS: Array<{ keywords: string[]; categoryPatterns: string[]; 
   { keywords: ['sale', 'revenue', 'proceeds', 'receipt'], categoryPatterns: ['sales', 'revenue', 'income'], type: 'income' },
   { keywords: ['transfer in', 'deposit', 'credit'], categoryPatterns: ['transfer', 'deposit', 'income'], type: 'income' },
 
-  // Expense patterns
+  // Expense patterns (specific inventory/hardware/restock BEFORE generic "purchase")
+  { keywords: ['restock', 'purchase order', 'po-', 'inventory', 'stock', 'wholesale', 'raw material', 'merchandise'], categoryPatterns: ['inventory', 'cost of goods', 'cogs', 'stock', 'purchases', 'procurement'], type: 'expense' },
+  { keywords: ['samsung', 'nokia', 'iphone', 'apple', 'macbook', 'laptop', 'desktop', 'monitor', 'server', 'hardware', 'equipment', 'mobile', 'phone', 'tablet', 'electronics'], categoryPatterns: ['inventory', 'equipment', 'hardware', 'asset', 'cost of goods', 'purchases', 'office'], type: 'expense' },
   { keywords: ['rent', 'lease', 'tenancy'], categoryPatterns: ['rent', 'lease', 'occupancy'], type: 'expense' },
   { keywords: ['electric', 'power', 'gas', 'water', 'sewage', 'utility', 'utilities'], categoryPatterns: ['utilit', 'electric', 'power', 'gas', 'water'], type: 'expense' },
-  { keywords: ['internet', 'broadband', 'wifi', 'telecom', 'phone', 'mobile', 'airtime', 'data bundle', 'vodafone', 'airtel', 'jio', 'mtn'], categoryPatterns: ['telecom', 'phone', 'internet', 'communication', 'utilit'], type: 'expense' },
+  { keywords: ['internet', 'broadband', 'wifi', 'telecom', 'airtime', 'data bundle', 'vodafone', 'airtel', 'jio', 'mtn'], categoryPatterns: ['telecom', 'phone', 'internet', 'communication', 'utilit'], type: 'expense' },
   { keywords: ['insurance', 'premium', 'policy', 'cover'], categoryPatterns: ['insurance', 'premium'], type: 'expense' },
   { keywords: ['fuel', 'petrol', 'diesel', 'gas station', 'shell', 'total', 'filling'], categoryPatterns: ['fuel', 'transport', 'vehicle', 'auto'], type: 'expense' },
   { keywords: ['uber', 'bolt', 'lyft', 'taxi', 'cab', 'ride', 'transport', 'bus', 'train', 'metro', 'fare'], categoryPatterns: ['transport', 'travel', 'commut'], type: 'expense' },
   { keywords: ['food', 'restaurant', 'cafe', 'coffee', 'lunch', 'dinner', 'breakfast', 'meal', 'eat', 'pizza', 'burger', 'catering', 'kitchen', 'snack', 'kfc', 'mcdonald'], categoryPatterns: ['food', 'meal', 'dining', 'restaurant', 'catering', 'entertainment'], type: 'expense' },
   { keywords: ['grocery', 'supermarket', 'market', 'shoprite', 'walmart', 'costco', 'provision', 'store'], categoryPatterns: ['grocery', 'food', 'supplies', 'household'], type: 'expense' },
-  { keywords: ['amazon', 'shopping', 'purchase', 'buy', 'order', 'ecommerce', 'flipkart', 'jumia', 'alibaba'], categoryPatterns: ['shopping', 'purchase', 'supplies', 'expense'], type: 'expense' },
   { keywords: ['office', 'stationery', 'printer', 'paper', 'toner', 'supplies'], categoryPatterns: ['office', 'supplies', 'stationery', 'admin'], type: 'expense' },
   { keywords: ['software', 'subscription', 'saas', 'license', 'licence', 'cloud', 'hosting', 'domain', 'aws', 'azure', 'google cloud', 'heroku'], categoryPatterns: ['software', 'technology', 'it', 'subscription', 'cloud'], type: 'expense' },
   { keywords: ['marketing', 'ads', 'advert', 'campaign', 'promotion', 'sponsor', 'facebook ads', 'google ads'], categoryPatterns: ['marketing', 'advertis', 'promotion', 'sales'], type: 'expense' },
@@ -94,6 +110,7 @@ const KEYWORD_PATTERNS: Array<{ keywords: string[]; categoryPatterns: string[]; 
   { keywords: ['loan', 'emi', 'installment', 'repayment', 'mortgage', 'interest payment'], categoryPatterns: ['loan', 'debt', 'interest', 'financial'], type: 'expense' },
   { keywords: ['donation', 'charity', 'contribution', 'ngo', 'tithe', 'offering'], categoryPatterns: ['donation', 'charity', 'contribution'], type: 'expense' },
   { keywords: ['entertainment', 'movie', 'netflix', 'spotify', 'music', 'game', 'ticket', 'concert', 'show'], categoryPatterns: ['entertainment', 'recreation', 'subscription'], type: 'expense' },
+  { keywords: ['amazon', 'shopping', 'purchase', 'buy', 'order', 'ecommerce', 'flipkart', 'jumia', 'alibaba'], categoryPatterns: ['shopping', 'purchase', 'supplies', 'expense'], type: 'expense' },
   { keywords: ['transfer', 'wire', 'remittance', 'send', 'payment'], categoryPatterns: ['transfer', 'payment', 'expense'], type: 'expense' },
 ];
 
@@ -101,7 +118,8 @@ function classifyWithKeywords(
   narration: string,
   amount: number,
   type: 'debit' | 'credit',
-  availableCategories: Array<{ id: string; name: string; type: string }>
+  availableCategories: Array<{ id: string; name: string; type: string }>,
+  personalWorldEnabled: boolean = true
 ): TransactionClassificationResult | null {
   try {
     const result = classifyTransaction(
@@ -110,19 +128,37 @@ function classifyWithKeywords(
       type,
       availableCategories as any,
       [],
-      []
+      [],
+      { personalWorldEnabled }
     );
 
-    if (result && result.categoryName && result.categoryName !== 'Uncategorized') {
+    // Do NOT inflate confidence (Handoff §11): preserve real confidence and skip low-confidence fallbacks
+    if (result && result.categoryId && result.source !== 'fallback' && result.confidence >= 70) {
       return {
         suggestedCategory: result.categoryName,
-        confidence: Math.max(90, result.confidence),
+        confidence: result.confidence,
         reasoning: result.reasoning,
+        world: result.world || 'business',
+        worldReason: result.worldReason,
+        createNewCategory: false,
         alternatives: (result.alternativeSuggestions || []).map(alt => ({
           categoryName: alt.categoryName,
           confidence: alt.confidence,
           reasoning: `Alternative match (${alt.confidence}%)`,
         })),
+      };
+    }
+
+    if (result?.proposedNewCategory) {
+      return {
+        suggestedCategory: result.proposedNewCategory.name,
+        confidence: result.confidence,
+        reasoning: result.reasoning,
+        world: result.world || 'business',
+        worldReason: result.worldReason,
+        createNewCategory: true,
+        newCategoryName: result.proposedNewCategory.name,
+        alternatives: [],
       };
     }
   } catch (err) {
@@ -154,8 +190,10 @@ function classifyWithKeywords(
       if (matchedCategory) {
         return {
           suggestedCategory: matchedCategory.name,
-          confidence: 95,
-          reasoning: `Matched pattern: "${catPattern}"`,
+          confidence: 82,
+          reasoning: `Matched keyword pattern: "${catPattern}"`,
+          world: 'business',
+          createNewCategory: false,
           alternatives: [],
         };
       }
@@ -165,25 +203,59 @@ function classifyWithKeywords(
   return null;
 }
 
+function formatLearningContextBlock(ctx?: OrgLearningContext): string {
+  if (!ctx) return '';
+  const sections: string[] = [];
+  if (ctx.departments && ctx.departments.length > 0) {
+    sections.push(`Organization Departments: ${ctx.departments.map(d => d.name).join(', ')}`);
+  }
+  if (ctx.learnedRules && ctx.learnedRules.length > 0) {
+    const lines = ctx.learnedRules
+      .slice(0, 20)
+      .map(r => `- "${r.pattern}" => ${r.categoryName} [${r.world || 'business'}]`)
+      .join('\n');
+    sections.push(`Organization Confirmed Rules (highest priority):\n${lines}`);
+  }
+  if (ctx.recentCorrections && ctx.recentCorrections.length > 0) {
+    const lines = ctx.recentCorrections
+      .slice(0, 12)
+      .map(c => `- "${c.narration.slice(0, 70)}" => ${c.categoryName} [${c.world || 'business'}]`)
+      .join('\n');
+    sections.push(`Recent Human Corrections (learn from these patterns):\n${lines}`);
+  }
+  return sections.length > 0 ? `\n\n${sections.join('\n\n')}` : '';
+}
+
 /**
  * Build system prompt for transaction classification
  */
-function buildSystemPrompt(categories: Array<{ id: string; name: string; type: string }>): string {
+function buildSystemPrompt(
+  categories: Array<{ id: string; name: string; type: string }>,
+  learningContext?: OrgLearningContext
+): string {
   const categoryList = categories.map(c => `- ${c.name} (${c.type})`).join('\n');
-  
-  return `Classify bank transactions into categories.
+  const learningBlock = formatLearningContextBlock(learningContext);
+  const worldRule = learningContext?.personalWorldEnabled === false
+    ? '2. Set "world" to "business" (personal finance is disabled for this org).'
+    : '2. Determine whether the transaction is "business" (company/agency operations, inventory/restock, hardware/equipment, SaaS, payroll, client revenue, office, B2B) or "personal" (groceries, gym, pharmacy, cinema, family, personal shopping/draw).';
 
-Categories:
-${categoryList}
+  return `You are a senior financial accountant classifying bank transactions into categories, business/personal scope, and departments.
+
+Existing Organization Categories:
+${categoryList}${learningBlock}
 
 Rules:
-1. Match transaction type (debit/credit) with category type (expense/income)
-2. Return confidence 0-100
-3. Keep reasoning under 30 words
-4. alternatives array is optional (omit if unsure)
+1. Match transaction type (debit=expense, credit=income) with category type.
+${worldRule}
+3. Understand the FULL commercial intent (e.g., "Purchase: Samsung Mobile (10) - Ref: 002" or "Restock PO" is Inventory / Equipment & Hardware / Cost of Goods Sold — NOT generic shopping).
+4. Follow Organization Confirmed Rules and Recent Human Corrections whenever the merchant or pattern matches.
+5. Prefer an existing category when it accurately fits. ONLY if NO existing category accurately describes the transaction, set "createNewCategory": true and provide a concise canonical "newCategoryName" (2-4 words).
+6. ALWAYS provide up to 2 sensible "alternatives" from Existing Organization Categories with honest confidence scores and short reasoning.
+7. If Organization Departments are listed, pick the best matching "suggestedDepartment" (or "" if general/shared).
+8. Return honest confidence 0-100 (below 70 if ambiguous). Keep reasoning clear and specific (under 25 words).
 
-Return ONLY valid, complete JSON in compact format:
-{"suggestedCategory":"Category Name","confidence":75,"reasoning":"Brief explanation","alternatives":[]}`;
+Return ONLY valid, complete JSON:
+{"suggestedCategory":"Category Name","confidence":86,"world":"business","worldReason":"Commercial stock/hardware procurement","suggestedDepartment":"Operations","createNewCategory":false,"newCategoryName":"","reasoning":"Bulk purchase of 10 Samsung Mobile units indicates inventory or hardware procurement","alternatives":[{"categoryName":"Second Best Category","confidence":64,"reasoning":"Short reason"}]}`;
 }
 
 /**
@@ -482,64 +554,77 @@ async function callAI(config: AIConfig, systemPrompt: string, userPrompt: string
 }
 
 /**
- * Main classification function — tries AI first, falls back to local keyword classifier
+ * Main classification function — uses Unified AI Gateway multi-provider failover first,
+ * falls back to direct callAI, and only uses local keyword classifier if all LLM providers fail.
  */
 export async function classifyTransactionWithAI(
   input: TransactionClassificationInput,
   config: AIConfig
 ): Promise<TransactionClassificationResult> {
-  // If quota is exhausted, go straight to local classifier
-  if (config.provider === 'gemini' && isQuotaExhausted()) {
-    const localResult = classifyWithKeywords(
-      input.narration, input.amount, input.type, input.availableCategories
-    );
-    if (localResult) return localResult;
-    return {
-      suggestedCategory: 'Uncategorized',
-      confidence: 0,
-      reasoning: 'AI quota exhausted; no keyword match found',
-      alternatives: [],
-    };
-  }
-
-  const systemPrompt = buildSystemPrompt(input.availableCategories);
+  const systemPrompt = buildSystemPrompt(input.availableCategories, input.learningContext);
   const userPrompt = buildUserPrompt(input);
+  const orgId = (config as any).organizationId as string | undefined;
 
   try {
-    const responseText = await callAI(config, systemPrompt, userPrompt);
-
     let result: TransactionClassificationResult;
-    try {
+    let modelUsed: string | undefined = config.modelName;
+
+    if (orgId) {
+      try {
+        const gwRes = await executeAIJSON<TransactionClassificationResult>(orgId, {
+          prompt: `${systemPrompt}\n\n${userPrompt}`,
+          temperature: config.temperature ?? 0.2,
+          portalType: 'organization_admin',
+          featureArea: 'narration_classification',
+        });
+        result = gwRes.data;
+        modelUsed = gwRes.model || modelUsed;
+      } catch (gwErr: any) {
+        console.warn('[aiClient] Gateway executeAIJSON failed, trying direct callAI:', gwErr?.message || gwErr);
+        const responseText = await callAI(config, systemPrompt, userPrompt);
+        result = JSON.parse(responseText) as TransactionClassificationResult;
+      }
+    } else {
+      const responseText = await callAI(config, systemPrompt, userPrompt);
       result = JSON.parse(responseText) as TransactionClassificationResult;
-    } catch (parseError) {
-      console.error('Failed to parse AI response:', responseText);
-      return {
-        suggestedCategory: 'Uncategorized',
-        confidence: 0,
-        reasoning: 'AI returned invalid response',
-        alternatives: [],
-      };
     }
-    
-    if (!result.suggestedCategory || typeof result.confidence !== 'number') {
-      console.error('Invalid AI response structure:', result);
+
+    if (!result || (!result.suggestedCategory && !result.newCategoryName) || typeof result.confidence !== 'number') {
       throw new Error('Invalid AI response format');
     }
 
-    result.confidence = Math.max(0, Math.min(100, result.confidence));
+    result.suggestedCategory = String(result.suggestedCategory || result.newCategoryName || '').trim();
+    result.confidence = Math.max(0, Math.min(100, Math.round(result.confidence)));
+    result.world = result.world === 'personal' && input.learningContext?.personalWorldEnabled !== false ? 'personal' : 'business';
+    result.createNewCategory = Boolean(result.createNewCategory);
+    if (result.createNewCategory && result.newCategoryName) {
+      result.newCategoryName = String(result.newCategoryName).trim().slice(0, 60);
+    }
     if (!Array.isArray(result.alternatives)) {
       result.alternatives = [];
+    } else {
+      result.alternatives = result.alternatives
+        .filter((a: any) => a && a.categoryName)
+        .slice(0, 3)
+        .map((a: any) => ({
+          categoryName: String(a.categoryName).trim(),
+          confidence: Math.max(10, Math.min(95, Math.round(Number(a.confidence) || 50))),
+          reasoning: String(a.reasoning || 'Alternative AI suggestion').slice(0, 120),
+        }));
     }
+    result.usedAI = true;
+    result.modelUsed = modelUsed;
 
     return result;
   } catch (error) {
-    // On failure, try local keyword classifier before giving up
+    // On failure of ALL AI providers, fall back to local keyword classifier (marked usedAI: false!)
     const localResult = classifyWithKeywords(
-      input.narration, input.amount, input.type, input.availableCategories
+      input.narration, input.amount, input.type, input.availableCategories,
+      input.learningContext?.personalWorldEnabled !== false
     );
     if (localResult) {
-      console.log(`[aiClient] AI failed, local classifier matched: "${localResult.suggestedCategory}"`);
-      return localResult;
+      console.log(`[aiClient] All AI providers unavailable, local classifier matched: "${localResult.suggestedCategory}"`);
+      return { ...localResult, usedAI: false };
     }
 
     console.error('AI classification error:', error);
@@ -552,27 +637,27 @@ export interface BatchItemClassification {
   suggestedCategory: string;
   confidence: number;
   reasoning: string;
+  world?: 'business' | 'personal';
+  worldReason?: string;
+  suggestedDepartment?: string;
+  alternatives?: CategorySuggestion[];
+  createNewCategory?: boolean;
+  newCategoryName?: string;
+  usedAI?: boolean;
+  modelUsed?: string;
 }
 
 /**
- * High-performance batch classification: sends all transactions in a single prompt
- * and automatically classifies any missing transactions individually so NO transactions are skipped.
- * 
- * Quota-aware: detects rate limits early and falls back to local keyword classification
- * to avoid burning through free-tier quota on doomed requests.
- */
-/**
- * High-performance batch classification with parallel processing
- * Strategy:
- * 1. Quick local classification for obvious patterns (instant)
- * 2. Deduplicate similar transactions (reduce API calls)
- * 3. Process remaining in parallel chunks (fast)
- * 4. Fall back for any failures (reliable)
+ * High-performance batch classification with Unified AI Gateway multi-provider failover.
+ * Note: Org rules are already evaluated BEFORE calling this function (§11).
+ * Sends unresolved rows to the real LLM with org learning context, returning category +
+ * alternatives + personal/business world + department + missing category proposals.
  */
 export async function classifyBatchWithAI(
   input: {
     transactions: Array<{ narration: string; amount: number; type: 'debit' | 'credit' }>;
     availableCategories: Array<{ id: string; name: string; type: string }>;
+    learningContext?: OrgLearningContext;
   },
   config: AIConfig
 ): Promise<Map<number, BatchItemClassification>> {
@@ -580,61 +665,17 @@ export async function classifyBatchWithAI(
   if (!input.transactions.length) return results;
 
   const totalCount = input.transactions.length;
-  console.log(`[aiClient] Batch classification started: ${totalCount} transactions`);
-
-  // ═══ PHASE 1: Quick local classification for high-confidence matches ═══
-  const needsAI: number[] = [];
+  const personalEnabled = input.learningContext?.personalWorldEnabled !== false;
   const startLocal = Date.now();
+  console.log(`[aiClient] Batch AI classification started: ${totalCount} transactions`);
 
-  for (let i = 0; i < totalCount; i++) {
-    const txn = input.transactions[i];
-    const localResult = classifyWithKeywords(
-      txn.narration, txn.amount, txn.type, input.availableCategories
-    );
-    
-    // Use local result if confidence is high enough (90+)
-    if (localResult && localResult.confidence >= 90) {
-      results.set(i, {
-        index: i,
-        suggestedCategory: localResult.suggestedCategory,
-        confidence: localResult.confidence,
-        reasoning: localResult.reasoning,
-      });
-    } else {
-      needsAI.push(i);
-    }
-  }
+  // Send ALL unresolved rows passed here to the LLM (deduplicated by type+narration)
+  const needsAI: number[] = Array.from({ length: totalCount }, (_, i) => i);
 
-  const localTime = Date.now() - startLocal;
-  console.log(`[aiClient] Phase 1: ${results.size}/${totalCount} classified locally in ${localTime}ms`);
-
-  // If all classified locally or quota exhausted, return early
-  if (needsAI.length === 0 || (config.provider === 'gemini' && isQuotaExhausted())) {
-    if (isQuotaExhausted()) {
-      console.log(`[aiClient] Quota exhausted, using local classifier for remaining ${needsAI.length}`);
-      // Classify remaining with lower threshold
-      for (const idx of needsAI) {
-        const txn = input.transactions[idx];
-        const localResult = classifyWithKeywords(
-          txn.narration, txn.amount, txn.type, input.availableCategories
-        );
-        if (localResult) {
-          results.set(idx, {
-            index: idx,
-            suggestedCategory: localResult.suggestedCategory,
-            confidence: Math.max(60, localResult.confidence),
-            reasoning: localResult.reasoning,
-          });
-        }
-      }
-    }
-    return results;
-  }
-
-  // ═══ PHASE 2: Deduplicate similar transactions ═══
-  const dedupeMap = new Map<string, number[]>(); // narration -> indices
+  // ═══ PHASE 1: Deduplicate identical transactions to minimize LLM tokens ═══
+  const dedupeMap = new Map<string, number[]>();
   for (const idx of needsAI) {
-    const key = input.transactions[idx].narration.toLowerCase().trim();
+    const key = `${input.transactions[idx].type}:${input.transactions[idx].narration.toLowerCase().trim()}`;
     if (!dedupeMap.has(key)) {
       dedupeMap.set(key, []);
     }
@@ -642,110 +683,177 @@ export async function classifyBatchWithAI(
   }
 
   const uniqueKeys = Array.from(dedupeMap.keys());
-  console.log(`[aiClient] Phase 2: Deduplicated ${needsAI.length} → ${uniqueKeys.length} unique transactions`);
+  console.log(`[aiClient] Deduplicated ${needsAI.length} → ${uniqueKeys.length} unique transactions for LLM`);
 
-  // ═══ PHASE 3: Parallel AI classification in optimized chunks ═══
-  const CHUNK_SIZE = 10; // Balanced: not too big (timeout), not too small (slow)
-  const MAX_PARALLEL = 3; // Process 3 chunks simultaneously
-  
+  // ═══ PHASE 2: Parallel AI classification in compact chunks via Unified AI Gateway ═══
+  // Keep chunks compact (5 rows) so JSON output never truncates on reasoning models and runs fast in parallel.
+  const CHUNK_SIZE = 5;
+  const MAX_PARALLEL = 3;
+
   const startAI = Date.now();
   const chunks: number[][] = [];
-  
-  // Build chunks from unique transaction indices
+
   for (let i = 0; i < uniqueKeys.length; i += CHUNK_SIZE) {
     const chunkKeys = uniqueKeys.slice(i, Math.min(i + CHUNK_SIZE, uniqueKeys.length));
-    const chunkIndices = chunkKeys.flatMap(key => dedupeMap.get(key)!);
-    chunks.push(chunkIndices.map(idx => needsAI.indexOf(idx)).filter(i => i >= 0));
+    const repIndices = chunkKeys.map(key => dedupeMap.get(key)![0]);
+    chunks.push(repIndices);
   }
 
-  // Process chunks in parallel batches
-  for (let batchStart = 0; batchStart < chunks.length; batchStart += MAX_PARALLEL) {
-    const batchEnd = Math.min(batchStart + MAX_PARALLEL, chunks.length);
-    const parallelChunks = chunks.slice(batchStart, batchEnd);
-    
-    const promises = parallelChunks.map((chunkIndices, idx) => 
+  const applyChunkResult = (result: PromiseSettledResult<Map<number, BatchItemClassification>>) => {
+    if (result.status === 'fulfilled') {
+      for (const [idx, classification] of result.value) {
+        results.set(idx, classification);
+
+        const txn = input.transactions[idx];
+        const key = `${txn.type}:${txn.narration.toLowerCase().trim()}`;
+        const duplicates = dedupeMap.get(key) || [];
+        for (const dupIdx of duplicates) {
+          if (dupIdx !== idx && !results.has(dupIdx)) {
+            results.set(dupIdx, { ...classification, index: dupIdx });
+          }
+        }
+      }
+    }
+  };
+
+  // Canary-first execution: run Chunk 0 first when multiple chunks exist so any overloaded/503
+  // gateway model trips its circuit breaker immediately, letting remaining parallel chunks go
+  // straight to the healthy provider without redundant timeouts.
+  let startIdx = 0;
+  if (chunks.length > 1) {
+    const [firstRes] = await Promise.allSettled([
       classifyChunkWithAI(
-        chunkIndices.map(i => needsAI[i]),
+        chunks[0],
         input.transactions,
         input.availableCategories,
         config,
-        batchStart + idx
+        0,
+        input.learningContext
+      ),
+    ]);
+    applyChunkResult(firstRes);
+    startIdx = 1;
+  }
+
+  for (let batchStart = startIdx; batchStart < chunks.length; batchStart += MAX_PARALLEL) {
+    const batchEnd = Math.min(batchStart + MAX_PARALLEL, chunks.length);
+    const parallelChunks = chunks.slice(batchStart, batchEnd);
+
+    const promises = parallelChunks.map((chunkIndices, idx) =>
+      classifyChunkWithAI(
+        chunkIndices,
+        input.transactions,
+        input.availableCategories,
+        config,
+        batchStart + idx,
+        input.learningContext
       )
     );
 
     const chunkResults = await Promise.allSettled(promises);
-    
-    // Merge results
-    chunkResults.forEach((result) => {
-      if (result.status === 'fulfilled') {
-        for (const [idx, classification] of result.value) {
-          results.set(idx, classification);
-          
-          // Apply same classification to duplicates
-          const txn = input.transactions[idx];
-          const key = txn.narration.toLowerCase().trim();
-          const duplicates = dedupeMap.get(key) || [];
-          for (const dupIdx of duplicates) {
-            if (dupIdx !== idx && !results.has(dupIdx)) {
-              results.set(dupIdx, { ...classification, index: dupIdx });
-            }
-          }
-        }
-      }
-    });
+    chunkResults.forEach(applyChunkResult);
+  }
+
+  // ═══ PHASE 2B: Automatic single retry for any chunks missed due to transient 503/timeout ═══
+  const missedUniqueReps: number[] = [];
+  for (const key of uniqueKeys) {
+    const repIdx = dedupeMap.get(key)![0];
+    if (!results.has(repIdx)) {
+      missedUniqueReps.push(repIdx);
+    }
+  }
+  if (missedUniqueReps.length > 0 && !isQuotaExhausted()) {
+    console.log(`[aiClient] Retrying ${missedUniqueReps.length} missed unique transaction(s) with LLM...`);
+    const retryChunks: number[][] = [];
+    for (let i = 0; i < missedUniqueReps.length; i += CHUNK_SIZE) {
+      retryChunks.push(missedUniqueReps.slice(i, i + CHUNK_SIZE));
+    }
+    for (let rIdx = 0; rIdx < retryChunks.length; rIdx++) {
+      const [retryRes] = await Promise.allSettled([
+        classifyChunkWithAI(
+          retryChunks[rIdx],
+          input.transactions,
+          input.availableCategories,
+          config,
+          100 + rIdx,
+          input.learningContext
+        ),
+      ]);
+      applyChunkResult(retryRes);
+    }
   }
 
   const aiTime = Date.now() - startAI;
-  console.log(`[aiClient] Phase 3: AI classified ${results.size - (totalCount - needsAI.length)} transactions in ${aiTime}ms`);
+  console.log(`[aiClient] LLM classified ${results.size}/${totalCount} transactions in ${aiTime}ms`);
 
-  // ═══ PHASE 4: Final fallback for any missed transactions ═══
+  // ═══ PHASE 3: Local fallback ONLY for rows where ALL AI providers failed (honestly flagged usedAI: false) ═══
   const stillMissing: number[] = [];
   for (let i = 0; i < totalCount; i++) {
     if (!results.has(i)) stillMissing.push(i);
   }
 
   if (stillMissing.length > 0) {
-    console.log(`[aiClient] Phase 4: Fallback for ${stillMissing.length} remaining transactions`);
+    console.warn(`[aiClient] Fallback classifier used for ${stillMissing.length} transactions (AI providers unavailable)`);
     for (const idx of stillMissing) {
       const txn = input.transactions[idx];
       const localResult = classifyWithKeywords(
-        txn.narration, txn.amount, txn.type, input.availableCategories
+        txn.narration, txn.amount, txn.type, input.availableCategories, personalEnabled
       );
       results.set(idx, {
         index: idx,
         suggestedCategory: localResult?.suggestedCategory || 'Uncategorized',
-        confidence: localResult?.confidence || 50,
-        reasoning: localResult?.reasoning || 'Fallback classification',
+        confidence: localResult?.confidence || 45,
+        reasoning: localResult?.reasoning || 'Fallback classification (AI temporarily unavailable)',
+        world: localResult?.world || 'business',
+        worldReason: localResult?.worldReason,
+        alternatives: localResult?.alternatives || [],
+        createNewCategory: localResult?.createNewCategory,
+        newCategoryName: localResult?.newCategoryName,
+        usedAI: false,
       });
     }
   }
 
   const totalTime = Date.now() - startLocal;
-  console.log(`[aiClient] Batch complete: ${results.size}/${totalCount} in ${totalTime}ms (${Math.round(totalTime/totalCount)}ms/txn)`);
+  console.log(`[aiClient] Batch complete: ${results.size}/${totalCount} in ${totalTime}ms`);
 
   return results;
 }
 
 /**
- * Classify a single chunk with AI (helper for parallel processing)
+ * Classify a single chunk with AI via Unified AI Gateway (multi-provider failover + JSON output)
  */
 async function classifyChunkWithAI(
   indices: number[],
   allTransactions: Array<{ narration: string; amount: number; type: 'debit' | 'credit' }>,
   availableCategories: Array<{ id: string; name: string; type: string }>,
   config: AIConfig,
-  chunkId: number
+  chunkId: number,
+  learningContext?: OrgLearningContext
 ): Promise<Map<number, BatchItemClassification>> {
   const results = new Map<number, BatchItemClassification>();
   if (indices.length === 0) return results;
 
-  const categoryList = availableCategories.map(c => `${c.name}(${c.type})`).join(', ');
+  const categoryList = availableCategories.length > 0
+    ? availableCategories.map(c => `${c.name}(${c.type})`).join(', ')
+    : 'None yet (propose clean standard accounting categories with createNewCategory:true and newCategoryName)';
+  const learningBlock = formatLearningContextBlock(learningContext);
+  const personalEnabled = learningContext?.personalWorldEnabled !== false;
   const chunkTransactions = indices.map(idx => allTransactions[idx]);
 
-  // Ultra-compact prompt for speed
-  const systemPrompt = `Classify transactions. Categories: ${categoryList}
-Rules: Match type (debit=expense, credit=income). Confidence 60-95. Reasoning <15 words.
-Return JSON: {"classifications":[{"index":0,"suggestedCategory":"Name","confidence":85,"reasoning":"why"}]}`;
+  const systemPrompt = `You are a senior financial accountant classifying bank transactions into categories, business/personal scope, and departments.
+Existing Categories: ${categoryList}${learningBlock}
+Rules:
+1. Match type (exp=expense, inc=income).
+2. ${personalEnabled ? 'Classify world as "business" (company/agency operations, inventory/restock, hardware/equipment, SaaS, payroll, client revenue) or "personal" (groceries, gym, pharmacy, cinema, family, personal shopping/draw).' : 'Always set world="business".'}
+3. Understand FULL meaning (e.g., "Purchase: Samsung Mobile (10)" or "Restock PO" is Inventory / Hardware / Cost of Goods, NOT generic shopping).
+4. Follow Organization Confirmed Rules and Recent Human Corrections when applicable.
+5. Prefer an existing category when it accurately fits. ONLY if NO existing category accurately fits, set createNewCategory:true and newCategoryName:"Concise Name".
+6. ALWAYS include up to 2 sensible "alternatives" from Existing Categories with confidence and short reasoning.
+7. If Organization Departments are listed, include best matching "suggestedDepartment" (or "").
+8. Honest confidence 35-95. Clear, specific reasoning (<20 words).
+Return ONLY valid JSON:
+{"classifications":[{"index":0,"suggestedCategory":"Name","confidence":86,"world":"business","worldReason":"why","suggestedDepartment":"Operations","createNewCategory":false,"newCategoryName":"","reasoning":"specific reason","alternatives":[{"categoryName":"Alt Category","confidence":65,"reasoning":"why"}]}]}`;
 
   const txnsPayload = chunkTransactions.map((t, i) => ({
     index: indices[i],
@@ -754,36 +862,86 @@ Return JSON: {"classifications":[{"index":0,"suggestedCategory":"Name","confiden
     type: t.type === 'debit' ? 'exp' : 'inc',
   }));
 
-  const userPrompt = `Classify ${indices.length} txns:\n${JSON.stringify(txnsPayload)}`;
+  const userPrompt = `Classify ${indices.length} transactions:\n${JSON.stringify(txnsPayload)}`;
+  const orgId = (config as any).organizationId as string | undefined;
 
   try {
-    const rawText = await callAI(config, systemPrompt, userPrompt);
-    
-    // Parse response
     let parsed: any;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch {
-      const cleaned = rawText.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
-      parsed = JSON.parse(cleaned);
+    let modelUsed: string | undefined = config.modelName;
+
+    if (orgId) {
+      try {
+        const gwRes = await executeAIJSON<any>(orgId, {
+          prompt: `${systemPrompt}\n\n${userPrompt}`,
+          temperature: config.temperature ?? 0.2,
+          maxTokens: 8192,
+          timeoutMs: 25_000,
+          portalType: 'organization_admin',
+          featureArea: 'statement_import_batch',
+        });
+        parsed = gwRes.data;
+        modelUsed = gwRes.model || modelUsed;
+      } catch (gwErr: any) {
+        const msg = String(gwErr?.message || gwErr);
+        if (msg.includes('(429)') || msg.toLowerCase().includes('quota')) {
+          markQuotaExhausted(parseRetryDelay(msg) || 120);
+          throw gwErr;
+        }
+        console.warn(`[aiClient] Chunk ${chunkId} gateway failed, trying direct callAI:`, msg);
+        const rawText = await callAI(config, systemPrompt, userPrompt);
+        try {
+          parsed = JSON.parse(rawText);
+        } catch {
+          const cleaned = rawText.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+          parsed = JSON.parse(cleaned);
+        }
+      }
+    } else {
+      const rawText = await callAI(config, systemPrompt, userPrompt);
+      try {
+        parsed = JSON.parse(rawText);
+      } catch {
+        const cleaned = rawText.replace(/```(?:json)?/gi, '').replace(/```/g, '').trim();
+        parsed = JSON.parse(cleaned);
+      }
     }
 
-    const list: any[] = Array.isArray(parsed) 
-      ? parsed 
+    const list: any[] = Array.isArray(parsed)
+      ? parsed
       : (Array.isArray(parsed?.classifications) ? parsed.classifications : []);
 
     for (const item of list) {
-      if (typeof item?.index === 'number' && item?.suggestedCategory) {
+      if (typeof item?.index === 'number' && (item?.suggestedCategory || item?.newCategoryName)) {
+        const createNew = Boolean(item.createNewCategory);
+        const newCatName = createNew ? String(item.newCategoryName || item.suggestedCategory || '').trim().slice(0, 60) : undefined;
+        const alts: CategorySuggestion[] = Array.isArray(item.alternatives)
+          ? item.alternatives
+              .filter((a: any) => a && a.categoryName)
+              .slice(0, 3)
+              .map((a: any) => ({
+                categoryName: String(a.categoryName).trim(),
+                confidence: Math.max(10, Math.min(95, Math.round(Number(a.confidence) || 50))),
+                reasoning: String(a.reasoning || 'Alternative AI suggestion').substring(0, 120),
+              }))
+          : [];
         results.set(item.index, {
           index: item.index,
-          suggestedCategory: String(item.suggestedCategory).trim(),
-          confidence: Math.max(60, Math.min(95, Number(item.confidence) || 80)),
-          reasoning: String(item.reasoning || 'AI classified').substring(0, 100),
+          suggestedCategory: String(item.suggestedCategory || newCatName || '').trim(),
+          confidence: Math.max(30, Math.min(95, Math.round(Number(item.confidence) || 75))),
+          reasoning: String(item.reasoning || 'AI classified').substring(0, 150),
+          world: item.world === 'personal' && personalEnabled ? 'personal' : 'business',
+          worldReason: item.worldReason ? String(item.worldReason).substring(0, 120) : undefined,
+          suggestedDepartment: item.suggestedDepartment ? String(item.suggestedDepartment).trim() : undefined,
+          alternatives: alts,
+          createNewCategory: createNew,
+          newCategoryName: newCatName,
+          usedAI: true,
+          modelUsed,
         });
       }
     }
 
-    console.log(`[aiClient] Chunk ${chunkId}: ${results.size}/${indices.length} classified`);
+    console.log(`[aiClient] Chunk ${chunkId}: ${results.size}/${indices.length} classified by LLM (${modelUsed})`);
   } catch (err) {
     console.warn(`[aiClient] Chunk ${chunkId} failed:`, err instanceof Error ? err.message : err);
   }

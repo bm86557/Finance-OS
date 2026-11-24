@@ -224,7 +224,7 @@ export interface DepartmentServices {
   update(id: string, updates: Partial<Department>): ReturnType<typeof departmentService.update>;
   delete(id: string): ReturnType<typeof departmentService.delete>;
   /** Department-level P&L with overhead allocation */
-  getProfitability(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof departmentService.getProfitability>;
+  getProfitability(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' | 'ALL' }): ReturnType<typeof departmentService.getProfitability>;
 }
 
 export interface RecurringServices {
@@ -236,6 +236,11 @@ export interface RecurringServices {
   generate(asOfDate?: string): ReturnType<typeof recurringTransactionService.generate>;
   generateSingle(recurringId: string): ReturnType<typeof recurringTransactionService.generateSingle>;
   getTotals(): ReturnType<typeof recurringTransactionService.getTotals>;
+  getSuggestions(world?: 'business' | 'personal' | 'all'): ReturnType<typeof recurringTransactionService.getSuggestions>;
+  promoteSuggestion(candidate: Parameters<typeof recurringTransactionService.promoteSuggestion>[1]): ReturnType<typeof recurringTransactionService.promoteSuggestion>;
+  getOccurrences(status?: string): ReturnType<typeof recurringTransactionService.getOccurrences>;
+  approveOccurrence(occurrenceId: string): ReturnType<typeof recurringTransactionService.approveOccurrence>;
+  rejectOccurrence(occurrenceId: string, reason?: string): ReturnType<typeof recurringTransactionService.rejectOccurrence>;
 }
 
 export interface ProjectServices {
@@ -244,6 +249,7 @@ export interface ProjectServices {
   create(data: Omit<Project, 'id' | 'organizationId'>): ReturnType<typeof projectService.create>;
   update(id: string, updates: Partial<Project>): ReturnType<typeof projectService.update>;
   delete(id: string): ReturnType<typeof projectService.delete>;
+  markCompleted(projectId: string, completedAt?: string): ReturnType<typeof projectService.markCompleted>;
   /** Quoted vs actual cost, margin %, budget variance */
   getProfitability(params?: { from?: string; to?: string; period?: '1M' | '3M' | '12M' }): ReturnType<typeof projectService.getProfitability>;
   getProjectDetails(projectId: string, params?: { from?: string; to?: string }): ReturnType<typeof projectService.getProjectDetails>;
@@ -343,23 +349,37 @@ export interface ReportServices {
 
 export interface ClassificationServices {
   /** AI-classify a single transaction narration */
-  classify(narration: string, amount: number, type: 'debit' | 'credit', world?: 'business' | 'personal', transactionId?: string): ReturnType<typeof classificationService.classify>;
+  classify(narration: string, amount: number, type: 'debit' | 'credit', world?: 'business' | 'personal', transactionId?: string, useAI?: boolean, accountId?: string): ReturnType<typeof classificationService.classify>;
   batchClassify(
-    transactions: Array<{ narration: string; amount: number; type: 'debit' | 'credit'; id?: string }>,
-    useAI?: boolean
+    transactions: Array<{ narration: string; amount: number; type: 'debit' | 'credit'; id?: string; accountId?: string }>,
+    useAI?: boolean,
+    forceAI?: boolean
   ): ReturnType<typeof classificationService.batchClassify>;
   /** Update model from user correction */
-  learnFromCorrection(transactionId: string, correctCategoryId: string, departmentId?: string): ReturnType<typeof classificationService.learnFromCorrection>;
+  learnFromCorrection(
+    transactionId: string,
+    correctCategoryId: string,
+    departmentId?: string,
+    options?: { world?: 'business' | 'personal'; scope?: 'row' | 'batch' | 'future'; rationale?: string }
+  ): ReturnType<typeof classificationService.learnFromCorrection>;
   recordHumanOverride(payload: {
     transactionId: string;
-    correctCategoryId: string;
+    correctCategoryId?: string;
     departmentId?: string;
     projectId?: string;
     scope: 'row' | 'batch' | 'future';
     rationale?: string;
     world?: 'business' | 'personal';
+    proposedNewCategory?: any;
   }): ReturnType<typeof classificationService.recordHumanOverride>;
-  getRules(): ReturnType<typeof classificationService.getRules>;
+  rejectSuggestion(
+    transactionId: string,
+    options?: { suggestedCategoryId?: string; suggestedConfidence?: number; reason?: string }
+  ): ReturnType<typeof classificationService.rejectSuggestion>;
+  getRules(includeInactive?: boolean): ReturnType<typeof classificationService.getRules>;
+  getRuleVersions(ruleId: string): ReturnType<typeof classificationService.getRuleVersions>;
+  getPolicy(): ReturnType<typeof classificationService.getPolicy>;
+  updatePolicy(updates: Record<string, unknown>): ReturnType<typeof classificationService.updatePolicy>;
   addRule(rule: any): ReturnType<typeof classificationService.addRule>;
   updateRule(ruleId: string, updates: any): ReturnType<typeof classificationService.updateRule>;
   deleteRule(ruleId: string): ReturnType<typeof classificationService.deleteRule>;
@@ -370,6 +390,7 @@ export interface ClassificationServices {
   approveBulkReviewGroup(transactionIds: string[], categoryId: string): ReturnType<typeof classificationService.approveBulkReviewGroup>;
   getDriftMetrics(): ReturnType<typeof classificationService.getDriftMetrics>;
   getTransactionEvidence(transactionId: string): ReturnType<typeof classificationService.getTransactionEvidence>;
+  getPerformance(): ReturnType<typeof classificationService.getPerformance>;
   getStats(): ReturnType<typeof classificationService.getStats>;
 }
 
@@ -433,12 +454,20 @@ export interface CostingServices {
   updateOverheadAllocation(id: string, updates: Partial<OverheadAllocation>): ReturnType<typeof costingService.updateOverheadAllocation>;
   deleteOverheadAllocation(id: string): ReturnType<typeof costingService.deleteOverheadAllocation>;
   setAllocationMethod(method: OverheadAllocation['allocationBase']): ReturnType<typeof costingService.setAllocationMethod>;
+  getAllocationRuns(): ReturnType<typeof costingService.getAllocationRuns>;
+  freezeAllocationRun(params?: { from?: string; to?: string; period?: string }): ReturnType<typeof costingService.freezeAllocationRun>;
   getCommissionStructures(): ReturnType<typeof costingService.getCommissionStructures>;
   createCommissionStructure(data: Omit<CommissionStructure, 'id' | 'organizationId'>): ReturnType<typeof costingService.createCommissionStructure>;
   updateCommissionStructure(id: string, updates: Partial<CommissionStructure>): ReturnType<typeof costingService.updateCommissionStructure>;
   deleteCommissionStructure(id: string): ReturnType<typeof costingService.deleteCommissionStructure>;
   getExchangeRates(): ReturnType<typeof costingService.getExchangeRates>;
+  saveExchangeRate(payload: { base: string; quote: string; rate: number }): ReturnType<typeof costingService.saveExchangeRate>;
   convertCurrency(amount: number, from: string, to: string): ReturnType<typeof costingService.convertCurrency>;
+  calculateQuote: typeof costingService.calculateQuote;
+  calculateQuoteRemote(payload: Record<string, unknown>): ReturnType<typeof costingService.calculateQuoteRemote>;
+  getQuotes(): ReturnType<typeof costingService.getQuotes>;
+  saveQuote(quote: Parameters<typeof costingService.saveQuote>[1]): ReturnType<typeof costingService.saveQuote>;
+  deleteQuote(quoteId: string): ReturnType<typeof costingService.deleteQuote>;
 }
 
 export interface SimulatorServices {
@@ -557,6 +586,7 @@ export function useOrgServices(): OrgServices {
       create:                 (data)          => projectService.create(orgId, data),
       update:                 (id, updates)   => projectService.update(id, updates, orgId || undefined),
       delete:                 (id)            => projectService.delete(id, orgId || undefined),
+      markCompleted:          (projId: string, completedAt?: string) => projectService.markCompleted(orgId, projId, completedAt),
       getProfitability:       (params?: any)  => projectService.getProfitability(orgId, params),
       getProjectDetails:      (projId: string, params?: any) => projectService.getProjectDetails(projId, orgId, params),
       approveTimesheetEntry:  (projId: string, entryId: string) => projectService.approveTimesheetEntry(orgId, projId, entryId),
@@ -643,11 +673,15 @@ export function useOrgServices(): OrgServices {
 
     // ── AI Classification Engine ─────────────────────────────────────────────
     classification: {
-      classify:             (narration, amount, type, world, transactionId) => classificationService.classify(orgId, narration, amount, type, world, transactionId),
-      batchClassify:        (txns, useAI)                     => classificationService.batchClassify(orgId, txns, useAI),
-      learnFromCorrection:  (txnId, catId, deptId)            => classificationService.learnFromCorrection(orgId, txnId, catId, deptId),
+      classify:             (narration, amount, type, world, transactionId, useAI, accountId) => classificationService.classify(orgId, narration, amount, type, world, transactionId, useAI, accountId),
+      batchClassify:        (txns, useAI, forceAI)            => classificationService.batchClassify(orgId, txns, useAI, forceAI),
+      learnFromCorrection:  (txnId, catId, deptId, options)   => classificationService.learnFromCorrection(orgId, txnId, catId, deptId, options),
       recordHumanOverride:  (payload)                         => classificationService.recordHumanOverride(orgId, payload),
-      getRules:             ()                                => classificationService.getRules(orgId || undefined),
+      rejectSuggestion:     (txnId, options)                  => classificationService.rejectSuggestion(orgId, txnId, options),
+      getRules:             (includeInactive?)                => classificationService.getRules(orgId || undefined, includeInactive),
+      getRuleVersions:      (ruleId)                          => classificationService.getRuleVersions(orgId, ruleId),
+      getPolicy:            ()                                => classificationService.getPolicy(orgId),
+      updatePolicy:         (updates)                         => classificationService.updatePolicy(orgId, updates),
       addRule:              (rule)                            => classificationService.addRule(rule, orgId || undefined),
       updateRule:           (ruleId, updates)                 => classificationService.updateRule(ruleId, updates, orgId || undefined),
       deleteRule:           (ruleId)                          => classificationService.deleteRule(ruleId, orgId || undefined),
@@ -658,6 +692,7 @@ export function useOrgServices(): OrgServices {
       approveBulkReviewGroup:(txIds, catId)                   => classificationService.approveBulkReviewGroup(orgId, txIds, catId),
       getDriftMetrics:      ()                                => classificationService.getDriftMetrics(orgId),
       getTransactionEvidence:(txnId)                          => classificationService.getTransactionEvidence(orgId, txnId),
+      getPerformance:       ()                                => classificationService.getPerformance(orgId),
       getStats:             ()                                => classificationService.getStats(orgId),
     },
 
@@ -701,14 +736,19 @@ export function useOrgServices(): OrgServices {
 
     // ── Recurring / scheduled transactions ───────────────────────────────────
     recurring: {
-      getAll:   ()                      => recurringTransactionService.getAll(orgId),
-      create:   (data)                  => recurringTransactionService.create(orgId, data),
-      update:   (id, updates)           => recurringTransactionService.update(id, updates, orgId || undefined),
-      delete:   (id)                    => recurringTransactionService.delete(id, orgId || undefined),
-      toggle:   (id)                    => recurringTransactionService.toggle(id, orgId || undefined),
-      generate: (asOfDate)              => recurringTransactionService.generate(orgId, asOfDate),
-      generateSingle: (recurringId)     => recurringTransactionService.generateSingle(recurringId, orgId || undefined),
-      getTotals: ()                     => recurringTransactionService.getTotals(orgId),
+      getAll:             ()                        => recurringTransactionService.getAll(orgId),
+      create:             (data)                    => recurringTransactionService.create(orgId, data),
+      update:             (id, updates)             => recurringTransactionService.update(id, updates, orgId || undefined),
+      delete:             (id)                      => recurringTransactionService.delete(id, orgId || undefined),
+      toggle:             (id)                      => recurringTransactionService.toggle(id, orgId || undefined),
+      generate:           (asOfDate)                => recurringTransactionService.generate(orgId, asOfDate),
+      generateSingle:     (recurringId)             => recurringTransactionService.generateSingle(recurringId, orgId || undefined),
+      getTotals:          ()                        => recurringTransactionService.getTotals(orgId),
+      getSuggestions:     (world?)                  => recurringTransactionService.getSuggestions(orgId, world),
+      promoteSuggestion:  (candidate)               => recurringTransactionService.promoteSuggestion(orgId, candidate),
+      getOccurrences:     (status?)                 => recurringTransactionService.getOccurrences(orgId, status),
+      approveOccurrence:  (occurrenceId)            => recurringTransactionService.approveOccurrence(orgId, occurrenceId),
+      rejectOccurrence:   (occurrenceId, reason?)   => recurringTransactionService.rejectOccurrence(orgId, occurrenceId, reason),
     },
 
     // ── Costing & Pricing Intelligence ──────────────────────────────────────
@@ -718,12 +758,20 @@ export function useOrgServices(): OrgServices {
       updateOverheadAllocation: (id, updates)                 => costingService.updateOverheadAllocation(orgId, id, updates),
       deleteOverheadAllocation: (id)                          => costingService.deleteOverheadAllocation(orgId, id),
       setAllocationMethod:      (method)                      => costingService.setAllocationMethod(orgId, method),
+      getAllocationRuns:        ()                            => costingService.getAllocationRuns(orgId),
+      freezeAllocationRun:      (params?)                     => costingService.freezeAllocationRun(orgId, params),
       getCommissionStructures:  ()                            => costingService.getCommissionStructures(orgId),
       createCommissionStructure:(data)                        => costingService.createCommissionStructure(orgId, data),
       updateCommissionStructure:(id, updates)                 => costingService.updateCommissionStructure(orgId, id, updates),
       deleteCommissionStructure:(id)                          => costingService.deleteCommissionStructure(orgId, id),
       getExchangeRates:         ()                            => costingService.getExchangeRates(orgId),
+      saveExchangeRate:         (payload)                     => costingService.saveExchangeRate(orgId, payload),
       convertCurrency:          (amount, from, to)            => costingService.convertCurrency(orgId, amount, from, to),
+      calculateQuote:           (input)                       => costingService.calculateQuote(input),
+      calculateQuoteRemote:     (payload)                     => costingService.calculateQuoteRemote(orgId, payload),
+      getQuotes:                ()                            => costingService.getQuotes(orgId),
+      saveQuote:                (quote)                       => costingService.saveQuote(orgId, quote),
+      deleteQuote:              (quoteId)                     => costingService.deleteQuote(orgId, quoteId),
     },
 
     // ── What-If Simulator ────────────────────────────────────────────────────

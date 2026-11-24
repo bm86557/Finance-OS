@@ -11,6 +11,7 @@ import { getSupabaseClient } from '@/lib/supabaseClient';
 import { dataStore } from './dataStore';
 import { reconcileTask, buildAutoCloseDescription, todayYmdLocal } from '@/lib/taskReconciler';
 import { isValidProjectTransaction, isDirectProjectDebit } from '@/lib/projectTransactionFilter';
+import { computeProjectSchedulePreview } from '@/lib/projectScheduleHours';
 import type { ServiceResponse, ProjectProfitability } from './types';
 
 const PROJ = (organizationId: string) =>
@@ -95,6 +96,26 @@ export const projectService = {
     return backendUnavailable<null>();
   },
 
+  async markCompleted(
+    organizationId: string,
+    projectId: string,
+    completedAt?: string,
+  ): Promise<ServiceResponse<Project>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<Project>(organizationId);
+      if (err) return err;
+      const res = await apiPostJson<{ completedAt?: string }, Project>(
+        `${PROJ(organizationId)}/${encodeURIComponent(projectId)}/complete`,
+        completedAt ? { completedAt } : {},
+      );
+      if (res.success) {
+        dataStore.notify('projects');
+      }
+      return res;
+    }
+    return backendUnavailable<Project>();
+  },
+
   async getProfitability(
     organizationId: string,
     params?: { from?: string; to?: string; period?: '1M' | '3M' | '12M' }
@@ -121,53 +142,32 @@ export const projectService = {
       }
     }
 
-    // Direct Supabase query fallback
+    // Direct Supabase query fallback (Schedule-driven Mon–Fri 40h/wk, 160h/mo — zero timesheet dependency)
     try {
       const sb = getSupabaseClient();
       if (sb) {
         const [
           { data: sbProjects },
           { data: sbTxns },
-          { data: sbTimesheets },
           { data: sbMembers },
           { data: sbDepts },
         ] = await Promise.all([
           sb.from('projects').select('*').eq('organization_id', organizationId),
           sb.from('transactions').select('*').eq('organization_id', organizationId),
-          sb.from('timesheet_entries').select('*').eq('organization_id', organizationId),
           sb.from('organization_members').select('*').eq('organization_id', organizationId),
           sb.from('departments').select('*').eq('organization_id', organizationId),
         ]);
 
         if (sbProjects && sbProjects.length > 0) {
           const txns = sbTxns || [];
-          const ts = sbTimesheets || [];
 
-          // Build department and member rate lookup maps
           const deptRateMap = new Map<string, number>();
           for (const d of (sbDepts || [])) {
             if (d.cost_per_hour && Number(d.cost_per_hour) > 0) {
               deptRateMap.set(d.id, Number(d.cost_per_hour));
+            } else if (d.budget && Number(d.budget) > 0) {
+              deptRateMap.set(d.id, Number(d.budget) / 160);
             }
-          }
-
-          const memberRateMap = new Map<string, number>();
-          for (const m of (sbMembers || [])) {
-            const fixedSal = Number(m.fixed_salary || 0);
-            let rate = 0;
-            if (fixedSal > 0) {
-              const hoursPerDay = Number(m.hours_per_day || 8);
-              const daysPerMonth = Number(m.working_days_per_month || 20);
-              const capHours = (hoursPerDay > 0 && daysPerMonth > 0) ? hoursPerDay * daysPerMonth : 160;
-              rate = fixedSal / capHours;
-            } else if (m.hourly_rate && Number(m.hourly_rate) > 0) {
-              rate = Number(m.hourly_rate);
-            } else if (m.department_id && deptRateMap.has(m.department_id)) {
-              rate = deptRateMap.get(m.department_id)!;
-            } else {
-              rate = 50.0;
-            }
-            memberRateMap.set(m.user_id || m.id, rate);
           }
 
           const profitability: ProjectProfitability[] = sbProjects.map((proj: any) => {
@@ -181,39 +181,76 @@ export const projectService = {
               .filter((t: any) => isDirectProjectDebit(t))
               .reduce((sum: number, t: any) => sum + Math.abs(Number(t.amount || 0)), 0);
 
-            const projTs = ts.filter((t: any) => t.project_id === proj.id);
-            const loggedHours = projTs.reduce((sum: number, t: any) => sum + Number(t.hours || 0), 0);
-            const billableHours = projTs.filter((t: any) => t.billable !== false).reduce((sum: number, t: any) => sum + Number(t.hours || 0), 0);
-            const nonBillableHours = projTs.filter((t: any) => t.billable === false).reduce((sum: number, t: any) => sum + Number(t.hours || 0), 0);
-            const contributorCount = new Set(projTs.map((t: any) => t.user_id)).size;
+            const assignedMembers = (sbMembers || []).filter((m: any) => {
+              const ap = Array.isArray(m.assigned_projects) ? m.assigned_projects : [];
+              return ap.includes(proj.id);
+            });
 
-            // Only approved timesheets accumulate to actual recognized labor cost (§12.4, §13)
-            const laborCost = projTs
-              .filter((t: any) => t.status === 'approved')
-              .reduce((sum: number, t: any) => {
-                const rate = memberRateMap.get(t.user_id) || 50.0;
-                return sum + (Number(t.hours || 0) * rate);
-              }, 0);
+            const memberCount = assignedMembers.length > 0
+              ? assignedMembers.length
+              : Math.max(1, Number(proj.planned_team_size || 1));
+
+            const combinedHourlyRate = assignedMembers.length > 0
+              ? assignedMembers.reduce((sum: number, m: any) => {
+                const sal = Number(m.fixed_salary || 0);
+                const hr = sal > 0 ? sal / 160 : (Number(m.hourly_rate || 0) || deptRateMap.get(proj.department_id) || 50);
+                return sum + hr;
+              }, 0)
+              : (deptRateMap.get(proj.department_id) || 50) * memberCount;
 
             const quotedAmount = Number(proj.quoted_amount || 0);
             const initialBaseline = Number(proj.initial_baseline_cost || 0);
             const committedRemainingWork = Number(proj.committed_remaining_work || 0);
-            const actualCost = Math.round((initialBaseline + directCost + laborCost) * 100) / 100;
 
-            // Recognized Revenue from ledger credits (§12.4, §14)
+            const preview = computeProjectSchedulePreview({
+              startDate: proj.start_date,
+              endDate: proj.end_date,
+              status: proj.status,
+              completedAt: proj.completed_at,
+              pausedAt: proj.paused_at,
+              pausedBusinessDays: Number(proj.paused_business_days || 0),
+              quotedAmount,
+              initialBaselineCost: initialBaseline + directCost,
+              budgetedHours: proj.budgeted_hours ? Number(proj.budgeted_hours) : null,
+              memberCount,
+              combinedHourlyRate,
+            });
+
+            const laborCost = preview.estimatedElapsedLaborCost;
+            const actualCost = Math.round((initialBaseline + directCost + laborCost) * 100) / 100;
             const recognizedRevenue = Math.round(revenue * 100) / 100;
             const operatingProfit = Math.round((recognizedRevenue - actualCost) * 100) / 100;
+            const quoteProfit = Math.round((quotedAmount - actualCost) * 100) / 100;
+            const quoteMarginPct = quotedAmount > 0 ? Math.round(((quoteProfit / quotedAmount) * 100) * 10) / 10 : null;
             const directCosts = Math.round((directCost + laborCost) * 100) / 100;
             const projectContribution = Math.round((recognizedRevenue - directCosts) * 100) / 100;
-            const profitMargin = recognizedRevenue > 0 ? Math.round(((operatingProfit / recognizedRevenue) * 100) * 10) / 10 : 0;
+            const profitMargin = recognizedRevenue > 0 ? Math.round(((operatingProfit / recognizedRevenue) * 100) * 10) / 10 : null;
             const budgetVariance = quotedAmount > 0
               ? Math.round((((actualCost - quotedAmount) / quotedAmount) * 100) * 10) / 10
               : 0;
-            const costToComplete = committedRemainingWork > 0
-              ? committedRemainingWork
-              : Math.max(0, quotedAmount - actualCost);
-            const projectedAtCompletion = actualCost + costToComplete;
+            const avgRate = memberCount > 0 ? combinedHourlyRate / memberCount : 50;
+            const costToComplete = proj.status === 'completed'
+              ? 0
+              : committedRemainingWork > 0
+                ? committedRemainingWork
+                : Math.round(preview.remainingHours * avgRate * 100) / 100;
+            const projectedAtCompletion = Math.round((actualCost + costToComplete) * 100) / 100;
             const marginAtRisk = Math.round((quotedAmount - projectedAtCompletion) * 100) / 100;
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const effectiveStatus =
+              proj.status === 'quoted' && proj.start_date && todayStr >= String(proj.start_date).slice(0, 10)
+                ? 'active'
+                : proj.status;
+            const isOverdue = effectiveStatus === 'active' && preview.overdueBusinessDays > 0;
+            const healthStatus =
+              effectiveStatus === 'quoted' ? 'quoted'
+                : effectiveStatus === 'on_hold' ? 'on_hold'
+                  : effectiveStatus === 'cancelled' ? 'cancelled'
+                    : effectiveStatus === 'completed' ? (quotedAmount > 0 && actualCost > quotedAmount ? 'completed_loss' : 'completed_profit')
+                      : quotedAmount > 0 && actualCost > quotedAmount ? 'in_loss'
+                        : isOverdue ? 'overtime'
+                          : marginAtRisk < 0 ? 'at_risk'
+                            : 'on_track';
 
             return {
               projectId: proj.id,
@@ -223,21 +260,43 @@ export const projectService = {
               actualCost,
               revenue: recognizedRevenue,
               profit: operatingProfit,
+              quoteProfit,
+              quoteMarginPct,
               profitMargin,
-              status: proj.status,
+              operatingMarginPct: recognizedRevenue > 0 ? profitMargin : null,
+              status: effectiveStatus,
               budgetVariance,
-              loggedHours: Math.round(loggedHours * 100) / 100,
-              billableHours: Math.round(billableHours * 100) / 100,
-              nonBillableHours: Math.round(nonBillableHours * 100) / 100,
+              plannedHours: preview.plannedHours,
+              elapsedHours: preview.elapsedHours,
+              remainingHours: preview.remainingHours,
+              overrunHours: preview.overrunHours,
+              projectSchedulePlannedHours: preview.projectSchedulePlannedHours,
+              projectScheduleElapsedHours: preview.projectScheduleElapsedHours,
+              projectScheduleRemainingHours: preview.projectScheduleRemainingHours,
+              projectScheduleOverrunHours: preview.projectScheduleOverrunHours,
+              plannedBusinessDays: preview.plannedBusinessDays,
+              elapsedBusinessDays: preview.elapsedBusinessDays,
+              remainingBusinessDays: preview.remainingBusinessDays,
+              overdueBusinessDays: preview.overdueBusinessDays,
+              isOverdue,
+              isOpenEnded: !proj.end_date,
+              breakEvenDate: preview.breakEvenDate,
+              healthStatus,
+              lossAmount: quotedAmount > 0 && actualCost > quotedAmount ? Math.round((actualCost - quotedAmount) * 100) / 100 : 0,
+              loggedHours: preview.elapsedHours,
+              billableHours: preview.elapsedHours,
+              nonBillableHours: 0,
               committedRemainingWork,
-              contributorCount,
+              contributorCount: assignedMembers.length,
               directCost: Math.round(directCost * 100) / 100,
               laborCost: Math.round(laborCost * 100) / 100,
               projectContribution,
               operatingProfit,
               costToComplete: Math.round(costToComplete * 100) / 100,
-              projectedAtCompletion: Math.round(projectedAtCompletion * 100) / 100,
+              projectedAtCompletion,
               marginAtRisk,
+              isUsingDeptFallback: assignedMembers.length === 0,
+              capacityBasis: 'scheduled_mon_fri_40h_160h',
             };
           });
 

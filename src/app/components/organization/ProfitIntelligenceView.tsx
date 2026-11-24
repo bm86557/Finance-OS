@@ -30,6 +30,9 @@ interface ProjectDetailsModalData {
     margin?: number;
     variancePct: number;
     loggedHours?: number;
+    elapsedHours?: number;
+    plannedHours?: number;
+    overrunHours?: number;
   };
   income?: Array<{
     id: string;
@@ -382,9 +385,9 @@ export function ProfitIntelligenceView() {
           : 'All Time (all transactions)';
 
   return (
-    <div 
-      className="min-h-screen p-8" 
-      style={{ 
+    <div
+      className="min-h-screen p-8"
+      style={{
         background: theme === 'dark' ? AXIOM.backgrounds.main : '#f8fafc',
       }}
     >
@@ -400,7 +403,7 @@ export function ProfitIntelligenceView() {
       {/* Header with AXIOM Icon Box */}
       <motion.div {...AXIOM.animations.fadeInTop} className="mb-8">
         <div className="flex items-center gap-3 mb-2">
-          <div 
+          <div
             className="p-3 rounded-xl flex items-center justify-center"
             style={{
               background: AXIOM.iconBoxes.purple,
@@ -428,17 +431,16 @@ export function ProfitIntelligenceView() {
                   p === 'ALL'
                     ? 'Show all transactions (including future-dated)'
                     : hasLiveDeptData
-                    ? 'Scale monthly department figures by this range (totals and department charts).'
-                    : 'Available when your org has at least one department with profitability data.'
+                      ? 'Scale monthly department figures by this range (totals and department charts).'
+                      : 'Available when your org has at least one department with profitability data.'
                 }
                 onClick={() => setPeriod(p)}
-                className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors min-h-9 touch-manipulation ${
-                  (!hasLiveDeptData && p !== 'ALL')
-                    ? 'cursor-not-allowed opacity-45 bg-slate-800/30 text-slate-500'
-                    : period === p
-                      ? 'bg-purple-500/30 text-white ring-1 ring-purple-400/40'
-                      : 'bg-slate-800/50 text-slate-400 hover:bg-slate-800'
-                }`}
+                className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors min-h-9 touch-manipulation ${(!hasLiveDeptData && p !== 'ALL')
+                  ? 'cursor-not-allowed opacity-45 bg-slate-800/30 text-slate-500'
+                  : period === p
+                    ? 'bg-purple-500/30 text-white ring-1 ring-purple-400/40'
+                    : 'bg-slate-800/50 text-slate-400 hover:bg-slate-800'
+                  }`}
               >
                 {p === '1M' ? '1 month' : p === '3M' ? '3 months' : p === '1Y' ? '1 year' : 'All Time'}
               </button>
@@ -467,28 +469,28 @@ export function ProfitIntelligenceView() {
           animate={{ opacity: 1, y: 0 }}
           className="group relative"
         >
-          <div 
+          <div
             className="relative overflow-hidden rounded-2xl p-6 border transition-all duration-300"
             style={{
-              background: theme === 'dark' 
+              background: theme === 'dark'
                 ? 'linear-gradient(135deg, rgba(30, 15, 50, 0.6) 0%, rgba(10, 5, 20, 0.8) 100%)'
                 : 'linear-gradient(135deg, rgba(255, 255, 255, 0.9) 0%, rgba(248, 250, 252, 0.9) 100%)',
               border: theme === 'dark' ? AXIOM.borders.cyan : '1px solid rgba(6, 182, 212, 0.3)',
-              boxShadow: theme === 'dark' 
+              boxShadow: theme === 'dark'
                 ? '0 4px 24px -4px rgba(59, 130, 246, 0.3), 0 0 48px -12px rgba(6, 182, 212, 0.2)'
                 : '0 4px 12px -2px rgba(59, 130, 246, 0.1)',
             }}
           >
-            <div 
+            <div
               className="absolute top-0 left-0 right-0 h-[2px] opacity-60"
               style={{
                 background: 'linear-gradient(to right, rgb(59, 130, 246), rgb(6, 182, 212), rgb(59, 130, 246))',
               }}
             />
-            
+
             <div className="relative z-10">
               <div className="flex items-center gap-3 mb-4">
-                <div 
+                <div
                   className="p-2.5 rounded-xl border shadow-lg"
                   style={{
                     background: theme === 'dark'
@@ -502,7 +504,7 @@ export function ProfitIntelligenceView() {
                 </div>
               </div>
               <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Total Revenue</p>
-              <p 
+              <p
                 className="text-3xl font-bold"
                 style={{
                   background: theme === 'dark'
@@ -525,28 +527,28 @@ export function ProfitIntelligenceView() {
           transition={{ delay: 0.1 }}
           className="group relative"
         >
-          <div 
+          <div
             className="relative overflow-hidden rounded-2xl p-6 border transition-all duration-300"
             style={{
-              background: theme === 'dark' 
+              background: theme === 'dark'
                 ? 'linear-gradient(135deg, rgba(30, 15, 50, 0.6) 0%, rgba(10, 5, 20, 0.8) 100%)'
                 : 'linear-gradient(135deg, rgba(255, 255, 255, 0.9) 0%, rgba(248, 250, 252, 0.9) 100%)',
               border: theme === 'dark' ? AXIOM.borders.green : '1px solid rgba(16, 185, 129, 0.3)',
-              boxShadow: theme === 'dark' 
+              boxShadow: theme === 'dark'
                 ? '0 4px 24px -4px rgba(16, 185, 129, 0.3), 0 0 48px -12px rgba(52, 211, 153, 0.2)'
                 : '0 4px 12px -2px rgba(16, 185, 129, 0.1)',
             }}
           >
-            <div 
+            <div
               className="absolute top-0 left-0 right-0 h-[2px] opacity-60"
               style={{
                 background: 'linear-gradient(to right, rgb(16, 185, 129), rgb(5, 150, 105), rgb(16, 185, 129))',
               }}
             />
-            
+
             <div className="relative z-10">
               <div className="flex items-center gap-3 mb-4">
-                <div 
+                <div
                   className="p-2.5 rounded-xl border shadow-lg"
                   style={{
                     background: theme === 'dark'
@@ -560,7 +562,7 @@ export function ProfitIntelligenceView() {
                 </div>
               </div>
               <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Gross Profit</p>
-              <p 
+              <p
                 className="text-3xl font-bold"
                 style={{
                   background: theme === 'dark'
@@ -585,28 +587,28 @@ export function ProfitIntelligenceView() {
           transition={{ delay: 0.2 }}
           className="group relative"
         >
-          <div 
+          <div
             className="relative overflow-hidden rounded-2xl p-6 border transition-all duration-300"
             style={{
-              background: theme === 'dark' 
+              background: theme === 'dark'
                 ? 'linear-gradient(135deg, rgba(30, 15, 50, 0.6) 0%, rgba(10, 5, 20, 0.8) 100%)'
                 : 'linear-gradient(135deg, rgba(255, 255, 255, 0.9) 0%, rgba(248, 250, 252, 0.9) 100%)',
               border: theme === 'dark' ? AXIOM.borders.purple : '1px solid rgba(168, 85, 247, 0.3)',
-              boxShadow: theme === 'dark' 
+              boxShadow: theme === 'dark'
                 ? '0 4px 24px -4px rgba(168, 85, 247, 0.3), 0 0 48px -12px rgba(139, 92, 246, 0.2)'
                 : '0 4px 12px -2px rgba(168, 85, 247, 0.1)',
             }}
           >
-            <div 
+            <div
               className="absolute top-0 left-0 right-0 h-[2px] opacity-60"
               style={{
                 background: 'linear-gradient(to right, rgb(168, 85, 247), rgb(139, 92, 246), rgb(168, 85, 247))',
               }}
             />
-            
+
             <div className="relative z-10">
               <div className="flex items-center gap-3 mb-4">
-                <div 
+                <div
                   className="p-2.5 rounded-xl border shadow-lg"
                   style={{
                     background: theme === 'dark'
@@ -620,7 +622,7 @@ export function ProfitIntelligenceView() {
                 </div>
               </div>
               <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Operating Profit</p>
-              <p 
+              <p
                 className="text-3xl font-bold"
                 style={{
                   background: theme === 'dark'
@@ -650,28 +652,28 @@ export function ProfitIntelligenceView() {
           transition={{ delay: 0.3 }}
           className="group relative"
         >
-          <div 
+          <div
             className="relative overflow-hidden rounded-2xl p-6 border transition-all duration-300"
             style={{
-              background: theme === 'dark' 
+              background: theme === 'dark'
                 ? 'linear-gradient(135deg, rgba(30, 15, 50, 0.6) 0%, rgba(10, 5, 20, 0.8) 100%)'
                 : 'linear-gradient(135deg, rgba(255, 255, 255, 0.9) 0%, rgba(248, 250, 252, 0.9) 100%)',
               border: theme === 'dark' ? AXIOM.borders.amber : '1px solid rgba(245, 158, 11, 0.3)',
-              boxShadow: theme === 'dark' 
+              boxShadow: theme === 'dark'
                 ? '0 4px 24px -4px rgba(245, 158, 11, 0.3), 0 0 48px -12px rgba(251, 146, 60, 0.2)'
                 : '0 4px 12px -2px rgba(245, 158, 11, 0.1)',
             }}
           >
-            <div 
+            <div
               className="absolute top-0 left-0 right-0 h-[2px] opacity-60"
               style={{
                 background: 'linear-gradient(to right, rgb(245, 158, 11), rgb(251, 146, 60), rgb(245, 158, 11))',
               }}
             />
-            
+
             <div className="relative z-10">
               <div className="flex items-center gap-3 mb-4">
-                <div 
+                <div
                   className="p-2.5 rounded-xl border shadow-lg"
                   style={{
                     background: theme === 'dark'
@@ -685,7 +687,7 @@ export function ProfitIntelligenceView() {
                 </div>
               </div>
               <p className="text-sm font-medium mb-2" style={{ color: theme === 'dark' ? '#cbd5e1' : '#475569' }}>Total Overhead</p>
-              <p 
+              <p
                 className="text-3xl font-bold"
                 style={{
                   background: theme === 'dark'
@@ -753,16 +755,16 @@ export function ProfitIntelligenceView() {
                 boxShadow: '0 20px 60px -20px rgba(168, 85, 247, 0.5)',
               }}
             >
-              <div 
+              <div
                 className="absolute inset-0 opacity-40"
                 style={{
                   background: 'radial-gradient(circle at 50% 50%, rgba(139, 92, 246, 0.3), transparent 70%)',
                 }}
               />
-              
+
               <div className="relative z-10">
                 <div className="flex items-center gap-3 mb-6">
-                  <div 
+                  <div
                     className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
                     style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
                   >
@@ -830,16 +832,16 @@ export function ProfitIntelligenceView() {
                 boxShadow: '0 20px 60px -20px rgba(236, 72, 153, 0.5)',
               }}
             >
-              <div 
+              <div
                 className="absolute inset-0 opacity-40"
                 style={{
                   background: 'radial-gradient(circle at 50% 50%, rgba(236, 72, 153, 0.3), transparent 70%)',
                 }}
               />
-              
+
               <div className="relative z-10">
                 <div className="flex items-center gap-3 mb-6">
-                  <div 
+                  <div
                     className="w-12 h-12 rounded-xl bg-gradient-to-br from-pink-500 to-rose-500 flex items-center justify-center"
                     style={{ boxShadow: '0 10px 30px -10px rgba(236, 72, 153, 0.6)' }}
                   >
@@ -916,7 +918,7 @@ export function ProfitIntelligenceView() {
             }}
           >
             <div className="flex items-center gap-3 mb-6">
-              <div 
+              <div
                 className="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center"
                 style={{ boxShadow: '0 10px 30px -10px rgba(6, 182, 212, 0.6)' }}
               >
@@ -952,13 +954,12 @@ export function ProfitIntelligenceView() {
                       <h3 className="text-xl font-bold text-white">{dept.name}</h3>
                       <p className="text-sm text-slate-400">👥 {dept.teamMembers} members · ⚡ {dept.utilization.toFixed(1)}% utilization</p>
                     </div>
-                    <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                      (dept.profitMargin || 0) >= 15 
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30' 
-                        : (dept.profitMargin || 0) >= 10 
-                        ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30' 
+                    <div className={`px-3 py-1 rounded-lg text-xs font-medium ${(dept.profitMargin || 0) >= 15
+                      ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-400/30'
+                      : (dept.profitMargin || 0) >= 10
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30'
                         : 'bg-red-500/20 text-red-300 border border-red-400/30'
-                    }`}>
+                      }`}>
                       {(dept.profitMargin || 0).toFixed(1)}% margin
                     </div>
                   </div>
@@ -1011,7 +1012,7 @@ export function ProfitIntelligenceView() {
           >
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-3">
-                <div 
+                <div
                   className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
                   style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
                 >
@@ -1019,21 +1020,20 @@ export function ProfitIntelligenceView() {
                 </div>
                 <div>
                   <h2 className="text-2xl font-bold text-white">Project Profitability</h2>
-                  <p className="text-slate-400 text-sm">Direct expense & timesheet labor burn analysis</p>
+                  <p className="text-slate-400 text-sm">Direct expense &amp; automatic Mon–Fri schedule labor burn analysis</p>
                 </div>
               </div>
-              
+
               {/* Period filter buttons */}
               <div className="flex gap-2">
                 {(['1M', '3M', '12M'] as const).map(p => (
                   <button
                     key={p}
                     onClick={() => setProjectPeriod(p)}
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-                      projectPeriod === p 
-                        ? 'bg-purple-600 text-white shadow-lg' 
-                        : 'bg-white/10 text-gray-400 hover:bg-white/20'
-                    }`}
+                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${projectPeriod === p
+                      ? 'bg-purple-600 text-white shadow-lg'
+                      : 'bg-white/10 text-gray-400 hover:bg-white/20'
+                      }`}
                   >
                     {p === '1M' ? 'Last Month' : p === '3M' ? 'Last 3 Months' : 'Last Year'}
                   </button>
@@ -1092,31 +1092,30 @@ export function ProfitIntelligenceView() {
                           <p className="text-sm text-slate-400">{project.client}</p>
                         </div>
                         <div className="flex items-center gap-3">
-                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                            project.status === 'completed' 
-                              ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
-                              : project.status === 'in-progress' 
-                              ? 'bg-blue-500/20 text-blue-300 border border-blue-400/30' 
+                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${project.status === 'completed'
+                            ? 'bg-green-500/20 text-green-300 border border-green-400/30'
+                            : project.status === 'in-progress'
+                              ? 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
                               : 'bg-slate-500/20 text-slate-300 border border-slate-400/30'
-                          }`}>
+                            }`}>
                             {project.status}
                           </div>
-                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                            project.profitMargin >= 20 
-                              ? 'bg-green-500/20 text-green-300 border border-green-400/30' 
-                              : project.profitMargin >= 10 
-                              ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30' 
-                              : 'bg-red-500/20 text-red-300 border border-red-400/30'
-                          }`}>
-                            {project.profitMargin.toFixed(1)}%
+                          <div className={`px-3 py-1 rounded-lg text-xs font-medium ${project.profitMargin == null
+                            ? 'bg-slate-500/20 text-slate-300 border border-slate-400/30'
+                            : project.profitMargin >= 20
+                              ? 'bg-green-500/20 text-green-300 border border-green-400/30'
+                              : project.profitMargin >= 10
+                                ? 'bg-amber-500/20 text-amber-300 border border-amber-400/30'
+                                : 'bg-red-500/20 text-red-300 border border-red-400/30'
+                            }`}>
+                            {project.profitMargin != null ? `${project.profitMargin.toFixed(1)}%` : 'N/A'}
                           </div>
                           {/* Budget variance indicator */}
                           {project.budgetVariance !== 0 && (
-                            <div className={`px-3 py-1 rounded-lg text-xs font-medium flex items-center gap-1 ${
-                              project.budgetVariance > 0 
-                                ? 'bg-red-500/20 text-red-300 border border-red-400/30' 
-                                : 'bg-green-500/20 text-green-300 border border-green-400/30'
-                            }`}>
+                            <div className={`px-3 py-1 rounded-lg text-xs font-medium flex items-center gap-1 ${project.budgetVariance > 0
+                              ? 'bg-red-500/20 text-red-300 border border-red-400/30'
+                              : 'bg-green-500/20 text-green-300 border border-green-400/30'
+                              }`}>
                               {project.budgetVariance > 0 ? (
                                 <TrendingUp className="w-3 h-3" />
                               ) : (
@@ -1132,7 +1131,7 @@ export function ProfitIntelligenceView() {
                           <p className="text-xs text-slate-400 mb-1">Quoted Amount</p>
                           <p className="font-bold text-blue-400">{currency} {(project.quotedAmount / 1000).toFixed(0)}K</p>
                           <p className="text-[11px] text-slate-400">
-                            {project.loggedHours > 0 ? `${project.loggedHours.toFixed(1)}h logged` : '0h logged'}
+                            {project.loggedHours > 0 ? `${project.loggedHours.toFixed(1)}h scheduled` : '0h scheduled'}
                           </p>
                         </div>
                         <div>
@@ -1153,7 +1152,7 @@ export function ProfitIntelligenceView() {
                           <p className={`font-bold ${project.actualProfit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                             {currency} {(project.actualProfit / 1000).toFixed(0)}K
                           </p>
-                          <p className="text-[11px] text-slate-400">{project.profitMargin.toFixed(1)}% margin</p>
+                          <p className="text-[11px] text-slate-400">{project.profitMargin != null ? `${project.profitMargin.toFixed(1)}% margin` : 'N/A margin'}</p>
                         </div>
                       </div>
                       <button
@@ -1186,16 +1185,16 @@ export function ProfitIntelligenceView() {
               boxShadow: '0 20px 60px -20px rgba(6, 182, 212, 0.5)',
             }}
           >
-            <div 
+            <div
               className="absolute inset-0 opacity-40"
               style={{
                 background: 'radial-gradient(circle at 50% 50%, rgba(6, 182, 212, 0.3), transparent 70%)',
               }}
             />
-            
+
             <div className="relative z-10">
               <div className="flex items-center gap-3 mb-6">
-                <div 
+                <div
                   className="w-12 h-12 rounded-xl bg-gradient-to-br from-cyan-500 to-blue-500 flex items-center justify-center"
                   style={{ boxShadow: '0 10px 30px -10px rgba(6, 182, 212, 0.6)' }}
                 >
@@ -1262,16 +1261,16 @@ export function ProfitIntelligenceView() {
                 boxShadow: '0 20px 60px -20px rgba(245, 158, 11, 0.5)',
               }}
             >
-              <div 
+              <div
                 className="absolute inset-0 opacity-40"
                 style={{
                   background: 'radial-gradient(circle at 50% 50%, rgba(245, 158, 11, 0.3), transparent 70%)',
                 }}
               />
-              
+
               <div className="relative z-10">
                 <div className="flex items-center gap-3 mb-6">
-                  <div 
+                  <div
                     className="w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-orange-500 flex items-center justify-center"
                     style={{ boxShadow: '0 10px 30px -10px rgba(245, 158, 11, 0.6)' }}
                   >
@@ -1303,9 +1302,9 @@ export function ProfitIntelligenceView() {
                           <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
                         ))}
                       </Pie>
-                      <Tooltip 
-                        contentStyle={{ 
-                          backgroundColor: 'rgba(15, 23, 42, 0.98)', 
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: 'rgba(15, 23, 42, 0.98)',
                           border: '1px solid rgba(245, 158, 11, 0.3)',
                           backdropFilter: 'blur(20px)',
                           borderRadius: '12px',
@@ -1335,7 +1334,7 @@ export function ProfitIntelligenceView() {
               }}
             >
               <div className="flex items-center gap-3 mb-6">
-                <div 
+                <div
                   className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center"
                   style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
                 >
@@ -1349,8 +1348,8 @@ export function ProfitIntelligenceView() {
 
               <div className="space-y-4">
                 {(overheadData?.items || []).map((overhead, idx) => (
-                  <motion.div 
-                    key={overhead.id} 
+                  <motion.div
+                    key={overhead.id}
                     initial={{ opacity: 0, x: -20 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: 0.6 + idx * 0.1 }}
@@ -1454,11 +1453,10 @@ export function ProfitIntelligenceView() {
                       <p className="text-slate-400 text-sm">{description}</p>
                     </div>
                     <div
-                      className={`px-3 py-1 rounded-lg text-xs font-medium ${
-                        impact >= 0
-                          ? 'bg-green-500/20 text-green-300 border border-green-400/30'
-                          : 'bg-red-500/20 text-red-300 border border-red-400/30'
-                      }`}
+                      className={`px-3 py-1 rounded-lg text-xs font-medium ${impact >= 0
+                        ? 'bg-green-500/20 text-green-300 border border-green-400/30'
+                        : 'bg-red-500/20 text-red-300 border border-red-400/30'
+                        }`}
                     >
                       Impact {currency} {(impact / 1000).toFixed(0)}K
                     </div>
@@ -1514,7 +1512,7 @@ export function ProfitIntelligenceView() {
             }}
           >
             <div className="flex items-center gap-3 mb-6">
-              <div 
+              <div
                 className="w-12 h-12 rounded-xl bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center"
                 style={{ boxShadow: '0 10px 30px -10px rgba(59, 130, 246, 0.6)' }}
               >
@@ -1547,9 +1545,9 @@ export function ProfitIntelligenceView() {
                           <Cell fill="#3b82f6" />
                           <Cell fill="#10b981" />
                         </Pie>
-                        <Tooltip 
-                          contentStyle={{ 
-                            backgroundColor: 'rgba(15, 23, 42, 0.98)', 
+                        <Tooltip
+                          contentStyle={{
+                            backgroundColor: 'rgba(15, 23, 42, 0.98)',
                             border: '1px solid rgba(148, 163, 184, 0.3)',
                             backdropFilter: 'blur(20px)',
                             borderRadius: '12px',
@@ -1570,10 +1568,10 @@ export function ProfitIntelligenceView() {
                   <h3 className="text-lg font-bold text-white mb-2">Business Income</h3>
                   <p className="text-3xl font-bold text-blue-400 mb-2">{currency} {((businessPersonalData?.find(d => d.scope === 'business')?.income || 0) / 1000).toFixed(0)}K</p>
                   <p className="text-sm text-blue-200">
-                    {businessPersonalData ? 
-                      `${(((businessPersonalData.find(d => d.scope === 'business')?.income || 0) / 
-                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) + 
-                         (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income` 
+                    {businessPersonalData ?
+                      `${(((businessPersonalData.find(d => d.scope === 'business')?.income || 0) /
+                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) +
+                          (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income`
                       : '0% of total income'}
                   </p>
                   <div className="mt-3 space-y-1 text-sm text-blue-100">
@@ -1591,10 +1589,10 @@ export function ProfitIntelligenceView() {
                   <h3 className="text-lg font-bold text-white mb-2">Personal Income</h3>
                   <p className="text-3xl font-bold text-green-400 mb-2">{currency} {((businessPersonalData?.find(d => d.scope === 'personal')?.income || 0) / 1000).toFixed(0)}K</p>
                   <p className="text-sm text-green-200">
-                    {businessPersonalData ? 
-                      `${(((businessPersonalData.find(d => d.scope === 'personal')?.income || 0) / 
-                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) + 
-                         (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income` 
+                    {businessPersonalData ?
+                      `${(((businessPersonalData.find(d => d.scope === 'personal')?.income || 0) /
+                        ((businessPersonalData.find(d => d.scope === 'business')?.income || 0) +
+                          (businessPersonalData.find(d => d.scope === 'personal')?.income || 0))) * 100).toFixed(1)}% of total income`
                       : '0% of total income'}
                   </p>
                   <div className="mt-3 space-y-1 text-sm text-green-100">
@@ -1628,7 +1626,7 @@ export function ProfitIntelligenceView() {
           >
             <div className="flex items-center justify-between mb-6 flex-wrap gap-4">
               <div className="flex items-center gap-3">
-                <div 
+                <div
                   className="w-12 h-12 rounded-xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shrink-0"
                   style={{ boxShadow: '0 10px 30px -10px rgba(168, 85, 247, 0.6)' }}
                 >
@@ -1781,13 +1779,12 @@ export function ProfitIntelligenceView() {
             {projectDetails?.project && (
               <div className="flex items-center gap-3 mt-2">
                 <p className="text-slate-400">{projectDetails.project.clientName}</p>
-                <div className={`px-2 py-1 rounded text-xs font-medium ${
-                  projectDetails.project.status === 'completed' 
-                    ? 'bg-green-500/20 text-green-300' 
-                    : projectDetails.project.status === 'active' 
-                    ? 'bg-blue-500/20 text-blue-300' 
+                <div className={`px-2 py-1 rounded text-xs font-medium ${projectDetails.project.status === 'completed'
+                  ? 'bg-green-500/20 text-green-300'
+                  : projectDetails.project.status === 'active'
+                    ? 'bg-blue-500/20 text-blue-300'
                     : 'bg-slate-500/20 text-slate-300'
-                }`}>
+                  }`}>
                   {projectDetails.project.status}
                 </div>
               </div>
@@ -1817,17 +1814,15 @@ export function ProfitIntelligenceView() {
                 </div>
                 <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
                   <p className="text-xs text-slate-400 mb-1">Operating Profit</p>
-                  <p className={`text-lg font-bold ${
-                    projectDetails.summary.netProfit >= 0 ? 'text-green-400' : 'text-red-400'
-                  }`}>
+                  <p className={`text-lg font-bold ${projectDetails.summary.netProfit >= 0 ? 'text-green-400' : 'text-red-400'
+                    }`}>
                     {currency} {(projectDetails.summary.netProfit / 1000).toFixed(1)}K
                   </p>
                 </div>
                 <div className="p-4 rounded-lg bg-slate-800/50 border border-slate-700">
                   <p className="text-xs text-slate-400 mb-1">vs Quoted</p>
-                  <p className={`text-lg font-bold ${
-                    projectDetails.summary.variancePct <= 0 ? 'text-green-400' : 'text-red-400'
-                  }`}>
+                  <p className={`text-lg font-bold ${projectDetails.summary.variancePct <= 0 ? 'text-green-400' : 'text-red-400'
+                    }`}>
                     {projectDetails.summary.variancePct > 0 ? '+' : ''}
                     {projectDetails.summary.variancePct.toFixed(1)}%
                   </p>
@@ -1843,8 +1838,8 @@ export function ProfitIntelligenceView() {
                   </h3>
                   <div className="space-y-2">
                     {projectDetails.income.map((txn: any) => (
-                      <div 
-                        key={txn.id} 
+                      <div
+                        key={txn.id}
                         className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
                       >
                         <div className="flex-1">
@@ -1871,8 +1866,8 @@ export function ProfitIntelligenceView() {
                   </h3>
                   <div className="space-y-2">
                     {projectDetails.expenses.map((txn: any) => (
-                      <div 
-                        key={txn.id} 
+                      <div
+                        key={txn.id}
                         className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
                       >
                         <div className="flex-1">
@@ -1890,13 +1885,13 @@ export function ProfitIntelligenceView() {
                 </div>
               )}
 
-              {/* Attributed Timesheet Labor Entries */}
+              {/* Schedule-Allocated Team Labor Entries (Mon–Fri 40h/wk, 160h/mo) */}
               {projectDetails.laborEntries && projectDetails.laborEntries.length > 0 && (
                 <div>
                   <h3 className="text-lg font-semibold text-white mb-3 flex items-center justify-between">
                     <span className="flex items-center gap-2">
                       <Clock className="w-5 h-5 text-cyan-400" />
-                      Attributed Timesheet Labor ({projectDetails.summary.loggedHours?.toFixed(1) || '0.0'} hrs)
+                      Schedule-Allocated Team Labor ({(projectDetails.summary.elapsedHours ?? projectDetails.summary.loggedHours ?? 0).toFixed(1)} hrs · Mon–Fri)
                     </span>
                     <span className="text-sm font-mono text-cyan-400 font-normal">
                       Total: {currency} {Math.round(projectDetails.summary.laborCost || 0).toLocaleString()}
@@ -1904,14 +1899,22 @@ export function ProfitIntelligenceView() {
                   </h3>
                   <div className="space-y-2">
                     {projectDetails.laborEntries.map((l: any) => (
-                      <div 
-                        key={l.id} 
+                      <div
+                        key={l.id}
                         className="p-3 rounded-lg bg-slate-800/30 border border-slate-700/50 flex justify-between items-center"
                       >
                         <div className="flex-1">
-                          <p className="font-medium text-white">{l.userName || 'Employee'}</p>
+                          <p className="font-medium text-white">
+                            {l.userName || 'Team Member'}
+                            {l.allocationSharePct != null && (
+                              <span className="ml-2 text-xs font-mono text-cyan-300 bg-cyan-500/10 px-1.5 py-0.5 rounded">
+                                {l.allocationSharePct}% split
+                              </span>
+                            )}
+                          </p>
                           <p className="text-xs text-slate-400 mt-1">
-                            {new Date(l.date).toLocaleDateString()} • {l.hours.toFixed(1)} hrs @ {currency} {l.effectiveHourlyRate.toFixed(2)}/hr
+                            From {new Date(l.date).toLocaleDateString()} • {l.hours.toFixed(1)} hrs{l.plannedHours > 0 ? ` / ${l.plannedHours.toFixed(0)}h planned` : ''} @ {currency} {l.effectiveHourlyRate.toFixed(2)}/hr
+                            {l.overrunHours > 0 ? ` • +${l.overrunHours.toFixed(1)}h overrun` : ''}
                           </p>
                         </div>
                         <p className="font-bold text-cyan-400 font-mono">
@@ -1923,13 +1926,13 @@ export function ProfitIntelligenceView() {
                 </div>
               )}
 
-              {(!projectDetails.income || projectDetails.income.length === 0) && 
-               (!projectDetails.expenses || projectDetails.expenses.length === 0) && 
-               (!projectDetails.laborEntries || projectDetails.laborEntries.length === 0) && (
-                <div className="py-8 text-center text-slate-400">
-                  No transactions or labor entries found for this project
-                </div>
-              )}
+              {(!projectDetails.income || projectDetails.income.length === 0) &&
+                (!projectDetails.expenses || projectDetails.expenses.length === 0) &&
+                (!projectDetails.laborEntries || projectDetails.laborEntries.length === 0) && (
+                  <div className="py-8 text-center text-slate-400">
+                    No transactions or labor entries found for this project
+                  </div>
+                )}
             </div>
           ) : (
             <div className="py-8 text-center text-slate-400">

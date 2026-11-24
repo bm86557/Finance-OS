@@ -38,7 +38,7 @@ import {
 } from 'lucide-react';
 import { AXIOM } from '../../../styles/axiom-tokens';
 // Wired to organizationService for member management
-import { organizationService, type AgencyTeam } from '@/services/organizationService';
+import { organizationService } from '@/services/organizationService';
 import { authService } from '@/services/authService';
 import { dataStore } from '@/services/dataStore';
 import { departmentService } from '@/services/departmentService';
@@ -62,7 +62,7 @@ import {
 } from '../ui/dialog';
 import { Loader2 } from 'lucide-react';
 
-type TeamView = 'members' | 'teams' | 'announcements' | 'roles' | 'activity' | 'invitations';
+type TeamView = 'members' | 'timesheets' | 'announcements' | 'roles' | 'activity' | 'invitations';
 type MemberRole = 'org_admin' | 'team_member' | 'accountant' | 'viewer';
 type MemberStatus = 'active' | 'inactive' | 'pending';
 
@@ -305,14 +305,40 @@ export function TeamPermissions() {
     ['projects'],
   );
 
-  // ── Real Organization Timesheets (to compute monthly logged hours) ──
+  // ── Real Organization Timesheets (HR attendance review + monthly logged hours) ──
   const {
     data: orgTimesheets = [],
+    refetch: refetchTimesheets,
   } = useServiceArray(
     () => employeeService.getTimesheetsByOrg(orgId),
     [orgId],
     ['timesheets', orgId],
   );
+
+  const [reviewingTsId, setReviewingTsId] = React.useState<string | null>(null);
+  const handleReviewTimesheet = async (ts: any, action: 'approve' | 'reject') => {
+    if (!ts?.id || !ts?.projectId) {
+      toast.error('Timesheet entry is missing a project reference.');
+      return;
+    }
+    setReviewingTsId(ts.id);
+    try {
+      const res =
+        action === 'approve'
+          ? await projectService.approveTimesheetEntry(orgId, ts.projectId, ts.id)
+          : await projectService.rejectTimesheetEntry(orgId, ts.projectId, ts.id, 'Returned for revision by manager');
+      if (res.success) {
+        toast.success(action === 'approve' ? 'Employee timesheet approved (HR log).' : 'Timesheet returned to draft.');
+        await refetchTimesheets();
+      } else {
+        toast.error(res.error || 'Could not update timesheet status');
+      }
+    } catch (err: any) {
+      toast.error(err?.message || 'Error updating timesheet');
+    } finally {
+      setReviewingTsId(null);
+    }
+  };
 
   const monthlyHoursByMember = React.useMemo(() => {
     const curMonth = new Date().toISOString().slice(0, 7);
@@ -360,124 +386,6 @@ export function TeamPermissions() {
   const [filterRole, setFilterRole] = React.useState<string>('all');
   const [updatingMemberId, setUpdatingMemberId] = React.useState<string | null>(null);
   const [salaryDrafts, setSalaryDrafts] = React.useState<Record<string, string>>({});
-
-  // ── Cross-Departmental Agency Teams / Squads ───────────────────────
-  const {
-    data: agencyTeams = [],
-    loading: teamsLoading,
-    refetch: refetchTeams,
-  } = useServiceArray(
-    () => organizationService.getTeams(orgId),
-    [orgId],
-    ['agency_teams', orgId],
-  );
-
-  const [teamDialogOpen, setTeamDialogOpen] = React.useState(false);
-  const [editingTeam, setEditingTeam] = React.useState<AgencyTeam | null>(null);
-  const [teamName, setTeamName] = React.useState('');
-  const [teamDescription, setTeamDescription] = React.useState('');
-  const [teamProjectId, setTeamProjectId] = React.useState('');
-  const [teamLeadUserId, setTeamLeadUserId] = React.useState('');
-  const [teamMemberIds, setTeamMemberIds] = React.useState<string[]>([]);
-  const [teamDeptFilter, setTeamDeptFilter] = React.useState<string>('ALL');
-  const [savingTeam, setSavingTeam] = React.useState(false);
-  const [deletingTeamId, setDeletingTeamId] = React.useState<string | null>(null);
-
-  const openCreateTeamModal = (preselectedMemberIds: string[] = []) => {
-    setEditingTeam(null);
-    setTeamName('');
-    setTeamDescription('');
-    setTeamProjectId(orgProjects[0]?.id || '');
-    setTeamMemberIds(preselectedMemberIds);
-    setTeamLeadUserId(preselectedMemberIds[0] || '');
-    setTeamDeptFilter('ALL');
-    setTeamDialogOpen(true);
-  };
-
-  const openEditTeamModal = (team: AgencyTeam) => {
-    setEditingTeam(team);
-    setTeamName(team.name);
-    setTeamDescription(team.description || '');
-    setTeamProjectId(team.projectId || '');
-    setTeamMemberIds(team.memberIds || []);
-    setTeamLeadUserId(team.leadUserId || team.memberIds?.[0] || '');
-    setTeamDeptFilter('ALL');
-    setTeamDialogOpen(true);
-  };
-
-  const toggleTeamMemberSelection = (userId: string) => {
-    setTeamMemberIds((prev) => {
-      const exists = prev.includes(userId);
-      const next = exists ? prev.filter((id) => id !== userId) : [...prev, userId];
-      if (!exists && !teamLeadUserId) {
-        setTeamLeadUserId(userId);
-      } else if (exists && teamLeadUserId === userId) {
-        setTeamLeadUserId(next[0] || '');
-      }
-      return next;
-    });
-  };
-
-  const handleSaveTeam = async () => {
-    if (!teamName.trim()) {
-      toast.error('Please enter a Team / Squad name');
-      return;
-    }
-    if (teamMemberIds.length === 0) {
-      toast.error('Please select at least one employee for this team');
-      return;
-    }
-
-    setSavingTeam(true);
-    try {
-      const payload = {
-        name: teamName.trim(),
-        description: teamDescription.trim(),
-        projectId: teamProjectId || undefined,
-        leadUserId: teamLeadUserId || teamMemberIds[0],
-        memberIds: teamMemberIds,
-      };
-
-      const res = editingTeam
-        ? await organizationService.updateTeam(orgId, editingTeam.id, payload)
-        : await organizationService.createTeam(orgId, payload);
-
-      if (res.success) {
-        toast.success(
-          editingTeam
-            ? `Updated team "${teamName.trim()}"`
-            : `Created cross-departmental team "${teamName.trim()}"!`,
-        );
-        setTeamDialogOpen(false);
-        await Promise.all([refetchTeams(), refetchMembers()]);
-        setActiveView('teams');
-      } else {
-        toast.error(res.error || 'Failed to save team');
-      }
-    } catch (err: any) {
-      toast.error(err?.message || 'Failed to save team');
-    } finally {
-      setSavingTeam(false);
-    }
-  };
-
-  const handleDeleteTeam = async (team: AgencyTeam) => {
-    if (!window.confirm(`Delete team "${team.name}"?`)) return;
-    setDeletingTeamId(team.id);
-    try {
-      const res = await organizationService.deleteTeam(orgId, team.id);
-      if (res.success) {
-        toast.success(`Deleted team "${team.name}"`);
-        await refetchTeams();
-      } else {
-        toast.error(res.error || 'Failed to delete team');
-      }
-    } catch {
-      toast.error('Failed to delete team');
-    } finally {
-      setDeletingTeamId(null);
-    }
-  };
 
   // ── Company Announcements Management State & Actions ──────────────
   const {
@@ -981,9 +889,14 @@ export function TeamPermissions() {
     return matchesSearch && matchesRole;
   });
 
+  const pendingTimesheetsCount = React.useMemo(
+    () => (orgTimesheets || []).filter((ts: any) => ts.status === 'submitted').length,
+    [orgTimesheets],
+  );
+
   const viewButtons = [
     { id: 'members' as const, label: 'Team Members', icon: Users },
-    { id: 'teams' as const, label: `Agency Teams (${agencyTeams.length})`, icon: GitBranch },
+    { id: 'timesheets' as const, label: `Timesheets${pendingTimesheetsCount > 0 ? ` (${pendingTimesheetsCount})` : ''}`, icon: Clock },
     { id: 'announcements' as const, label: `Company News (${announcements.length})`, icon: Megaphone },
     { id: 'roles' as const, label: 'Roles & Permissions', icon: Shield },
     { id: 'activity' as const, label: 'Activity Log', icon: Activity },
@@ -1013,21 +926,6 @@ export function TeamPermissions() {
             </div>
           </div>
           <div className="flex flex-wrap gap-3">
-            <motion.button
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-              onClick={() => openCreateTeamModal()}
-              className="px-4 py-2 rounded-xl text-sm font-medium flex items-center gap-2"
-              style={{
-                background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.35), rgba(6, 182, 212, 0.35))',
-                border: '1px solid rgba(16, 185, 129, 0.55)',
-                boxShadow: '0 10px 30px -10px rgba(16, 185, 129, 0.5)',
-                color: '#ffffff',
-              }}
-            >
-              <GitBranch className="size-4 text-emerald-300" />
-              + Create Team
-            </motion.button>
             <motion.button
               whileHover={{ scale: 1.05 }}
               whileTap={{ scale: 0.95 }}
@@ -1361,24 +1259,24 @@ export function TeamPermissions() {
 
               {/* Monthly Logged Hours for this member (not shown for Organization Owner) */}
               {member.orgRole !== 'owner' && (
-  <div
-                className="flex items-center justify-between p-2.5 rounded-xl mb-4"
-                style={{
-                  background: 'rgba(59, 130, 246, 0.08)',
-                  border: '1px solid rgba(59, 130, 246, 0.2)',
-                }}
-              >
-                <div className="flex items-center gap-2">
-                  <Clock className="size-4 text-blue-400" />
-                  <span className="text-xs text-slate-300 font-medium">Logged this month</span>
+                <div
+                  className="flex items-center justify-between p-2.5 rounded-xl mb-4"
+                  style={{
+                    background: 'rgba(59, 130, 246, 0.08)',
+                    border: '1px solid rgba(59, 130, 246, 0.2)',
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <Clock className="size-4 text-blue-400" />
+                    <span className="text-xs text-slate-300 font-medium">Logged this month</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs font-mono font-bold text-white bg-blue-500/20 px-2 py-0.5 rounded border border-blue-500/30">
+                      {(monthlyHoursByMember.get(member.id) || 0).toFixed(1)}h
+                    </span>
+                    <span className="text-[10px] font-mono text-slate-400">/ 160h</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs font-mono font-bold text-white bg-blue-500/20 px-2 py-0.5 rounded border border-blue-500/30">
-                    {(monthlyHoursByMember.get(member.id) || 0).toFixed(1)}h
-                  </span>
-                  <span className="text-[10px] font-mono text-slate-400">/ 160h</span>
-                </div>
-              </div>
               )}
 
               <div className="mb-4">
@@ -1656,73 +1554,6 @@ export function TeamPermissions() {
                 </div>
               )}
 
-              {/* Cross-Departmental Agency Teams / Squads for this employee */}
-              {member.orgRole !== 'owner' && (
-                <div className="mb-4">
-                  <div className="text-xs text-slate-400 mb-1.5 flex items-center justify-between">
-                    <span className="flex items-center gap-1.5">
-                      <GitBranch className="size-3.5 text-emerald-400" />
-                      Agency Teams / Squads
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => openCreateTeamModal([member.id])}
-                      className="text-[11px] text-emerald-400 hover:text-emerald-300 font-mono underline-offset-2 hover:underline"
-                    >
-                      + Make Team with {member.name.split(' ')[0]}
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {agencyTeams
-                      .filter((t) => {
-                        const memId = String(member.id || '').trim();
-                        const memEmail = String(member.email || '').toLowerCase().trim();
-                        const inIds = Array.isArray(t.memberIds) && t.memberIds.some((id) => String(id).trim() === memId);
-                        const inMembers = Array.isArray(t.members) && t.members.some(
-                          (m) =>
-                            String(m.userId || (m as any).id || '').trim() === memId ||
-                            (memEmail && String(m.email || '').toLowerCase().trim() === memEmail)
-                        );
-                        return inIds || inMembers;
-                      })
-                      .map((t) => (
-                        <span
-                          key={t.id}
-                          onClick={() => openEditTeamModal(t)}
-                          title="Click to view or edit team"
-                          className="cursor-pointer inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-all hover:brightness-110"
-                          style={{
-                            background: 'rgba(16, 185, 129, 0.14)',
-                            border: '1px solid rgba(16, 185, 129, 0.35)',
-                            color: '#6ee7b7',
-                          }}
-                        >
-                          <GitBranch className="size-3" />
-                          <span>{t.name}</span>
-                          {t.leadUserId === member.id && (
-                            <span className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                              Lead
-                            </span>
-                          )}
-                        </span>
-                      ))}
-                    {agencyTeams.filter((t) => {
-                      const memId = String(member.id || '').trim();
-                      const memEmail = String(member.email || '').toLowerCase().trim();
-                      const inIds = Array.isArray(t.memberIds) && t.memberIds.some((id) => String(id).trim() === memId);
-                      const inMembers = Array.isArray(t.members) && t.members.some(
-                        (m) =>
-                          String(m.userId || (m as any).id || '').trim() === memId ||
-                          (memEmail && String(m.email || '').toLowerCase().trim() === memEmail)
-                      );
-                      return inIds || inMembers;
-                    }).length === 0 && (
-                      <span className="text-xs text-slate-500 italic py-0.5">Not assigned to an agency squad yet</span>
-                    )}
-                  </div>
-                </div>
-              )}
-
               <div className="space-y-2 mb-4 pb-4" style={{ borderBottom: '1px solid rgba(148, 163, 184, 0.1)' }}>
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-slate-500">Joined</span>
@@ -1763,235 +1594,6 @@ export function TeamPermissions() {
               </p>
             </motion.div>
           ))}
-        </div>
-      )}
-
-      {activeView === 'teams' && (
-        <div className="space-y-6">
-          {/* Agency Squads Header Banner */}
-          <motion.div
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="p-6 rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4"
-            style={{
-              background: 'linear-gradient(135deg, rgba(16, 185, 129, 0.12), rgba(6, 182, 212, 0.12), rgba(168, 85, 247, 0.1))',
-              border: '1px solid rgba(16, 185, 129, 0.35)',
-            }}
-          >
-            <div className="space-y-1">
-              <div className="flex items-center gap-2">
-                <span className="px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                  Agency Squad Structure
-                </span>
-                <span className="text-xs font-mono text-cyan-300">Cross-Departmental Collaboration</span>
-              </div>
-              <h2 className="text-xl font-bold text-white">Cross-Functional Agency Teams & Squads</h2>
-              <p className="text-sm text-slate-300 max-w-2xl">
-                Build real agency delivery teams by combining employees across different departments (e.g., Development, Marketing, Design), assigning a Team Lead, and linking client projects. Employees immediately see their squad and teammates in the Employee Portal.
-              </p>
-            </div>
-            <motion.button
-              whileHover={{ scale: 1.03 }}
-              whileTap={{ scale: 0.97 }}
-              onClick={() => openCreateTeamModal()}
-              className="px-5 py-3 rounded-xl text-sm font-semibold flex items-center gap-2 shrink-0"
-              style={{
-                background: 'linear-gradient(135deg, #10b981, #06b6d4)',
-                color: '#ffffff',
-                boxShadow: '0 10px 25px -8px rgba(16, 185, 129, 0.6)',
-              }}
-            >
-              <Plus className="size-4" />
-              Create Cross-Departmental Team
-            </motion.button>
-          </motion.div>
-
-          {teamsLoading && agencyTeams.length === 0 ? (
-            <div className="p-10 rounded-2xl text-center text-slate-400 text-sm" style={AXIOM.containers.list}>
-              Loading agency teams…
-            </div>
-          ) : agencyTeams.length === 0 ? (
-            <div
-              className="p-12 rounded-2xl text-center space-y-4"
-              style={AXIOM.containers.list}
-            >
-              <div className="w-14 h-14 rounded-2xl mx-auto flex items-center justify-center bg-emerald-500/15 border border-emerald-500/30">
-                <GitBranch className="size-7 text-emerald-400" />
-              </div>
-              <div className="space-y-1 max-w-md mx-auto">
-                <h3 className="text-lg font-bold text-white">No Cross-Departmental Teams Yet</h3>
-                <p className="text-xs text-slate-400">
-                  Select employees across Development, Marketing, Design, and Operations to assemble your first agency delivery squad.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => openCreateTeamModal()}
-                className="px-5 py-2.5 rounded-xl text-xs font-mono font-bold text-white bg-gradient-to-r from-emerald-500 to-cyan-600 hover:from-emerald-400 hover:to-cyan-500 transition-all"
-              >
-                + Make Your First Team
-              </button>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              {agencyTeams.map((team, idx) => {
-                const depts = team.departments && team.departments.length > 0
-                  ? team.departments
-                  : Array.from(new Set((team.members || []).map((m) => m.department).filter(Boolean)));
-                return (
-                  <motion.div
-                    key={team.id}
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.1 + idx * 0.05 }}
-                    className="p-6 rounded-2xl flex flex-col justify-between space-y-5"
-                    style={AXIOM.containers.list}
-                  >
-                    <div className="space-y-4">
-                      {/* Top Header */}
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="space-y-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <h3 className="text-xl font-bold text-white">{team.name}</h3>
-                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                              {team.members?.length || team.memberIds?.length || 0} Members
-                            </span>
-                            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
-                              {depts.length} {depts.length === 1 ? 'Department' : 'Departments'}
-                            </span>
-                          </div>
-                          {team.description && (
-                            <p className="text-xs text-slate-400">{team.description}</p>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => openEditTeamModal(team)}
-                            className="px-3 py-1.5 rounded-lg text-xs font-mono text-cyan-300 hover:bg-cyan-500/15 border border-cyan-500/30 flex items-center gap-1 transition-all"
-                          >
-                            <Edit className="size-3.5" />
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            disabled={deletingTeamId === team.id}
-                            onClick={() => void handleDeleteTeam(team)}
-                            className="p-1.5 rounded-lg text-red-400 hover:bg-red-500/15 border border-red-500/30 transition-all disabled:opacity-50"
-                            title="Delete team"
-                          >
-                            <Trash2 className="size-3.5" />
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* Linked Project & Squad Lead Banner */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div
-                          className="p-3 rounded-xl"
-                          style={{
-                            background: 'rgba(168, 85, 247, 0.08)',
-                            border: '1px solid rgba(168, 85, 247, 0.25)',
-                          }}
-                        >
-                          <p className="text-[10px] font-mono uppercase tracking-wider text-purple-300/80 mb-0.5">
-                            Assigned Project
-                          </p>
-                          <p className="text-sm font-semibold text-white truncate">
-                            {team.projectName || 'General Agency Delivery'}
-                          </p>
-                        </div>
-                        <div
-                          className="p-3 rounded-xl"
-                          style={{
-                            background: 'rgba(245, 158, 11, 0.08)',
-                            border: '1px solid rgba(245, 158, 11, 0.25)',
-                          }}
-                        >
-                          <p className="text-[10px] font-mono uppercase tracking-wider text-amber-300/80 mb-0.5">
-                            Squad / Team Lead
-                          </p>
-                          <p className="text-sm font-semibold text-white flex items-center gap-1.5 truncate">
-                            <Crown className="size-3.5 text-amber-400 shrink-0" />
-                            <span>{team.leadName || team.members?.[0]?.name || 'Assigned Lead'}</span>
-                          </p>
-                        </div>
-                      </div>
-
-                      {/* Departments Collaborating */}
-                      <div>
-                        <p className="text-[11px] font-mono uppercase tracking-wider text-slate-400 mb-1.5">
-                          Departments Collaborating ({depts.length})
-                        </p>
-                        <div className="flex flex-wrap gap-1.5">
-                          {depts.map((dept) => (
-                            <span
-                              key={dept}
-                              className="px-2.5 py-0.5 rounded-md text-xs font-mono text-cyan-200 bg-slate-800/90 border border-cyan-500/30"
-                            >
-                              {dept}
-                            </span>
-                          ))}
-                        </div>
-                      </div>
-
-                      {/* Squad Roster */}
-                      <div>
-                        <p className="text-[11px] font-mono uppercase tracking-wider text-slate-400 mb-2">
-                          Team Members ({team.members?.length || 0})
-                        </p>
-                        <div className="space-y-2">
-                          {(team.members || []).map((m) => (
-                            <div
-                              key={m.userId}
-                              className="p-2.5 rounded-xl flex items-center justify-between gap-3"
-                              style={AXIOM.containers.item}
-                            >
-                              <div className="flex items-center gap-2.5 min-w-0">
-                                <div
-                                  className="size-8 rounded-lg flex items-center justify-center text-white text-xs font-bold shrink-0"
-                                  style={{ background: m.isLead ? AXIOM.iconBoxes.amber : AXIOM.iconBoxes.blue }}
-                                >
-                                  {(m.name || '?')[0].toUpperCase()}
-                                </div>
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-1.5">
-                                    <p className="text-xs font-semibold text-white truncate">{m.name}</p>
-                                    {m.isLead && (
-                                      <span className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                                        Team Lead
-                                      </span>
-                                    )}
-                                  </div>
-                                  <p className="text-[11px] text-slate-400 font-mono truncate">
-                                    {m.role} • {m.email}
-                                  </p>
-                                </div>
-                              </div>
-                              <span className="px-2 py-0.5 rounded text-[11px] font-mono text-slate-300 bg-slate-800/80 border border-slate-700 shrink-0">
-                                {m.department}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400 font-mono">
-                      <span>Visible in Employee Portal → Team Directory</span>
-                      <button
-                        type="button"
-                        onClick={() => openEditTeamModal(team)}
-                        className="text-emerald-400 hover:text-emerald-300 font-semibold"
-                      >
-                        Manage Roster →
-                      </button>
-                    </div>
-                  </motion.div>
-                );
-              })}
-            </div>
-          )}
         </div>
       )}
 
@@ -2054,11 +1656,10 @@ export function TeamPermissions() {
                   key={cat}
                   type="button"
                   onClick={() => setAnnouncementCategoryFilter(cat)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all ${
-                    announcementCategoryFilter === cat
-                      ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/30'
-                      : 'bg-slate-900/50 text-slate-400 hover:text-white hover:bg-slate-800/60 border border-slate-800/80'
-                  }`}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium capitalize transition-all ${announcementCategoryFilter === cat
+                    ? 'bg-blue-600 text-white shadow-sm shadow-blue-500/30'
+                    : 'bg-slate-900/50 text-slate-400 hover:text-white hover:bg-slate-800/60 border border-slate-800/80'
+                    }`}
                 >
                   {cat === 'all' ? 'All Categories' : cat}
                 </button>
@@ -2156,11 +1757,10 @@ export function TeamPermissions() {
                             type="button"
                             onClick={() => handleTogglePinAnnouncement(ann)}
                             title={isPinned ? 'Unpin from top' : 'Pin to top of employee portal'}
-                            className={`p-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                              isPinned
-                                ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                                : 'bg-slate-800/60 border-slate-700/60 text-slate-400 hover:text-white'
-                            }`}
+                            className={`p-1.5 rounded-lg text-xs font-medium border transition-colors ${isPinned
+                              ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+                              : 'bg-slate-800/60 border-slate-700/60 text-slate-400 hover:text-white'
+                              }`}
                           >
                             {isPinned ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
                           </button>
@@ -2511,6 +2111,106 @@ export function TeamPermissions() {
               </div>
             ))}
           </div>
+        </motion.div>
+      )}
+
+      {activeView === 'timesheets' && (
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.1 }}
+          className="p-6 rounded-2xl space-y-4"
+          style={AXIOM.containers.list}
+        >
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                <Clock className="size-5 text-cyan-400" />
+                Employee Timesheets (HR &amp; Attendance Log)
+              </h3>
+              <p className="text-sm text-slate-400 mt-0.5">
+                Review employee time submissions from the Employee Portal. Project Profitability runs independently on automatic Mon–Fri schedule hours.
+              </p>
+            </div>
+            <span className="text-xs font-mono text-slate-400">
+              {orgTimesheets.length} entries · {pendingTimesheetsCount} awaiting review
+            </span>
+          </div>
+
+          {orgTimesheets.length === 0 ? (
+            <div className="py-12 text-center text-slate-400 text-sm">
+              No employee timesheet submissions yet.
+            </div>
+          ) : (
+            <div className="space-y-2.5 max-h-[600px] overflow-y-auto pr-1">
+              {[...orgTimesheets]
+                .sort((a: any, b: any) => String(b.date || '').localeCompare(String(a.date || '')))
+                .map((ts: any) => {
+                  const member = teamMembers.find((m) => m.id === ts.userId || (m as any).userId === ts.userId);
+                  const proj = orgProjects.find((p) => p.id === ts.projectId);
+                  const isSubmitted = ts.status === 'submitted';
+                  const isApproved = ts.status === 'approved';
+                  return (
+                    <div
+                      key={ts.id}
+                      className="p-4 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                      style={AXIOM.containers.item}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-white font-semibold text-sm">
+                            {member?.name || ts.userId}
+                          </span>
+                          <span className="text-xs font-mono text-cyan-300 bg-cyan-500/10 border border-cyan-500/25 px-2 py-0.5 rounded">
+                            {Number(ts.hours || 0).toFixed(1)}h
+                          </span>
+                          <span className="text-xs text-slate-400 font-mono">{ts.date}</span>
+                          <span className="text-xs text-slate-300 bg-slate-800/80 px-2 py-0.5 rounded">
+                            {proj?.name || ts.projectName || 'General'}
+                          </span>
+                          <span
+                            className={`text-[10px] uppercase font-mono px-2 py-0.5 rounded ${isApproved
+                              ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                              : isSubmitted
+                                ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                                : 'bg-slate-800 text-slate-400'
+                              }`}
+                          >
+                            {ts.status}
+                          </span>
+                        </div>
+                        {ts.description && (
+                          <p className="text-xs text-slate-400 mt-1 truncate">{ts.description}</p>
+                        )}
+                      </div>
+
+                      {isSubmitted && (
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            disabled={reviewingTsId === ts.id}
+                            onClick={() => void handleReviewTimesheet(ts, 'approve')}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold text-emerald-300 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                          >
+                            <CheckCircle className="size-3.5" />
+                            Approve
+                          </button>
+                          <button
+                            type="button"
+                            disabled={reviewingTsId === ts.id}
+                            onClick={() => void handleReviewTimesheet(ts, 'reject')}
+                            className="px-3 py-1.5 rounded-lg text-xs font-medium text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                          >
+                            <XCircle className="size-3.5" />
+                            Return
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+            </div>
+          )}
         </motion.div>
       )}
 
@@ -3118,272 +2818,6 @@ export function TeamPermissions() {
                 Send {bulkRows.filter(r => r.email.trim()).length || ''} Bulk Invites
               </button>
             )}
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      {/* ── Edit Role Permissions Dialog ───────────────────────────── */}
-      {/* ── Create / Edit Cross-Departmental Agency Team Dialog ── */}
-      <Dialog open={teamDialogOpen} onOpenChange={setTeamDialogOpen}>
-        <DialogContent
-          className="sm:max-w-[680px] border max-h-[90vh] overflow-y-auto"
-          style={{
-            background: '#0f172a',
-            borderColor: 'rgba(16, 185, 129, 0.35)',
-            boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.85)',
-          }}
-        >
-          <DialogHeader className="space-y-2 pb-4 border-b border-slate-800">
-            <div className="flex items-center gap-3">
-              <div
-                className="w-10 h-10 rounded-xl flex items-center justify-center"
-                style={{
-                  background: 'linear-gradient(135deg, #10b981, #06b6d4)',
-                }}
-              >
-                <GitBranch className="size-5 text-white" />
-              </div>
-              <div>
-                <DialogTitle className="text-xl font-bold text-white">
-                  {editingTeam ? `Edit Team: ${editingTeam.name}` : 'Create Cross-Departmental Agency Team'}
-                </DialogTitle>
-                <DialogDescription className="text-xs text-slate-400">
-                  Select employees across different departments, assign a Squad Lead, and link an agency project.
-                </DialogDescription>
-              </div>
-            </div>
-          </DialogHeader>
-
-          <div className="space-y-5 py-3">
-            {/* Team Name & Linked Project */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs font-mono uppercase text-slate-300 mb-1.5">
-                  Team / Squad Name *
-                </label>
-                <input
-                  type="text"
-                  placeholder="e.g. Finance OS Product Squad"
-                  value={teamName}
-                  onChange={(e) => setTeamName(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white"
-                  style={{
-                    background: AXIOM.inputs.background,
-                    border: AXIOM.inputs.border,
-                  }}
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-mono uppercase text-slate-300 mb-1.5">
-                  Linked Agency Project
-                </label>
-                <select
-                  value={teamProjectId}
-                  onChange={(e) => setTeamProjectId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white font-mono"
-                  style={{
-                    background: AXIOM.inputs.background,
-                    border: AXIOM.inputs.border,
-                  }}
-                >
-                  <option value="" className="bg-slate-900 text-slate-300">
-                    General / Multi-Project Squad
-                  </option>
-                  {orgProjects.map((p) => (
-                    <option key={p.id} value={p.id} className="bg-slate-900 text-white">
-                      {p.name} {p.clientName ? `(${p.clientName})` : ''}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            {/* Mission / Description */}
-            <div>
-              <label className="block text-xs font-mono uppercase text-slate-300 mb-1.5">
-                Team Mission & Responsibilities
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. Cross-functional engineering & marketing growth delivery squad"
-                value={teamDescription}
-                onChange={(e) => setTeamDescription(e.target.value)}
-                className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white"
-                style={{
-                  background: AXIOM.inputs.background,
-                  border: AXIOM.inputs.border,
-                }}
-              />
-            </div>
-
-            {/* Select Employees Across Departments */}
-            <div className="space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <label className="text-xs font-mono uppercase text-slate-300">
-                  Select Employees Across Departments ({teamMemberIds.length} selected)
-                </label>
-                <div className="flex flex-wrap gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setTeamDeptFilter('ALL')}
-                    className={`px-2.5 py-1 rounded-lg text-xs font-mono transition-all ${
-                      teamDeptFilter === 'ALL'
-                        ? 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/50'
-                        : 'bg-slate-800/80 text-slate-400 border border-slate-700'
-                    }`}
-                  >
-                    All Depts
-                  </button>
-                  {Array.from(
-                    new Set(
-                      teamMembers
-                        .filter((m) => m.orgRole !== 'owner')
-                        .map((m) => m.department || 'Development'),
-                    ),
-                  ).map((dept) => (
-                    <button
-                      key={dept}
-                      type="button"
-                      onClick={() => setTeamDeptFilter(dept)}
-                      className={`px-2.5 py-1 rounded-lg text-xs font-mono transition-all ${
-                        teamDeptFilter === dept
-                          ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-500/50'
-                          : 'bg-slate-800/80 text-slate-400 border border-slate-700'
-                      }`}
-                    >
-                      {dept}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-60 overflow-y-auto pr-1">
-                {teamMembers
-                  .filter((m) => m.orgRole !== 'owner')
-                  .filter((m) => teamDeptFilter === 'ALL' || (m.department || 'Development') === teamDeptFilter)
-                  .map((emp) => {
-                    const isSelected = teamMemberIds.includes(emp.id);
-                    const isLead = teamLeadUserId === emp.id;
-                    return (
-                      <div
-                        key={emp.id}
-                        onClick={() => toggleTeamMemberSelection(emp.id)}
-                        className="p-3 rounded-xl cursor-pointer transition-all flex items-center justify-between gap-3"
-                        style={{
-                          background: isSelected ? 'rgba(16, 185, 129, 0.12)' : 'rgba(15, 23, 42, 0.7)',
-                          border: isSelected
-                            ? '1px solid rgba(16, 185, 129, 0.5)'
-                            : '1px solid rgba(148, 163, 184, 0.15)',
-                        }}
-                      >
-                        <div className="flex items-center gap-2.5 min-w-0">
-                          <div
-                            className={`w-5 h-5 rounded flex items-center justify-center shrink-0 ${
-                              isSelected
-                                ? 'bg-emerald-500 text-slate-950 font-bold'
-                                : 'border border-slate-600 bg-slate-800'
-                            }`}
-                          >
-                            {isSelected && <Check className="size-3.5 stroke-[3]" />}
-                          </div>
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-1.5">
-                              <p className="text-xs font-bold text-white truncate">{emp.name}</p>
-                              {isLead && isSelected && (
-                                <span className="px-1.5 py-0.2 rounded text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/40">
-                                  Lead
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-[11px] text-cyan-300 font-mono truncate">
-                              {emp.customRole || 'Team Member'}
-                            </p>
-                            <p className="text-[10px] text-slate-400 font-mono truncate">
-                              {emp.department || 'Development'}
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-              </div>
-            </div>
-
-            {/* Team Lead Selector & Cross-Department Summary */}
-            {teamMemberIds.length > 0 && (
-              <div
-                className="p-4 rounded-xl space-y-3"
-                style={{
-                  background: 'rgba(6, 182, 212, 0.07)',
-                  border: '1px solid rgba(6, 182, 212, 0.25)',
-                }}
-              >
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                  <div>
-                    <p className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <Crown className="size-4 text-amber-400" />
-                      Designate Squad / Team Lead
-                    </p>
-                    <p className="text-[11px] text-slate-400">
-                      The Team Lead coordinates deliverables across departments for this squad.
-                    </p>
-                  </div>
-                  <select
-                    value={teamLeadUserId || teamMemberIds[0] || ''}
-                    onChange={(e) => setTeamLeadUserId(e.target.value)}
-                    className="px-3 py-2 rounded-lg text-xs text-white font-mono"
-                    style={{
-                      background: AXIOM.inputs.background,
-                      border: AXIOM.inputs.border,
-                    }}
-                  >
-                    {teamMemberIds.map((uid) => {
-                      const emp = teamMembers.find((m) => m.id === uid);
-                      if (!emp) return null;
-                      return (
-                        <option key={uid} value={uid} className="bg-slate-900 text-white">
-                          {emp.name} ({emp.department || 'Development'})
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800/80 text-xs font-mono text-emerald-300">
-                  <span>
-                    Squad Composition: {teamMemberIds.length} member(s) across{' '}
-                    {
-                      new Set(
-                        teamMemberIds
-                          .map((uid) => teamMembers.find((m) => m.id === uid)?.department)
-                          .filter(Boolean),
-                      ).size
-                    }{' '}
-                    department(s)
-                  </span>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <DialogFooter className="pt-4 border-t border-slate-800 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={() => setTeamDialogOpen(false)}
-              className="px-4 py-2 rounded-lg text-slate-400 text-sm font-mono hover:text-white"
-              style={AXIOM.buttons.outline}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              disabled={savingTeam}
-              onClick={() => void handleSaveTeam()}
-              className="flex items-center gap-2 px-5 py-2 rounded-lg text-white text-sm font-mono font-semibold disabled:opacity-50 bg-gradient-to-r from-emerald-500 to-cyan-600 hover:from-emerald-400 hover:to-cyan-500 shadow-lg shadow-emerald-500/20"
-            >
-              {savingTeam ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
-              {editingTeam ? 'Save Team Changes' : 'Create Agency Team'}
-            </button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

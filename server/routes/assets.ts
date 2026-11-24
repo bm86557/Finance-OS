@@ -8,6 +8,8 @@ import { ok, created, fail, notFound } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { ensureDefaultAccounts } from './accounts.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
+import { requirePermission } from '../middleware/auth.js';
+import { postBalancedJournalEntry, resolveGlAccountId, resolveOrgCurrency } from '../lib/ledgerService.js';
 
 function calculateMonthlyDepreciation(asset: Asset): number {
   if (asset.status !== 'active') return 0;
@@ -85,21 +87,12 @@ export function createAssetsRouter(): Router {
         
         if (error) throw error;
         
-        const now = new Date();
+        // Handoff §15 / §33 #3: Use authoritative persisted depreciation only (never fabricate unposted depreciation on read)
         const assets = (data || []).map((asset: any) => {
-          const purchasePrice = Number(asset.purchase_price || 0);
+          const purchasePrice = Number(asset.cost_basis ?? asset.purchase_price ?? 0);
           const salvageValue = Number(asset.salvage_value || 0);
-          const usefulLifeYears = Number(asset.useful_life_years || 5);
-          let accumulatedDepreciation = Number(asset.accumulated_depreciation || 0);
-
-          if (accumulatedDepreciation === 0 && asset.purchase_date && usefulLifeYears > 0) {
-            const pDate = new Date(asset.purchase_date);
-            const elapsedMonths = Math.max(0, (now.getFullYear() - pDate.getFullYear()) * 12 + (now.getMonth() - pDate.getMonth()));
-            const depreciableAmount = Math.max(0, purchasePrice - salvageValue);
-            accumulatedDepreciation = Math.min(depreciableAmount, Math.round(((depreciableAmount / (usefulLifeYears * 12)) * elapsedMonths) * 100) / 100);
-          }
-
-          const currentValue = asset.current_value != null && Number(asset.current_value) > 0
+          const accumulatedDepreciation = Number(asset.accumulated_depreciation || 0);
+          const currentValue = asset.current_value != null
             ? Number(asset.current_value)
             : Math.max(salvageValue, Math.round((purchasePrice - accumulatedDepreciation) * 100) / 100);
 
@@ -185,23 +178,17 @@ export function createAssetsRouter(): Router {
           .select('*')
           .eq('organization_id', orgId);
         
-        const now = new Date();
+        if (error) throw error;
+        // Handoff §15 / §33 #3: Return authoritative persisted depreciation & full §15 metadata (no phantom unposted depreciation)
         const assets = (data || []).map((asset: any) => {
           const purchasePrice = Number(asset.purchase_price || 0);
+          const costBasis = Number(asset.cost_basis ?? purchasePrice);
           const salvageValue = Number(asset.salvage_value || 0);
           const usefulLifeYears = Number(asset.useful_life_years || 5);
-          let accumulatedDepreciation = Number(asset.accumulated_depreciation || 0);
-
-          if (accumulatedDepreciation === 0 && asset.purchase_date && usefulLifeYears > 0) {
-            const pDate = new Date(asset.purchase_date);
-            const elapsedMonths = Math.max(0, (now.getFullYear() - pDate.getFullYear()) * 12 + (now.getMonth() - pDate.getMonth()));
-            const depreciableAmount = Math.max(0, purchasePrice - salvageValue);
-            accumulatedDepreciation = Math.min(depreciableAmount, Math.round(((depreciableAmount / (usefulLifeYears * 12)) * elapsedMonths) * 100) / 100);
-          }
-
-          const currentValue = asset.current_value != null && Number(asset.current_value) > 0
+          const accumulatedDepreciation = Number(asset.accumulated_depreciation || 0);
+          const currentValue = asset.current_value != null
             ? Number(asset.current_value)
-            : Math.max(salvageValue, Math.round((purchasePrice - accumulatedDepreciation) * 100) / 100);
+            : Math.max(salvageValue, Math.round((costBasis - accumulatedDepreciation) * 100) / 100);
 
           return {
             id: asset.id,
@@ -210,16 +197,25 @@ export function createAssetsRouter(): Router {
             name: asset.name,
             description: asset.description,
             category: asset.category,
+            accountId: asset.account_id || '',
+            accumulatedDepreciationAccountId: asset.accumulated_depreciation_account_id || '',
+            depreciationExpenseAccountId: asset.depreciation_expense_account_id || '',
             purchaseDate: asset.purchase_date,
+            placedInServiceDate: asset.placed_in_service_date || asset.purchase_date,
             purchasePrice,
+            costBasis,
             salvageValue,
             usefulLifeYears,
             depreciationMethod: asset.depreciation_method || 'straight_line',
+            taxDepreciationMethod: asset.tax_depreciation_method || 'straight_line',
+            taxUsefulLifeYears: asset.tax_useful_life_years != null ? Number(asset.tax_useful_life_years) : usefulLifeYears,
+            accumulatedTaxDepreciation: Number(asset.accumulated_tax_depreciation || 0),
             currentValue,
             accumulatedDepreciation,
             status: asset.status,
             disposalDate: asset.disposal_date,
-            disposalAmount: asset.disposal_amount,
+            disposalAmount: asset.disposal_amount != null ? Number(asset.disposal_amount) : undefined,
+            gainLossOnDisposal: asset.gain_loss_on_disposal != null ? Number(asset.gain_loss_on_disposal) : undefined,
             locationDetails: asset.location_details ?? asset.location ?? undefined,
             serialNumber: asset.serial_number,
             departmentId: asset.department_id,
@@ -358,7 +354,7 @@ export function createAssetsRouter(): Router {
     });
   });
 
-  r.post('/:id/dispose', async (req: Request, res: Response) => {
+  r.post('/:id/dispose', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const assetId = getParamId(req, 'id');
     const { disposalDate, disposalAmount } = (req.body || {}) as { disposalDate?: string; disposalAmount?: number };
@@ -380,21 +376,58 @@ export function createAssetsRouter(): Router {
       const accDepr = Number(existing.accumulated_depreciation || 0);
       const netBookValue = Math.max(0, costBasis - accDepr);
       const dispAmt = Number(disposalAmount ?? 0);
+      if (dispAmt < 0) return fail(res, 400, 'Disposal amount cannot be negative');
       const gainLoss = Math.round((dispAmt - netBookValue) * 100) / 100;
+      const effectiveDisposalDate = disposalDate || new Date().toISOString().slice(0, 10);
+      const orgCurrency = await resolveOrgCurrency(sb, orgId);
 
       const { data, error } = await sb
         .from('assets')
         .update({
           status: 'disposed',
-          disposal_date: disposalDate || new Date().toISOString().slice(0, 10),
+          disposal_date: effectiveDisposalDate,
           disposal_amount: dispAmt,
           gain_loss_on_disposal: gainLoss,
+          current_value: 0,
         })
         .eq('id', assetId)
         .eq('organization_id', orgId)
         .select()
         .maybeSingle();
       if (error) throw error;
+
+      // Post balanced disposal journal entry (§8, §15)
+      if (costBasis > 0) {
+        try {
+          const cashGlId = await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']);
+          const fixedAssetGlId = existing.account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['fixed_asset', 'fixed asset']));
+          const accumDeprGlId = existing.accumulated_depreciation_account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['accumulated_depreciation', 'accumulated depreciation']));
+          const gainGlId = await resolveGlAccountId(sb, orgId, 'income', ['gain', 'other_income']);
+          const lossGlId = await resolveGlAccountId(sb, orgId, 'expense', ['loss', 'disposal', 'operating_expense']);
+
+          const lines = [
+            ...(dispAmt > 0 ? [{ accountId: cashGlId, debit: dispAmt, credit: 0, description: `Cash proceeds from disposal of ${existing.name}` }] : []),
+            ...(accDepr > 0 ? [{ accountId: accumDeprGlId, debit: accDepr, credit: 0, description: `Remove accumulated depreciation for ${existing.name}` }] : []),
+            ...(gainLoss < 0 ? [{ accountId: lossGlId, debit: Math.abs(gainLoss), credit: 0, description: `Loss on disposal of ${existing.name}` }] : []),
+            { accountId: fixedAssetGlId, debit: 0, credit: costBasis, description: `Derecognize fixed asset ${existing.name}` },
+            ...(gainLoss > 0 ? [{ accountId: gainGlId, debit: 0, credit: gainLoss, description: `Gain on disposal of ${existing.name}` }] : []),
+          ];
+
+          await postBalancedJournalEntry(sb, {
+            organizationId: orgId,
+            entryDate: effectiveDisposalDate,
+            description: `Asset Disposal - ${existing.name || assetId}`,
+            sourceType: 'asset_disposal',
+            sourceId: assetId,
+            currency: orgCurrency,
+            actorUserId: req.authUser?.id || null,
+            entryPrefix: 'DISP',
+            lines,
+          });
+        } catch (jeErr) {
+          console.warn('[assets.dispose] Failed to post disposal journal:', jeErr);
+        }
+      }
 
       // Post disposal transaction if cash was received
       if (dispAmt > 0) {
@@ -403,11 +436,11 @@ export function createAssetsRouter(): Router {
           await sb.from('transactions').insert([{
             id: txnId,
             organization_id: orgId,
-            date: disposalDate || new Date().toISOString().slice(0, 10),
+            date: effectiveDisposalDate,
             description: `Asset Disposal Sale - ${existing.name || assetId}`,
             narration: `Disposal proceeds for ${existing.name || assetId}. Book value: ${netBookValue.toFixed(2)}, Gain/Loss: ${gainLoss >= 0 ? '+' : ''}${gainLoss.toFixed(2)}`,
             amount: dispAmt,
-            currency: 'USD',
+            currency: orgCurrency,
             type: 'credit',
             status: 'reconciled',
             tags: ['asset-disposal', 'investing-cash-flow', `asset:${assetId}`, 'business'],
@@ -418,13 +451,23 @@ export function createAssetsRouter(): Router {
         }
       }
 
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'dispose_asset',
+        entityType: 'asset',
+        entityId: assetId,
+        description: `Disposed asset ${existing.name} for ${dispAmt} ${orgCurrency} (Gain/Loss: ${gainLoss >= 0 ? '+' : ''}${gainLoss.toFixed(2)})`,
+        beforeState: existing,
+        afterState: data,
+      }).catch(() => {});
+
       return ok(res, data, `Asset disposed. Gain/Loss recognized: ${gainLoss >= 0 ? '+' : ''}${gainLoss.toFixed(2)}`);
     } catch (err) {
       console.error('[assets.dispose] Supabase error:', err);
       return fail(res, 500, 'Failed to dispose asset');
     }
   });
-  r.post('/:id/depreciation', async (req: Request, res: Response) => {
+  r.post('/:id/depreciation', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const assetId = getParamId(req, 'id');
     const { period } = req.body as { period: string };
@@ -433,6 +476,9 @@ export function createAssetsRouter(): Router {
     const today = new Date();
     const currentPeriod = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}`;
     const targetPeriod = period || currentPeriod;
+    if (!/^\d{4}-\d{2}$/.test(targetPeriod)) {
+      return fail(res, 400, 'period must be in YYYY-MM format');
+    }
 
     const sb = getSupabaseAdminClient();
     if (sb) {
@@ -453,6 +499,11 @@ export function createAssetsRouter(): Router {
           return fail(res, 400, `Cannot post depreciation for an asset with status '${dbAsset.status}'`);
         }
 
+        const inServiceDate = String(dbAsset.placed_in_service_date || dbAsset.purchase_date || '');
+        if (inServiceDate && targetPeriod < inServiceDate.slice(0, 7)) {
+          return fail(res, 400, `Cannot post depreciation for ${targetPeriod} before placed-in-service date (${inServiceDate.slice(0, 7)}).`);
+        }
+
         // 2. Strict idempotency: Ensure only ONE posted depreciation entry exists per month for this asset
         const { data: existingSchedules, error: schedErr } = await sb
           .from('depreciation_schedules')
@@ -466,7 +517,7 @@ export function createAssetsRouter(): Router {
         }
 
         // 3. Compute accurate depreciation amounts
-        const purchasePrice = Number(dbAsset.purchase_price || 0);
+        const purchasePrice = Number(dbAsset.cost_basis ?? dbAsset.purchase_price ?? 0);
         const salvageValue = Number(dbAsset.salvage_value || 0);
         const usefulLifeYears = Math.max(1, Number(dbAsset.useful_life_years || 5));
         const currentBookValue = dbAsset.current_value != null ? Number(dbAsset.current_value) : purchasePrice;
@@ -494,7 +545,26 @@ export function createAssetsRouter(): Router {
         const newAccDepr = Math.round((currentAccDepr + actualDepr) * 100) / 100;
         const newStatus = closingValue <= salvageValue ? 'fully_depreciated' : 'active';
         const scheduleId = `depr-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-        const journalEntryId = `DEP-${dbAsset.asset_code || assetId}-${targetPeriod}`;
+        const orgCurrency = await resolveOrgCurrency(sb, orgId);
+
+        // 3b. Post real balanced double-entry depreciation journal (§8, §15)
+        const deprExpGlId = dbAsset.depreciation_expense_account_id || (await resolveGlAccountId(sb, orgId, 'expense', ['depreciation']));
+        const accumDeprGlId = dbAsset.accumulated_depreciation_account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['accumulated_depreciation', 'accumulated depreciation']));
+        const jeRes = await postBalancedJournalEntry(sb, {
+          organizationId: orgId,
+          entryDate: `${targetPeriod}-01`,
+          description: `Monthly Depreciation (${targetPeriod}) - ${dbAsset.name || dbAsset.asset_code}`,
+          sourceType: 'depreciation_run',
+          sourceId: `${assetId}:${targetPeriod}`,
+          currency: orgCurrency,
+          actorUserId: req.authUser?.id || null,
+          entryPrefix: 'DEP',
+          lines: [
+            { accountId: deprExpGlId, departmentId: dbAsset.department_id || null, debit: actualDepr, credit: 0, description: `Depreciation expense (${targetPeriod}) - ${dbAsset.name}` },
+            { accountId: accumDeprGlId, debit: 0, credit: actualDepr, description: `Accumulated depreciation (${targetPeriod}) - ${dbAsset.name}` },
+          ],
+        });
+        const journalEntryId = jeRes.journalEntryId || `DEP-${dbAsset.asset_code || assetId}-${targetPeriod}`;
 
         // 4. Save schedule entry to Supabase
         const { error: insErr } = await sb.from('depreciation_schedules').insert({
@@ -507,6 +577,7 @@ export function createAssetsRouter(): Router {
           closing_value: closingValue,
           status: 'posted',
           posted_at: new Date().toISOString(),
+          posted_by: req.authUser?.id || null,
           journal_entry_id: journalEntryId,
         });
 
@@ -532,7 +603,7 @@ export function createAssetsRouter(): Router {
             description: `Depreciation Run - ${dbAsset.name || dbAsset.asset_code}`,
             narration: `Monthly depreciation for period ${targetPeriod} on ${dbAsset.name} (${journalEntryId})`,
             amount: actualDepr,
-            currency: 'USD',
+            currency: orgCurrency,
             type: 'debit',
             status: 'reconciled',
             tags: ['depreciation-expense', 'non-cash-expense', `asset:${assetId}`, `period:${targetPeriod}`, 'business'],
@@ -541,6 +612,15 @@ export function createAssetsRouter(): Router {
         } catch (tErr) {
           console.warn('[assets.postDepreciation] Failed to record depreciation transaction:', tErr);
         }
+
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'post_depreciation',
+          entityType: 'depreciation_schedule',
+          entityId: scheduleId,
+          description: `Posted depreciation for ${dbAsset.name} (${targetPeriod}): ${actualDepr} ${orgCurrency}`,
+          afterState: { assetId, period: targetPeriod, depreciationAmount: actualDepr, closingValue, journalEntryId },
+        }).catch(() => {});
 
         const domainSchedule: DepreciationSchedule = {
           id: scheduleId,
@@ -583,15 +663,21 @@ export function createAssetsRouter(): Router {
             accumulatedDepreciationAccountId: data.accumulated_depreciation_account_id || '',
             depreciationExpenseAccountId: data.depreciation_expense_account_id || '',
             purchaseDate: data.purchase_date,
+            placedInServiceDate: data.placed_in_service_date || data.purchase_date,
             purchasePrice: data.purchase_price,
+            costBasis: data.cost_basis ?? data.purchase_price,
             salvageValue: data.salvage_value,
             usefulLifeYears: data.useful_life_years,
             depreciationMethod: data.depreciation_method,
+            taxDepreciationMethod: data.tax_depreciation_method || 'straight_line',
+            taxUsefulLifeYears: data.tax_useful_life_years ?? data.useful_life_years,
+            accumulatedTaxDepreciation: data.accumulated_tax_depreciation ?? 0,
             currentValue: data.current_value,
             accumulatedDepreciation: data.accumulated_depreciation,
             status: data.status,
             disposalDate: data.disposal_date,
             disposalAmount: data.disposal_amount,
+            gainLossOnDisposal: data.gain_loss_on_disposal,
             departmentId: data.department_id,
             locationDetails: data.location_details ?? data.location,
             purchasePaymentMethod: data.purchase_payment_method,
@@ -606,7 +692,7 @@ export function createAssetsRouter(): Router {
     return fail(res, 503, 'Database unavailable');
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Asset, 'id' | 'organizationId'>;
 
@@ -721,7 +807,7 @@ export function createAssetsRouter(): Router {
     }
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const assetId = getParamId(req, 'id');
     const sb = getSupabaseAdminClient();
@@ -768,6 +854,17 @@ export function createAssetsRouter(): Router {
 
       const { error } = await sb.from('assets').upsert(mapDomainToDbAsset(merged), { onConflict: 'id' });
       if (error) throw error;
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'update_asset',
+        entityType: 'asset',
+        entityId: assetId,
+        description: `Updated asset ${merged.name} (${merged.assetCode})`,
+        beforeState: existing,
+        afterState: merged as unknown as Record<string, unknown>,
+      }).catch(() => {});
+
       return ok(res, merged);
     } catch (err) {
       console.error('[assets.patch] Supabase error:', err);
@@ -775,17 +872,51 @@ export function createAssetsRouter(): Router {
     }
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const assetId = getParamId(req, 'id');
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
     try {
+      const { data: existingAsset } = await sb
+        .from('assets')
+        .select('*')
+        .eq('id', assetId)
+        .eq('organization_id', orgId)
+        .maybeSingle();
+
+      if (!existingAsset) return notFound(res, 'Asset');
+      if (existingAsset.status === 'disposed') {
+        return fail(res, 400, 'Cannot delete a disposed asset. Historical disposal records are immutable.');
+      }
+
+      const { data: postedSchedules } = await sb
+        .from('depreciation_schedules')
+        .select('id')
+        .eq('asset_id', assetId)
+        .eq('organization_id', orgId)
+        .eq('status', 'posted')
+        .limit(1);
+
+      if (postedSchedules && postedSchedules.length > 0) {
+        return fail(res, 400, 'Cannot delete an asset with posted depreciation history. Dispose of the asset instead.');
+      }
+
       const { error: schedErr } = await sb.from('depreciation_schedules').delete().eq('asset_id', assetId).eq('organization_id', orgId);
       if (schedErr) throw schedErr;
       const { error } = await sb.from('assets').delete().eq('id', assetId).eq('organization_id', orgId);
       if (error) throw error;
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'delete_asset',
+        entityType: 'asset',
+        entityId: assetId,
+        description: `Deleted asset ${existingAsset.name} (${existingAsset.asset_code})`,
+        beforeState: existingAsset,
+      }).catch(() => {});
+
       return ok(res, { id: assetId });
     } catch (err) {
       console.error('[assets.delete] Supabase delete error:', err);

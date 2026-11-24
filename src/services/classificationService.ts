@@ -40,6 +40,29 @@ export type ClassificationStats = {
   rulesCount: number;
 };
 
+export type ClassificationPerformance = {
+  monthlyTrend: Array<{
+    month: string;
+    label: string;
+    total: number;
+    accepted: number;
+    corrected: number;
+    accuracy: number | null;
+  }>;
+  categoryPerformance: Array<{
+    categoryId: string;
+    categoryName: string;
+    icon: string;
+    color: string;
+    total: number;
+    accepted: number;
+    corrected: number;
+    avgConfidence: number;
+    accuracy: number | null;
+  }>;
+  totalFeedback: number;
+};
+
 function batchResponseToMap(data: unknown): Map<number, ClassificationResult> {
   const map = new Map<number, ClassificationResult>();
   if (Array.isArray(data)) {
@@ -70,13 +93,35 @@ export const classificationService = {
     type: 'debit' | 'credit',
     world?: 'business' | 'personal',
     transactionId?: string,
+    useAI?: boolean,
+    accountId?: string,
   ): Promise<ServiceResponse<ClassificationResult>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<ClassificationResult>(organizationId);
       if (err) return err;
-      const res = await apiPostJson<{ narration: string; amount: number; type: 'debit' | 'credit' }, ClassificationResult>(
+      const res = await apiPostJson<
+        {
+          narration: string;
+          amount: number;
+          type: 'debit' | 'credit';
+          world?: 'business' | 'personal';
+          transactionId?: string;
+          accountId?: string;
+          useAI?: boolean;
+        },
+        ClassificationResult
+      >(
         `${CLS(organizationId)}/classify`,
-        { narration, amount, type },
+        {
+          narration,
+          amount,
+          type,
+          ...(world ? { world } : {}),
+          ...(transactionId ? { transactionId } : {}),
+          ...(accountId ? { accountId } : {}),
+          ...(useAI !== undefined ? { useAI } : {}),
+        },
+        { timeoutMs: 45_000 },
       );
       if (res.success && res.data) {
         return res;
@@ -89,22 +134,23 @@ export const classificationService = {
     const categories = catRes.data || dataStore.categories.filter(c => c.organizationId === organizationId);
     const previousTxns = dataStore.transactions.filter(t => t.organizationId === organizationId);
 
-    const result = classifyTransaction(narration, amount, type, categories, previousTxns, classificationRules);
+    const result = classifyTransaction(narration, amount, type, categories, previousTxns, classificationRules, { world, accountId });
     return { success: true, data: result };
   },
 
   async batchClassify(
     organizationId: string,
-    transactions: Array<{ narration: string; amount: number; type: 'debit' | 'credit' }>,
+    transactions: Array<{ id?: string; narration: string; amount: number; type: 'debit' | 'credit'; accountId?: string }>,
     useAI: boolean = false,
+    forceAI: boolean = false,
   ): Promise<ServiceResponse<Map<number, ClassificationResult>>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<Map<number, ClassificationResult>>(organizationId);
       if (err) return err;
       const res = await apiPostJson<
-        { transactions: typeof transactions; useAI?: boolean },
+        { transactions: typeof transactions; useAI?: boolean; forceAI?: boolean },
         ClassificationResult[] | { results: (ClassificationResult & { index?: number })[] }
-      >(`${CLS(organizationId)}/batch`, { transactions, useAI });
+      >(`${CLS(organizationId)}/batch`, { transactions, useAI, forceAI }, { timeoutMs: useAI ? 120_000 : 30_000 });
       if (res.success && res.data != null) {
         return {
           success: true,
@@ -128,68 +174,42 @@ export const classificationService = {
     transactionId: string,
     correctCategoryId: string,
     departmentId?: string,
-  ): Promise<ServiceResponse<{ updated: boolean; departmentId?: string }>> {
+    options?: {
+      world?: 'business' | 'personal';
+      scope?: 'row' | 'batch' | 'future';
+      rationale?: string;
+    },
+  ): Promise<ServiceResponse<{ updated: boolean; departmentId?: string; world?: string; ruleId?: string; batchUpdatedCount?: number }>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<{ updated: boolean; departmentId?: string }>(organizationId);
       if (err) return err;
 
-      // Fetch the transaction from API to get its current state for feedback
-      let suggestedCategoryId: string | undefined;
-      let suggestedConfidence: number | undefined;
-      let aiReasoning: string | undefined;
-
-      try {
-        const txnResponse = await apiGet<any>(`/organizations/${encodeURIComponent(organizationId)}/transactions/${encodeURIComponent(transactionId)}`);
-        if (txnResponse.success && txnResponse.data) {
-          suggestedCategoryId = txnResponse.data.suggestedCategoryId || txnResponse.data.suggested_category_id || txnResponse.data.categoryId;
-          suggestedConfidence = txnResponse.data.suggestedConfidence || txnResponse.data.suggested_confidence || txnResponse.data.confidence;
-          aiReasoning = txnResponse.data.aiReasoning || txnResponse.data.ai_reasoning;
-        } else {
-          const localTxn = dataStore.transactions.find(t => t.id === transactionId);
-          if (localTxn) {
-            suggestedCategoryId = localTxn.suggestedCategoryId || localTxn.categoryId;
-            suggestedConfidence = localTxn.suggestedConfidence || localTxn.confidence;
-            aiReasoning = localTxn.aiReasoning;
-          }
-        }
-
-      } catch (err) {
-        console.warn('[learnFromCorrection] Failed to fetch transaction, using defaults:', err);
-      }
-
-      const action = suggestedCategoryId && suggestedCategoryId !== correctCategoryId
-        ? 'corrected'
-        : 'accepted';
-
-      const feedbackRes = await apiPostJson<{
-        transaction_id: string;
-        suggested_category_id?: string;
-        suggested_confidence?: number;
-        final_category_id: string;
-        department_id?: string;
-        action: string;
-        ai_reasoning?: string;
-      }, { recorded: boolean; department_id?: string }>(
-        `/organizations/${encodeURIComponent(organizationId)}/ai-classification/feedback`,
+      // Unified §11 endpoint: POST /classification/learn (handles immutability, world_scope, scope, evidence, balance sync)
+      const learnRes = await apiPostJson<{
+        transactionId: string;
+        correctCategoryId: string;
+        departmentId?: string;
+        world?: 'business' | 'personal';
+        scope?: 'row' | 'batch' | 'future';
+        rationale?: string;
+      }, { updated: boolean; departmentId?: string; world?: string; ruleId?: string; batchUpdatedCount?: number }>(
+        `${CLS(organizationId)}/learn`,
         {
-          transaction_id: transactionId,
-          suggested_category_id: suggestedCategoryId,
-          suggested_confidence: suggestedConfidence,
-          final_category_id: correctCategoryId,
-          department_id: departmentId,
-          action: action,
-          ai_reasoning: aiReasoning,
+          transactionId,
+          correctCategoryId,
+          ...(departmentId ? { departmentId } : {}),
+          ...(options?.world ? { world: options.world } : {}),
+          ...(options?.scope ? { scope: options.scope } : {}),
+          ...(options?.rationale ? { rationale: options.rationale } : {}),
         },
       );
 
-      if (feedbackRes.success) {
-        const assignedDept = departmentId || (feedbackRes.data as any)?.department_id;
+      if (learnRes.success) {
+        const assignedDept = departmentId || learnRes.data?.departmentId;
         const localTxn = dataStore.transactions.find(t => t.id === transactionId);
         if (localTxn) {
           localTxn.categoryId = correctCategoryId;
-          if (assignedDept) {
-            localTxn.departmentId = assignedDept;
-          }
+          if (assignedDept) localTxn.departmentId = assignedDept;
           localTxn.classifiedBy = 'user';
           localTxn.status = 'classified';
           localTxn.confidence = 100;
@@ -201,18 +221,21 @@ export const classificationService = {
 
         return {
           success: true,
-          data: { updated: true, departmentId: assignedDept },
-          message: action === 'corrected'
-            ? 'Category corrected and pattern learned for future precision'
-            : 'Category confirmed and saved to AI learning database'
-        };
-      } else {
-        return {
-          success: false,
-          data: { updated: false },
-          error: feedbackRes.error || 'Failed to record feedback'
+          data: {
+            updated: true,
+            departmentId: assignedDept,
+            world: learnRes.data?.world,
+            ruleId: learnRes.data?.ruleId,
+            batchUpdatedCount: learnRes.data?.batchUpdatedCount,
+          },
+          message: learnRes.message || 'Classification updated and learned',
         };
       }
+      return {
+        success: false,
+        data: { updated: false },
+        error: learnRes.error || 'Failed to record learning feedback',
+      };
     }
 
     await simulateDelay(150);
@@ -267,11 +290,12 @@ export const classificationService = {
     return { success: true, data: { updated: true }, message: 'Classification updated and learned' };
   },
 
-  async getRules(organizationId?: string): Promise<ServiceResponse<ClassificationRule[]>> {
+  async getRules(organizationId?: string, includeInactive: boolean = false): Promise<ServiceResponse<ClassificationRule[]>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<ClassificationRule[]>(organizationId ?? '');
       if (err) return err;
-      return apiGet<ClassificationRule[]>(`${CLS(organizationId!)}/rules`);
+      const qs = includeInactive ? '?includeInactive=true' : '';
+      return apiGet<ClassificationRule[]>(`${CLS(organizationId!)}/rules${qs}`);
     }
 
     await simulateDelay();
@@ -377,26 +401,45 @@ export const classificationService = {
     organizationId: string,
     payload: {
       transactionId: string;
-      correctCategoryId: string;
+      correctCategoryId?: string;
       departmentId?: string;
       projectId?: string;
       scope: 'row' | 'batch' | 'future';
       rationale?: string;
       world?: 'business' | 'personal';
+      proposedNewCategory?: any;
     }
-  ): Promise<ServiceResponse<{ updated: boolean; candidateRule?: any }>> {
+  ): Promise<ServiceResponse<{
+    updated: boolean;
+    categoryId?: string;
+    departmentId?: string;
+    ruleId?: string;
+    ruleVersion?: number;
+    ruleLearned?: boolean;
+    batchUpdatedCount?: number;
+    collisionWarning?: string;
+    world?: 'business' | 'personal';
+    scope?: 'row' | 'batch' | 'future';
+  }>> {
     if (isHttpBackendConfigured()) {
-      const err = requireOrg<{ updated: boolean; candidateRule?: any }>(organizationId);
+      const err = requireOrg<any>(organizationId);
       if (err) return err;
-      return apiPostJson<typeof payload, { updated: boolean; candidateRule?: any }>(
+      const res = await apiPostJson<typeof payload, any>(
         `${CLS(organizationId)}/learn`,
         payload
       );
+      if (res.success) {
+        dataStore.notify('transactions');
+        dataStore.notify('departments');
+        dataStore.notify('classification-rules');
+        dataStore.notify('categories');
+      }
+      return res;
     }
 
     await simulateDelay(150);
     const txn = dataStore.transactions.find(t => t.id === payload.transactionId);
-    if (txn) {
+    if (txn && payload.correctCategoryId) {
       txn.categoryId = payload.correctCategoryId;
       if (payload.departmentId) txn.departmentId = payload.departmentId;
       txn.status = 'classified';
@@ -405,6 +448,72 @@ export const classificationService = {
       dataStore.notify('transactions');
     }
     return { success: true, data: { updated: true } };
+  },
+
+  async rejectSuggestion(
+    organizationId: string,
+    transactionId: string,
+    options?: {
+      suggestedCategoryId?: string;
+      suggestedConfidence?: number;
+      reason?: string;
+    }
+  ): Promise<ServiceResponse<{ rejected: boolean; feedbackId?: string; disabledRules?: string[] }>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any>(organizationId);
+      if (err) return err;
+      const res = await apiPostJson<any, any>(
+        `${CLS(organizationId)}/reject`,
+        {
+          transactionId,
+          ...(options?.suggestedCategoryId ? { suggestedCategoryId: options.suggestedCategoryId } : {}),
+          ...(options?.suggestedConfidence != null ? { suggestedConfidence: options.suggestedConfidence } : {}),
+          ...(options?.reason ? { reason: options.reason } : {}),
+        }
+      );
+      if (res.success) {
+        dataStore.notify('classification-rules');
+      }
+      return res;
+    }
+    await simulateDelay(100);
+    return { success: true, data: { rejected: true, disabledRules: [] } };
+  },
+
+  async getRuleVersions(
+    organizationId: string,
+    ruleId: string
+  ): Promise<ServiceResponse<any[]>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any[]>(organizationId);
+      if (err) return err;
+      return apiGet<any[]>(`${CLS(organizationId)}/rules/${encodeURIComponent(ruleId)}/versions`);
+    }
+    await simulateDelay(50);
+    return { success: true, data: [] };
+  },
+
+  async getPolicy(organizationId: string): Promise<ServiceResponse<any>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any>(organizationId);
+      if (err) return err;
+      return apiGet<any>(`${CLS(organizationId)}/policy`);
+    }
+    await simulateDelay(50);
+    return { success: true, data: { highThreshold: 85, mediumThreshold: 60, allowsAutoApproval: true, highValueThreshold: 5000, duplicateWindowDays: 7, policyVersion: 1 } };
+  },
+
+  async updatePolicy(organizationId: string, updates: Record<string, unknown>): Promise<ServiceResponse<any>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<any>(organizationId);
+      if (err) return err;
+      return apiRequest<any>(`${CLS(organizationId)}/policy`, {
+        method: 'PUT',
+        body: JSON.stringify(updates),
+      });
+    }
+    await simulateDelay(50);
+    return { success: true, data: updates };
   },
 
   async revertRuleVersion(
@@ -525,6 +634,20 @@ export const classificationService = {
         activeRules: classificationRules.length,
         falsePositives: 0,
       },
+    };
+  },
+
+  async getPerformance(organizationId: string): Promise<ServiceResponse<ClassificationPerformance>> {
+    if (isHttpBackendConfigured()) {
+      const err = requireOrg<ClassificationPerformance>(organizationId);
+      if (err) return err;
+      return apiGet<ClassificationPerformance>(`${CLS(organizationId)}/performance`);
+    }
+
+    await simulateDelay(50);
+    return {
+      success: true,
+      data: { monthlyTrend: [], categoryPerformance: [], totalFeedback: 0 },
     };
   },
 

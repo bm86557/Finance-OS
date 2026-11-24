@@ -47,6 +47,8 @@ function joinBaseAndPath(base: string, path: string): string {
 export type ApiRequestOptions = RequestInit & {
   /** Optional bearer token; adds `Authorization` header when set. */
   token?: string;
+  /** Optional per-request timeout override (ms). Defaults to 20s. */
+  timeoutMs?: number;
 };
 
 /** Prevents hung requests (e.g. misconfigured API) from blocking auth and dashboards forever. */
@@ -96,7 +98,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     };
   }
 
-  const { token, ...requestInit } = options;
+  const { token, timeoutMs, ...requestInit } = options;
   const method = (requestInit.method ?? 'GET').toString().toUpperCase();
   const url = joinBaseAndPath(base, path);
   const headers = new Headers(requestInit.headers);
@@ -121,7 +123,7 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
 
   const executeFetch = async (authHeaders: Headers): Promise<Response> => {
     const { signal: timeoutSignal, clear: clearTimeoutSignal } = withTimeoutSignal(
-      DEFAULT_FETCH_TIMEOUT_MS,
+      timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS,
       requestInit.signal,
     );
     try {

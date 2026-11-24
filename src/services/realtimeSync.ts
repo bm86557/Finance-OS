@@ -146,6 +146,66 @@ export function setupSupabaseRealtimeSync(organizationId?: string): void {
           dataStore.notify('transactions');
         }
       )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'recurring_transactions',
+          ...(targetOrg ? { filter: `organization_id=eq.${targetOrg}` } : {}),
+        },
+        () => {
+          dataStore.notify('recurringTransactions');
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'employee_payslips',
+          ...(targetOrg ? { filter: `organization_id=eq.${targetOrg}` } : {}),
+        },
+        () => {
+          dataStore.notify('payslips');
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'employee_expenses',
+          ...(targetOrg ? { filter: `organization_id=eq.${targetOrg}` } : {}),
+        },
+        () => {
+          dataStore.notify('expenses');
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'invoices',
+          ...(targetOrg ? { filter: `organization_id=eq.${targetOrg}` } : {}),
+        },
+        () => {
+          dataStore.notify('invoices');
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'organization_members',
+          ...(targetOrg ? { filter: `organization_id=eq.${targetOrg}` } : {}),
+        },
+        () => {
+          dataStore.notify('organizationMembers');
+        }
+      )
       .subscribe((status, err) => {
         if (status === 'SUBSCRIBED') {
           subscriptionAttempts = 0;

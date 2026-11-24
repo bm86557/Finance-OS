@@ -10,6 +10,7 @@ import { ok, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import { calculateDepartmentProfitability } from './departments.js';
+import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -277,88 +278,70 @@ export function createProfitIntelligenceRouter(): Router {
         console.warn('[profitIntelligence.clients] Supabase RPC error:', err);
       }
 
-      // Query Supabase projects & transactions & timesheets tables directly
+      // Query Supabase using authoritative Schedule-Driven Project Cost Engine (§12.5 parity)
       try {
-        const [{ data: sbProjects }, { data: sbTxns }, { data: sbTimesheets }, { data: sbMembers }, { data: orgRow }] = await Promise.all([
+        const [
+          { data: sbProjects },
+          { data: sbTxns },
+          { data: sbMembers },
+          { data: sbDepts },
+          { data: sbOverhead },
+          { data: sbTeams },
+          { data: sbTeamMembers },
+          { data: orgRow },
+        ] = await Promise.all([
           sb.from('projects').select('*').eq('organization_id', orgId),
           sb.from('transactions').select('*').eq('organization_id', orgId),
-          sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
           sb.from('organization_members').select('*').eq('organization_id', orgId),
-          sb.from('organizations').select('currency').eq('id', orgId).maybeSingle(),
+          sb.from('departments').select('*').eq('organization_id', orgId),
+          sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
+          sb.from('agency_teams').select('*').eq('organization_id', orgId),
+          sb.from('agency_team_members').select('*').eq('organization_id', orgId),
+          sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
         ]);
-        const orgCurrency = orgRow?.currency || 'USD';
+        const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
 
         if (sbProjects && sbProjects.length > 0) {
-          const memberSalaryMap = new Map((sbMembers || []).map((m: any) => [
-            String(m.user_id || m.userId),
-            Number(m.fixed_salary || m.salary || 0)
-          ]));
+          const engineResult = computeOrgProjectsProfitability({
+            projects: sbProjects,
+            transactions: sbTxns || [],
+            members: sbMembers || [],
+            departments: sbDepts || [],
+            overheadAllocations: sbOverhead || [],
+            agencyTeams: sbTeams || [],
+            agencyTeamMembers: sbTeamMembers || [],
+            orgCurrency,
+            fromDate,
+            toDate,
+          });
 
-          const clientMap = new Map<string, { revenue: number; directCost: number; laborCost: number; projectIds: Set<string> }>();
+          const clientMap = new Map<string, { revenue: number; directCost: number; laborCost: number; assignedOverhead: number; projectIds: Set<string> }>();
 
-          for (const p of sbProjects) {
-            const clientName = p.client_name || p.name || 'Unknown Client';
+          for (const p of engineResult.projects) {
+            const clientName = p.clientName || p.projectName || 'Unknown Client';
             if (!clientMap.has(clientName)) {
-              clientMap.set(clientName, { revenue: 0, directCost: 0, laborCost: 0, projectIds: new Set() });
+              clientMap.set(clientName, { revenue: 0, directCost: 0, laborCost: 0, assignedOverhead: 0, projectIds: new Set() });
             }
             const cData = clientMap.get(clientName)!;
-            cData.projectIds.add(String(p.id));
+            cData.projectIds.add(p.projectId);
 
-            const projTxns = (sbTxns || []).filter((t: any) => {
-              if ((t.project_id || t.projectId) !== p.id) return false;
-              const status = String(t.status || 'classified').toLowerCase();
-              if (['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status)) return false;
-              const tags = Array.isArray(t.tags) ? t.tags : [];
-              if (t.is_transfer || t.transfer_group_id || tags.includes('transfer')) return false;
-              return true;
-            });
-            const txnRev = projTxns
-              .filter((t: any) => t.type === 'credit')
-              .reduce((s: number, t: any) => s + convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency), 0);
-            // Exclude reimbursement settlements to prevent double counting (§1247)
-            const txnCost = projTxns
-              .filter((t: any) => {
-                if (t.type !== 'debit') return false;
-                const tags = Array.isArray(t.tags) ? t.tags : [];
-                const desc = (t.description || t.narration || '').toLowerCase();
-                if (tags.includes('reimbursement_settlement') || tags.includes('payroll_payout')) return false;
-                if (desc.includes('reimbursement settlement') || desc.includes('expense payout')) return false;
-                return true;
-              })
-              .reduce((s: number, t: any) => s + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)), 0);
-
-            // Compute project timesheet labor cost with minute precision (§12.4)
-            const pTimesheets = (sbTimesheets || []).filter((ts: any) => (ts.project_id || ts.projectId) === p.id);
-            const laborCost = pTimesheets.reduce((s: number, ts: any) => {
-              const salary = memberSalaryMap.get(String(ts.user_id || ts.userId)) || 0;
-              let costPerHour = Number(ts.effective_cost_per_hour || 0);
-              let costPerMinute = Number(ts.effective_cost_per_minute || 0);
-              if (costPerMinute <= 0) {
-                costPerHour = salary > 0 ? (salary / 160) : 50;
-                costPerMinute = costPerHour / 60;
-              }
-              const durationMins = Number(ts.duration_minutes || Math.round(Number(ts.hours || 0) * 60));
-              return s + (durationMins * costPerMinute);
-            }, 0);
-
-            // Use live transactions if present, otherwise project quoted/actual budgets
-            const rev = txnRev > 0 ? txnRev : Number(p.quoted_amount || 0);
-            const dirCost = txnCost > 0 ? txnCost : Number(p.actual_cost || 0);
-
+            const rev = convertCurrency(p.revenue > 0 ? p.revenue : p.quotedAmount, p.currency, orgCurrency);
             cData.revenue += rev;
-            cData.directCost += dirCost;
-            cData.laborCost += laborCost;
+            cData.directCost += convertCurrency(p.initialBaselineCost + p.directCost, p.currency, orgCurrency);
+            cData.laborCost += convertCurrency(p.laborCost, p.currency, orgCurrency);
+            cData.assignedOverhead += convertCurrency(p.assignedOverhead, p.currency, orgCurrency);
           }
 
           const clients = Array.from(clientMap.entries()).map(([clientName, d]) => {
-            const totalCost = d.directCost + d.laborCost;
+            const totalCost = d.directCost + d.laborCost + d.assignedOverhead;
             const profit = d.revenue - totalCost;
             const margin = d.revenue > 0 ? (profit / d.revenue) * 100 : 0;
             return {
               clientName,
-              revenue: d.revenue,
+              revenue: Math.round(d.revenue * 100) / 100,
               directCost: Math.round(d.directCost * 100) / 100,
               laborCost: Math.round(d.laborCost * 100) / 100,
+              assignedOverhead: Math.round(d.assignedOverhead * 100) / 100,
               cost: Math.round(totalCost * 100) / 100,
               profit: Math.round(profit * 100) / 100,
               operatingProfit: Math.round(profit * 100) / 100,
@@ -609,80 +592,112 @@ export function createProfitIntelligenceRouter(): Router {
   r.patch('/space-allocations', handleSpaceAllocationsUpdate);
   r.post('/space-allocations', handleSpaceAllocationsUpdate);
 
-  // GET /worker-labor-costs - Worker loaded labor cost & dual capacity denominators (§12.1)
+  // GET /worker-labor-costs - Worker loaded labor cost & fixed 160h/month schedule capacity (§12.1)
   r.get('/worker-labor-costs', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
     try {
-      const [{ data: members }, { data: depts }, { data: timesheets }, { data: orgRow }] = await Promise.all([
+      const [{ data: members }, { data: depts }, { data: projects }, { data: txns }, { data: allocs }, { data: orgRow }] = await Promise.all([
         sb.from('organization_members').select('*').eq('organization_id', orgId),
         sb.from('departments').select('*').eq('organization_id', orgId),
-        sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
-        sb.from('organizations').select('currency').eq('id', orgId).maybeSingle(),
+        sb.from('projects').select('*').eq('organization_id', orgId),
+        sb.from('transactions').select('*').eq('organization_id', orgId),
+        sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
+        sb.from('organizations').select('base_currency, currency, settings').eq('id', orgId).maybeSingle(),
       ]);
 
-      const orgCurrency = orgRow?.currency || 'USD';
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+      // Configurable org employer statutory tax burden (default 0 unless configured per jurisdiction — §12.1 L610, ADR-08)
+      const employerTaxRatePct = Math.max(0, Number(orgRow?.settings?.employerTaxRatePct ?? 0));
       const deptMap = new Map((depts || []).map((d: any) => [d.id, d.name]));
 
-      const workerCosts = (members || []).map((m: any) => {
-        const baseSalary = Number(m.fixed_salary || m.salary || 0);
-        // Standard workforce cost policy: employer statutory taxes 7.65% (FICA) if salaried
-        const employerTaxes = baseSalary > 0 ? Math.round(baseSalary * 0.0765 * 100) / 100 : 0;
-        const employerBenefits = 0;
-        const approvedBonus = 0;
-        const workforceOverhead = 0;
-        const loadedLaborCost = baseSalary + employerTaxes + employerBenefits + approvedBonus + workforceOverhead;
+      // Compute current-month scheduled project hours per worker (fixed 160h/mo policy — zero timesheet dependency)
+      const now = new Date();
+      const yyyy = now.getUTCFullYear();
+      const mm = String(now.getUTCMonth() + 1).padStart(2, '0');
+      const lastDay = new Date(Date.UTC(yyyy, now.getUTCMonth() + 1, 0)).getUTCDate();
+      const monthStart = `${yyyy}-${mm}-01`;
+      const monthEnd = `${yyyy}-${mm}-${String(lastDay).padStart(2, '0')}`;
 
-        const hoursPerDay = Number(m.hours_per_day || 8);
-        const daysPerMonth = Number(m.working_days_per_month || 20);
-        const availableCapacityHours = (hoursPerDay > 0 && daysPerMonth > 0) ? (hoursPerDay * daysPerMonth) : 160;
-
-        // Approved productive hours from timesheets
-        const userTs = (timesheets || []).filter((t: any) => (t.user_id || t.userId) === m.user_id && t.status === 'approved');
-        const approvedProductiveHours = userTs.reduce((sum: number, t: any) => sum + Number(t.hours || 0), 0);
-
-        // Denominator selection: zero-hour denominator is undefined, never 0 cost!
-        const capacityHourlyCost = availableCapacityHours > 0
-          ? Math.round((loadedLaborCost / availableCapacityHours) * 100) / 100
-          : null;
-        const capacityMinuteCost = capacityHourlyCost != null
-          ? Math.round((capacityHourlyCost / 60) * 10000) / 10000
-          : null;
-
-        const productiveHourlyCost = approvedProductiveHours > 0
-          ? Math.round((loadedLaborCost / approvedProductiveHours) * 100) / 100
-          : null;
-        const productiveMinuteCost = productiveHourlyCost != null
-          ? Math.round((productiveHourlyCost / 60) * 10000) / 10000
-          : null;
-
-        return {
-          userId: m.user_id || m.id,
-          userName: m.email ? m.email.split('@')[0] : 'Member',
-          userEmail: m.email || '',
-          departmentId: m.department_id || null,
-          departmentName: m.department_id ? deptMap.get(m.department_id) || m.department : m.department || null,
-          position: m.position || null,
-          baseSalary,
-          employerTaxes,
-          employerBenefits,
-          approvedBonus,
-          workforceOverhead,
-          loadedLaborCost,
-          availableCapacityHours,
-          approvedProductiveHours: approvedProductiveHours > 0 ? approvedProductiveHours : null,
-          capacityHourlyCost,
-          capacityMinuteCost,
-          productiveHourlyCost,
-          productiveMinuteCost,
-          capacityBasis: 'fte_160h' as const,
-          currency: m.salary_currency || orgCurrency,
-          policyVersion: 'v1.2-costing',
-          effectiveDate: m.joined_at ? String(m.joined_at).slice(0, 10) : new Date().toISOString().slice(0, 10),
-        };
+      const schedEngine = computeOrgProjectsProfitability({
+        projects: projects || [],
+        transactions: txns || [],
+        members: members || [],
+        departments: depts || [],
+        overheadAllocations: allocs || [],
+        orgCurrency,
+        fromDate: monthStart,
+        toDate: monthEnd,
       });
+
+      const userScheduledHours = new Map<string, number>();
+      for (const proj of schedEngine.projects) {
+        for (const ta of proj.teamAllocations) {
+          userScheduledHours.set(ta.userId, (userScheduledHours.get(ta.userId) || 0) + ta.elapsedHours);
+        }
+      }
+
+      const workerCosts = (members || [])
+        .filter((m: any) => String(m.status || 'active').toLowerCase() === 'active')
+        .map((m: any) => {
+          const baseSalary = Number(m.fixed_salary || m.salary || 0);
+          const employerTaxes = baseSalary > 0 && employerTaxRatePct > 0
+            ? Math.round(baseSalary * (employerTaxRatePct / 100) * 100) / 100
+            : 0;
+          const employerBenefits = 0;
+          const approvedBonus = 0;
+          const workforceOverhead = 0;
+          const loadedLaborCost = Math.round((baseSalary + employerTaxes + employerBenefits + approvedBonus + workforceOverhead) * 100) / 100;
+
+          const hoursPerDay = Number(m.hours_per_day || 8);
+          const daysPerMonth = Number(m.working_days_per_month || 20);
+          const availableCapacityHours = (hoursPerDay > 0 && daysPerMonth > 0) ? (hoursPerDay * daysPerMonth) : 160;
+
+          const uid = String(m.user_id || m.id || '');
+          const scheduledProductiveHours = Math.round((userScheduledHours.get(uid) || 0) * 100) / 100;
+
+          // Denominator selection: zero-hour denominator is undefined (null), never 0 cost (§12.1 L620)
+          const capacityHourlyCost = availableCapacityHours > 0 && loadedLaborCost > 0
+            ? Math.round((loadedLaborCost / availableCapacityHours) * 100) / 100
+            : null;
+          const capacityMinuteCost = availableCapacityHours > 0 && loadedLaborCost > 0
+            ? Math.round((loadedLaborCost / (availableCapacityHours * 60)) * 10000) / 10000
+            : null;
+
+          const productiveHourlyCost = scheduledProductiveHours > 0 && loadedLaborCost > 0
+            ? Math.round((loadedLaborCost / scheduledProductiveHours) * 100) / 100
+            : null;
+          const productiveMinuteCost = scheduledProductiveHours > 0 && loadedLaborCost > 0
+            ? Math.round((loadedLaborCost / (scheduledProductiveHours * 60)) * 10000) / 10000
+            : null;
+
+          return {
+            userId: uid,
+            userName: m.email ? m.email.split('@')[0] : 'Member',
+            userEmail: m.email || '',
+            departmentId: m.department_id || null,
+            departmentName: m.department_id ? deptMap.get(m.department_id) || m.department : m.department || null,
+            position: m.position || null,
+            baseSalary,
+            employerTaxes,
+            employerBenefits,
+            approvedBonus,
+            workforceOverhead,
+            loadedLaborCost,
+            availableCapacityHours,
+            approvedProductiveHours: scheduledProductiveHours > 0 ? scheduledProductiveHours : null,
+            capacityHourlyCost,
+            capacityMinuteCost,
+            productiveHourlyCost,
+            productiveMinuteCost,
+            capacityBasis: 'fte_160h' as const,
+            currency: m.salary_currency || orgCurrency,
+            policyVersion: 'v1.2-costing',
+            effectiveDate: m.joined_at ? String(m.joined_at).slice(0, 10) : new Date().toISOString().slice(0, 10),
+          };
+        });
 
       return ok(res, workerCosts);
     } catch (err) {

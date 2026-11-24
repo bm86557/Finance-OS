@@ -2,13 +2,16 @@ import { Router, type Request, type Response } from 'express';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
 
 import { canViewConfidentialPayroll } from '../middleware/auth.js';
 import {
   computeBalanceSheetSnapshot,
   computeCashFlowSnapshot,
   computeProfitLossSnapshot,
+  computeUpcomingObligations,
   filterAccessibleBanks,
+  isActiveOrgMember,
   isLoanRepaymentTxn as isLoanRepaymentShared,
   isTransferTxn as isTransferShared,
   mapAndFilterWorldTransactions,
@@ -43,6 +46,7 @@ export function createReportsRouter(): Router {
       { data: accounts, error: accError },
       { data: bankAccounts },
       { data: loanRows },
+      { data: loanPaymentRows },
       { data: assetRows },
       { data: invRows },
       { data: deptRows },
@@ -51,12 +55,16 @@ export function createReportsRouter(): Router {
       { data: allocRows },
       { data: recurringRows },
       { data: budgetRows },
+      { data: payslipRows },
+      { data: employeeExpenseRows },
+      { data: invoiceRows },
     ] = await Promise.all([
       sb.from('organizations').select('*').eq('id', orgId),
       sb.from('transactions').select('*').eq('organization_id', orgId),
       sb.from('accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
       sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
       sb.from('loans').select('*').eq('organization_id', orgId),
+      sb.from('loan_payments').select('id, loan_id, payment_month, paid_on, amount').eq('organization_id', orgId),
       sb.from('assets').select('*').eq('organization_id', orgId),
       sb.from('inventory_items').select('*').eq('organization_id', orgId),
       sb.from('departments').select('*').eq('organization_id', orgId),
@@ -65,6 +73,9 @@ export function createReportsRouter(): Router {
       sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
       sb.from('recurring_transactions').select('*').eq('organization_id', orgId),
       sb.from('budgets').select('*').eq('organization_id', orgId),
+      sb.from('employee_payslips').select('*').eq('organization_id', orgId),
+      sb.from('employee_expenses').select('*').eq('organization_id', orgId).eq('status', 'approved'),
+      sb.from('invoices').select('id, invoice_number, client_name, due_date, total_amount, amount_paid, amount_due, currency, status').eq('organization_id', orgId),
     ]);
 
     const orgRow = orgRows?.[0];
@@ -164,7 +175,7 @@ export function createReportsRouter(): Router {
     const weeklyExpenses = currentWeekTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
     const weeklyProfit = weeklyRevenue - weeklyExpenses;
     const priorWeeklyProfit = priorWeekTxns.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0) -
-                              priorWeekTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
+      priorWeekTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
     const weeklyProfitChange = Math.abs(priorWeeklyProfit) > 0 ? Math.round(((weeklyProfit - priorWeeklyProfit) / Math.abs(priorWeeklyProfit)) * 1000) / 10 : null;
 
     // Current Year Metrics
@@ -176,20 +187,20 @@ export function createReportsRouter(): Router {
     const yearlyExpenses = currentYearTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
     const yearlyProfit = yearlyRevenue - yearlyExpenses;
     const priorYearlyProfit = priorYearTxns.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0) -
-                              priorYearTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
+      priorYearTxns.filter(t => t.type === 'debit' && !isLoanRepaymentTxn(t)).reduce((s, t) => s + Math.abs(t.amount), 0);
     const yearlyProfitChange = Math.abs(priorYearlyProfit) > 0 ? Math.round(((yearlyProfit - priorYearlyProfit) / Math.abs(priorYearlyProfit)) * 1000) / 10 : null;
 
-    // Monthly payroll from active organization members (only for business world & authorized roles)
-    const activeMembers = (memberRows ?? []).filter((m: any) => m.status === 'active' || m.is_active !== false);
+    // Monthly payroll from strictly active organization members (only for business world & authorized roles)
+    const activeMembers = (memberRows ?? []).filter(isActiveOrgMember);
     const rawMonthlyPayroll =
       worldFilter === 'personal'
         ? 0
         : activeMembers.reduce(
-            (sum: number, m: any) =>
-              sum + convertCurrency(Number(m.fixed_salary || m.salary || 0), m.salary_currency || m.currency || orgCurrency, orgCurrency),
-            0
-          );
-    const monthlyPayroll = includePayrollConfidential ? rawMonthlyPayroll : 0;
+          (sum: number, m: any) =>
+            sum + convertCurrency(Number(m.fixed_salary || m.salary || 0), m.salary_currency || m.currency || orgCurrency, orgCurrency),
+          0
+        );
+    const monthlyPayroll = includePayrollConfidential ? Math.round(rawMonthlyPayroll * 100) / 100 : 0;
 
     // 1–7. Authoritative Balance Sheet & Net Worth Snapshot (shared with /balance-sheet & /bank-accounts)
     const bsSnapshot = computeBalanceSheetSnapshot({
@@ -389,87 +400,34 @@ export function createReportsRouter(): Router {
       targetSource: totalBudgetedExpense > 0 ? 'budgets' : 'none',
     };
 
-    // ── Real Upcoming Payments and Expenses (Next 30 Days) ─────────────────
-    const upcomingPayments: Array<{ date: string; title: string; amount: number; currency: string; type?: 'credit' | 'debit' }> = [];
-    const upcomingExpenses: Array<{ date: string; title: string; amount: number; currency: string; type?: 'credit' | 'debit' }> = [];
+    // ── Authoritative Upcoming Payments & Expenses (Next 30 Days + Overdue Separation) ──
+    const upcomingSnapshot = computeUpcomingObligations({
+      orgCurrency,
+      worldFilter,
+      includePayrollConfidential,
+      allOrgBanks: bankAccounts ?? [],
+      bankWorldMap,
+      recurringRows: recurringRows ?? [],
+      loanRows: loanRows ?? [],
+      loanPaymentRows: loanPaymentRows ?? [],
+      memberRows: memberRows ?? [],
+      payslipRows: payslipRows ?? [],
+      employeeExpenseRows: employeeExpenseRows ?? [],
+      invoiceRows: invoiceRows ?? [],
+      asOfDate: now,
+      horizonDays: 30,
+    });
 
-    // 1. Recurring transactions (due within next 30 days)
-    for (const rec of (recurringRows || [])) {
-      if (rec.is_active === false) continue;
-      const amt = Number(rec.amount || 0);
-      if (amt <= 0) continue;
-      const nextDate = rec.next_occurrence || rec.start_date || '';
-      if (!nextDate) continue;
-      const dt = new Date(nextDate);
-      if (isNaN(dt.getTime())) continue;
-      const daysDiff = (dt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
-      if (daysDiff < -5 || daysDiff > 30) continue;
-      const dateFormatted = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      const convAmt = convertCurrency(amt, String(rec.currency || orgCurrency), orgCurrency);
-      const item = {
-        date: dateFormatted,
-        title: String(rec.description || 'Recurring Transaction'),
-        amount: Math.round(convAmt * 100) / 100,
-        rawAmount: amt,
-        currency: orgCurrency,
-        originalCurrency: String(rec.currency || orgCurrency),
-        type: rec.type === 'credit' ? ('credit' as const) : ('debit' as const),
-      };
-      if (rec.type === 'credit') {
-        upcomingPayments.push(item);
-      } else {
-        upcomingExpenses.push(item);
-      }
-    }
-
-    // 2. Active loan installments (due within next 30 days; require declared installment_amount per §33 #5)
-    const activeLoans = worldFilter === 'personal' ? [] : (loanRows || []);
-    for (const loan of activeLoans) {
-      if (loan.status === 'paid') continue;
-      const rem = Number(loan.remaining_balance ?? loan.amount ?? 0);
-      if (rem <= 0) continue;
-      const instAmt = Number(loan.installment_amount || 0);
-      if (instAmt <= 0) continue;
-      const nextDate = loan.next_payment_date || loan.due_date || '';
-      if (nextDate) {
-        const dt = new Date(nextDate);
-        if (!isNaN(dt.getTime())) {
-          const daysDiff = (dt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
-          if (daysDiff < -5 || daysDiff > 30) continue;
-        }
-      }
-      const dateFormatted = nextDate ? new Date(nextDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : 'Upcoming';
-      const convAmt = convertCurrency(instAmt, String(loan.currency || orgCurrency), orgCurrency);
-      const item = {
-        date: dateFormatted,
-        title: String(loan.description || (loan.type === 'to_pay' ? 'Loan Repayment' : 'Loan Collection')),
-        amount: Math.round(convAmt * 100) / 100,
-        rawAmount: Math.round(instAmt * 100) / 100,
-        currency: orgCurrency,
-        originalCurrency: String(loan.currency || orgCurrency),
-        type: loan.type === 'to_receive' ? ('credit' as const) : ('debit' as const),
-      };
-      if (loan.type === 'to_receive') {
-        upcomingPayments.push(item);
-      } else {
-        upcomingExpenses.push(item);
-      }
-    }
-
-    // 3. Monthly Team Payroll (only shown to roles with payroll:read_confidential)
-    if (monthlyPayroll > 0 && includePayrollConfidential) {
-      const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-      upcomingExpenses.push({
-        date: endOfMonth.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-        title: 'Team Payroll',
-        amount: monthlyPayroll,
-        currency: orgCurrency,
-        type: 'debit',
-      });
-    }
-
-    const totalUpcomingPayments = upcomingPayments.reduce((s, p) => s + p.amount, 0);
-    const totalUpcomingExpenses = upcomingExpenses.reduce((s, e) => s + e.amount, 0);
+    const {
+      upcomingPayments,
+      upcomingExpenses,
+      overduePayments,
+      overdueExpenses,
+      totalUpcomingPayments,
+      totalUpcomingExpenses,
+      totalOverduePayments,
+      totalOverdueExpenses,
+    } = upcomingSnapshot;
 
     // Monthly Burn Rate & Cash Runway Months (§12.1, §12.4, §15, §33)
     // Trailing active operating months within the 3-month window
@@ -534,8 +492,12 @@ export function createReportsRouter(): Router {
       monthlyGoals,
       upcomingPayments,
       upcomingExpenses,
+      overduePayments,
+      overdueExpenses,
       totalUpcomingPayments,
       totalUpcomingExpenses,
+      totalOverduePayments,
+      totalOverdueExpenses,
       meta: {
         basis: 'cash',
         baseCurrency: orgCurrency,
@@ -543,6 +505,11 @@ export function createReportsRouter(): Router {
         asOf: new Date().toISOString(),
         source: 'transactions',
         unapprovedCount: pendingTransactions,
+        upcomingWindow: {
+          start: upcomingSnapshot.windowStart,
+          end: upcomingSnapshot.windowEnd,
+          basis: upcomingSnapshot.basis,
+        },
       },
       chartData: {
         profitData: monthlyProfitData,
@@ -1185,23 +1152,33 @@ export function createReportsRouter(): Router {
     if (!sb) return res.status(503).json({ error: 'Database unavailable' });
 
     try {
-      const [{ data: members }, { data: timesheets }] = await Promise.all([
+      const [{ data: members }, { data: projects }] = await Promise.all([
         sb.from('organization_members').select('*').eq('organization_id', orgId).eq('status', 'active'),
-        sb.from('timesheet_entries').select('hours, billable, rate').eq('organization_id', orgId),
+        sb.from('projects').select('*').eq('organization_id', orgId),
       ]);
 
       const activeHeadcount = Math.max(1, (members || []).length);
-      let totalBillableHours = 0;
-      let totalWeightedRate = 0;
-      for (const ts of (timesheets || [])) {
-        if (ts.billable !== false) {
-          const h = Number(ts.hours || 0);
-          const r = Number(ts.rate || 85);
-          totalBillableHours += h;
-          totalWeightedRate += h * r;
+      const schedEngine = computeOrgProjectsProfitability({
+        projects: projects || [],
+        transactions: [],
+        members: members || [],
+        departments: [],
+        overheadAllocations: [],
+      });
+
+      let totalPlannedHours = 0;
+      let totalQuotedVal = 0;
+      for (const p of schedEngine.projects) {
+        if (p.plannedHours > 0 && p.quotedAmount > 0) {
+          totalPlannedHours += p.plannedHours;
+          totalQuotedVal += p.quotedAmount;
         }
       }
-      const avgRate = totalBillableHours > 0 ? totalWeightedRate / totalBillableHours : 85;
+      const avgRate = totalPlannedHours > 0 ? totalQuotedVal / totalPlannedHours : 85;
+      const monthlyPayroll = (members || []).reduce((sum: number, m: any) => {
+        const sal = Number(m.fixed_salary || m.salary || 0);
+        return sum + (sal > 0 ? sal : Number(m.hourly_rate || 0) * 160);
+      }, 0);
 
       const { computeCapacityForecast } = await import('../services/forecastEngine.js');
       const forecast = computeCapacityForecast({
@@ -1211,7 +1188,7 @@ export function createReportsRouter(): Router {
         activeHeadcount,
         standardHoursPerFte: 160,
         historicalBillableRate: Math.round(avgRate * 100) / 100,
-        directStaffCostPerMonth: activeHeadcount * 4500,
+        directStaffCostPerMonth: monthlyPayroll > 0 ? monthlyPayroll : activeHeadcount * 4500,
       });
 
       return ok(res, forecast);
@@ -1411,23 +1388,33 @@ export function createReportsRouter(): Router {
     if (!sb) return res.status(503).json({ error: 'Database unavailable' });
 
     try {
-      const [{ data: members }, { data: timesheets }] = await Promise.all([
+      const [{ data: members }, { data: projects }] = await Promise.all([
         sb.from('organization_members').select('*').eq('organization_id', orgId).eq('status', 'active'),
-        sb.from('timesheet_entries').select('hours, billable, rate').eq('organization_id', orgId),
+        sb.from('projects').select('*').eq('organization_id', orgId),
       ]);
 
       const activeHeadcount = Math.max(1, (members || []).length);
-      let totalBillableHours = 0;
-      let totalWeightedRate = 0;
-      for (const ts of (timesheets || [])) {
-        if (ts.billable !== false) {
-          const h = Number(ts.hours || 0);
-          const r = Number(ts.rate || 85);
-          totalBillableHours += h;
-          totalWeightedRate += h * r;
+      const schedEngine = computeOrgProjectsProfitability({
+        projects: projects || [],
+        transactions: [],
+        members: members || [],
+        departments: [],
+        overheadAllocations: [],
+      });
+
+      let totalPlannedHours = 0;
+      let totalQuotedVal = 0;
+      for (const p of schedEngine.projects) {
+        if (p.plannedHours > 0 && p.quotedAmount > 0) {
+          totalPlannedHours += p.plannedHours;
+          totalQuotedVal += p.quotedAmount;
         }
       }
-      const avgRate = totalBillableHours > 0 ? totalWeightedRate / totalBillableHours : 85;
+      const avgRate = totalPlannedHours > 0 ? totalQuotedVal / totalPlannedHours : 85;
+      const monthlyPayroll = (members || []).reduce((sum: number, m: any) => {
+        const sal = Number(m.fixed_salary || m.salary || 0);
+        return sum + (sal > 0 ? sal : Number(m.hourly_rate || 0) * 160);
+      }, 0);
 
       const { computeCapacityForecast } = await import('../services/forecastEngine.js');
       const forecast = computeCapacityForecast({
@@ -1437,7 +1424,7 @@ export function createReportsRouter(): Router {
         activeHeadcount,
         standardHoursPerFte: 160,
         historicalBillableRate: Math.round(avgRate * 100) / 100,
-        directStaffCostPerMonth: activeHeadcount * 4500,
+        directStaffCostPerMonth: monthlyPayroll > 0 ? monthlyPayroll : activeHeadcount * 4500,
       });
 
       return ok(res, forecast);
@@ -1688,27 +1675,31 @@ export function createReportsRouter(): Router {
       const projectMap = new Map<string, any>();
       for (const p of (projects || [])) projectMap.set(String(p.id), p);
 
+      const scheduleDeptEngine = computeOrgProjectsProfitability({
+        projects: projects || [],
+        transactions: txns || [],
+        members: members || [],
+        departments: activeDepts,
+        overheadAllocations: allocRows || [],
+        orgCurrency,
+        fromDate: dateFrom,
+        toDate: dateTo,
+      });
+
       const projectDeptHours = new Map<string, Map<string, number>>();
-      for (const ts of (timesheets || [])) {
-        const hrs = Number(ts.hours || 0);
-        if (hrs <= 0) continue;
-        const uid = String(ts.user_id || ts.userId || '');
-        const pid = String(ts.project_id || ts.projectId || '');
-        const proj = projectMap.get(pid);
-        const deptId = userDeptMap.get(uid) || matchDepartmentId(proj?.department_id || proj?.departmentId) || null;
-        if (deptId && deptStats.has(deptId)) {
-          if (ts.billable !== false) {
+      for (const [pid, dMap] of scheduleDeptEngine.projectDeptScheduledHours.entries()) {
+        const resolvedMap = new Map<string, number>();
+        for (const [rawDeptId, hrs] of dMap.entries()) {
+          const deptId = matchDepartmentId(rawDeptId) || rawDeptId;
+          if (deptId && deptStats.has(deptId) && hrs > 0) {
             deptStats.get(deptId)!.billableHours = Math.round((deptStats.get(deptId)!.billableHours + hrs) * 10) / 10;
-          }
-          if (pid) {
-            if (!projectDeptHours.has(pid)) projectDeptHours.set(pid, new Map());
-            const pMap = projectDeptHours.get(pid)!;
-            pMap.set(deptId, (pMap.get(deptId) || 0) + hrs);
+            resolvedMap.set(deptId, (resolvedMap.get(deptId) || 0) + hrs);
           }
         }
+        if (resolvedMap.size > 0) projectDeptHours.set(pid, resolvedMap);
       }
 
-      
+
       const catMap = new Map<string, string>();
       for (const c of (categories || [])) {
         if (c.id && c.name) catMap.set(String(c.id), String(c.name).toLowerCase());
@@ -2049,42 +2040,38 @@ export function createReportsRouter(): Router {
     if (!sb) return res.status(503).json({ error: 'Database unavailable' });
 
     try {
-      // §12.5 & §15 Client Profitability Parity with Project Costing Engine
-      const [{ data: projects }, { data: txns }, { data: allTs }, { data: members }, { data: overheadData }] = await Promise.all([
+      // §12.5 & §15 Client Profitability Parity with Schedule-Driven Project Costing Engine
+      const [
+        { data: projects },
+        { data: txns },
+        { data: members },
+        { data: departments },
+        { data: overheadData },
+        { data: teamsData },
+        { data: teamMembersData },
+        { data: orgRow },
+      ] = await Promise.all([
         sb.from('projects').select('*').eq('organization_id', orgId),
         sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
         sb.from('organization_members').select('*').eq('organization_id', orgId),
+        sb.from('departments').select('*').eq('organization_id', orgId),
         sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
+        sb.from('agency_teams').select('*').eq('organization_id', orgId),
+        sb.from('agency_team_members').select('*').eq('organization_id', orgId),
+        sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
       ]);
 
-      const pList = projects || [];
-      const txnList = txns || [];
-      const tsList = allTs || [];
-      const memList = members || [];
-      const ovhList = overheadData || [];
-
-      // Build member salary / rate map
-      const memberSalaryMap = new Map<string, number>();
-      const memberHourlyMap = new Map<string, number>();
-      for (const m of memList) {
-        const uId = String(m.user_id || m.userId);
-        memberSalaryMap.set(uId, Number(m.fixed_salary || 0));
-        memberHourlyMap.set(uId, Number(m.hourly_rate || 0));
-      }
-
-      // Build department overhead mapping
-      const deptOverheadMap = new Map<string, number>();
-      for (const oa of ovhList) {
-        const dId = String(oa.department_id || '');
-        const amt = Number(oa.amount || oa.allocated_amount || 0);
-        deptOverheadMap.set(dId, (deptOverheadMap.get(dId) || 0) + amt);
-      }
-      const deptProjectCount = new Map<string, number>();
-      for (const p of pList) {
-        const dId = String(p.department_id || '');
-        deptProjectCount.set(dId, (deptProjectCount.get(dId) || 0) + 1);
-      }
+      const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+      const engineResult = computeOrgProjectsProfitability({
+        projects: projects || [],
+        transactions: txns || [],
+        members: members || [],
+        departments: departments || [],
+        overheadAllocations: overheadData || [],
+        agencyTeams: teamsData || [],
+        agencyTeamMembers: teamMembersData || [],
+        orgCurrency,
+      });
 
       interface ClientAccumulator {
         clientName: string;
@@ -2092,17 +2079,14 @@ export function createReportsRouter(): Router {
         directCosts: number;
         laborCosts: number;
         assignedOverhead: number;
-        totalCost: number;
         projectCount: number;
         projectIds: Set<string>;
       }
 
       const clientMap = new Map<string, ClientAccumulator>();
-      const projectClientMap = new Map<string, string>();
 
-      for (const p of pList) {
-        const cName = p.client_name || p.clientName || 'General Clients';
-        projectClientMap.set(p.id, cName);
+      for (const p of engineResult.projects) {
+        const cName = p.clientName || 'General Clients';
         if (!clientMap.has(cName)) {
           clientMap.set(cName, {
             clientName: cName,
@@ -2110,102 +2094,23 @@ export function createReportsRouter(): Router {
             directCosts: 0,
             laborCosts: 0,
             assignedOverhead: 0,
-            totalCost: 0,
             projectCount: 0,
             projectIds: new Set(),
           });
         }
         const stat = clientMap.get(cName)!;
         stat.projectCount++;
-        stat.projectIds.add(p.id);
+        stat.projectIds.add(p.projectId);
 
-        // Project assigned overhead share
-        const dId = String(p.department_id || '');
-        const deptOvh = deptOverheadMap.get(dId) || 0;
-        const pCnt = deptProjectCount.get(dId) || 1;
-        const pOverhead = Math.round((deptOvh / pCnt) * 100) / 100;
-        stat.assignedOverhead += pOverhead;
-
-        // Project initial baseline cost
-        stat.totalCost += Number(p.initial_baseline_cost || 0);
-      }
-
-      // Accumulate timesheet labor costs into clients
-      for (const ts of tsList) {
-        if (!ts.project_id) continue;
-        const cName = projectClientMap.get(ts.project_id) || 'General Clients';
-        if (!clientMap.has(cName)) {
-          clientMap.set(cName, {
-            clientName: cName,
-            revenue: 0,
-            directCosts: 0,
-            laborCosts: 0,
-            assignedOverhead: 0,
-            totalCost: 0,
-            projectCount: 1,
-            projectIds: new Set([ts.project_id]),
-          });
-        }
-        const stat = clientMap.get(cName)!;
-
-        const uId = String(ts.user_id);
-        let costPerMinute = Number(ts.effective_cost_per_minute || 0);
-        if (costPerMinute <= 0) {
-          const salary = memberSalaryMap.get(uId) || 0;
-          const hourlyRate = salary > 0 ? (salary / 160) : (memberHourlyMap.get(uId) || 50);
-          costPerMinute = hourlyRate / 60;
-        }
-        const durationMins = Number(ts.duration_minutes || Math.round(Number(ts.hours || 0) * 60));
-        const laborCost = Math.round(durationMins * costPerMinute * 100) / 100;
-        stat.laborCosts += laborCost;
-      }
-
-      // Deduplicate transactions by ID to prevent double counting (§12.4, §12.5)
-      const txnMap = new Map<string, any>();
-      for (const t of txnList) {
-        if (t.tags?.includes('transfer') || t.type === 'transfer') continue;
-        const tags = Array.isArray(t.tags) ? t.tags : [];
-        const desc = (t.description || t.narration || '').toLowerCase();
-        // Exclude reimbursement settlements to prevent double counting with employee claims (§1247)
-        if (tags.includes('reimbursement_settlement') || tags.includes('payroll_payout')) continue;
-        if (desc.includes('reimbursement settlement') || desc.includes('expense payout')) continue;
-        txnMap.set(t.id, t);
-      }
-
-      for (const t of txnMap.values()) {
-        const amt = Math.abs(Number(t.amount || 0));
-        const cName = (t.project_id && projectClientMap.get(t.project_id)) || 'General Clients';
-        if (!clientMap.has(cName)) {
-          clientMap.set(cName, {
-            clientName: cName,
-            revenue: 0,
-            directCosts: 0,
-            laborCosts: 0,
-            assignedOverhead: 0,
-            totalCost: 0,
-            projectCount: 1,
-            projectIds: new Set(),
-          });
-        }
-        const stat = clientMap.get(cName)!;
-        if (t.type === 'credit') {
-          stat.revenue += amt;
-        } else if (t.project_id) {
-          stat.directCosts += amt;
-        }
-      }
-
-      // Fallback: If no transactions credited for project, use quoted amount
-      for (const p of pList) {
-        const cName = projectClientMap.get(p.id) || 'General Clients';
-        const stat = clientMap.get(cName);
-        if (stat && stat.revenue === 0 && Number(p.quoted_amount || 0) > 0) {
-          stat.revenue += Number(p.quoted_amount);
-        }
+        const rev = convertCurrency(p.revenue > 0 ? p.revenue : p.quotedAmount, p.currency, orgCurrency);
+        stat.revenue += rev;
+        stat.directCosts += convertCurrency(p.initialBaselineCost + p.directCost, p.currency, orgCurrency);
+        stat.laborCosts += convertCurrency(p.laborCost, p.currency, orgCurrency);
+        stat.assignedOverhead += convertCurrency(p.assignedOverhead, p.currency, orgCurrency);
       }
 
       const clientList = Array.from(clientMap.values()).map(c => {
-        const totalCost = Math.round((c.directCosts + c.laborCosts + c.assignedOverhead + c.totalCost) * 100) / 100;
+        const totalCost = Math.round((c.directCosts + c.laborCosts + c.assignedOverhead) * 100) / 100;
         const netProfit = Math.round((c.revenue - totalCost) * 100) / 100;
         const marginPct = c.revenue > 0 ? Math.round(((netProfit / c.revenue) * 100) * 10) / 10 : 0;
         return {

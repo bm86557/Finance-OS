@@ -11,8 +11,23 @@ import { postTransactionToJournal } from '../lib/ledgerService.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { recomputeServerBankBalance } from './transactions.js';
 import { detectAndIssuePayslipsForTransactions } from '../lib/aiPayrollDetector.js';
-import { detectRiskFlags } from '../../src/lib/classificationEngine.js';
+import {
+  classifyTransaction,
+  detectRiskFlags,
+  inferWorldScope,
+  type ProposedNewCategory,
+} from '../../src/lib/classificationEngine.js';
 import { getGlobalPlatformSettings } from './platformSettings.js';
+import { resolveOrgAIConfig } from '../lib/aiGateway.js';
+import {
+  findOrCreateCategoryForOrg,
+  loadFullRules,
+  loadTenantPolicy,
+  loadOrgPersonalWorldEnabled,
+  loadLearningPromptContext,
+  recordClassificationEvidence,
+  recordRuleMatchUsage,
+} from '../services/learningEngineService.js';
 
 interface ImportedRow {
   date: string;
@@ -20,7 +35,16 @@ interface ImportedRow {
   amount: number;
   type: 'debit' | 'credit';
   usage?: 'personal' | 'business';
+  worldScope?: 'personal' | 'business';
   importCategoryId?: string;
+  suggestedCategoryId?: string;
+  proposedNewCategory?: ProposedNewCategory | null;
+  confidence?: number;
+  classificationSource?: 'ai' | 'rules';
+  classifiedBy?: string;
+  needsReview?: boolean;
+  riskFlags?: string[];
+  reasoning?: string;
   isDuplicate?: boolean;
   projectId?: string;
 }
@@ -288,40 +312,58 @@ export function createImportsRouter(): Router {
         }
       }
       
-      // Ensure all rows have importCategoryId set so none are left uncategorized in DB
-      let finalRows = rows.map(r => ({
-        ...r,
-        importCategoryId: r.importCategoryId || (r as any).categoryId || (r as any).category_id || '',
-      }));
+      // Resolve organization personal_world_enabled policy (§5)
+      const personalWorldEnabled = await loadOrgPersonalWorldEnabled(sb, orgId);
+      const actorUserId = (req as any).authUser?.id || null;
 
-      // If autoClassify is requested and some rows lack importCategoryId, auto-assign from categories
-      const missingCatRows = finalRows.filter(r => !r.importCategoryId);
-      if (missingCatRows.length > 0) {
-        try {
-          const { data: catRows } = await sb
-            .from('categories')
-            .select('id, name, type')
-            .eq('organization_id', orgId);
+      // Normalize world_scope and auto-create any approved missing categories before commit (§5, §9, §11)
+      const createdCatCache = new Map<string, string>();
+      const categoriesCreatedOnImport: Array<{ id: string; name: string }> = [];
 
-          if (catRows && catRows.length > 0) {
-            finalRows = finalRows.map(r => {
-              if (r.importCategoryId) return r;
-              const expectedType = r.type === 'credit' ? 'income' : 'expense';
-              const typeCats = catRows.filter((c: any) => c.type === expectedType);
-              const fallback = typeCats.find((c: any) => 
-                c.name.toLowerCase().includes('general') || 
-                c.name.toLowerCase().includes('operating') ||
-                c.name.toLowerCase().includes('other')
-              ) || typeCats[0] || catRows[0];
-              return {
-                ...r,
-                importCategoryId: fallback ? fallback.id : '',
-              };
-            });
-          }
-        } catch (catErr) {
-          console.warn('[imports] Failed to fetch fallback categories:', catErr);
+      const finalRows: ImportedRow[] = [];
+      for (const r of rows) {
+        const rawWorld = r.usage || r.worldScope;
+        let resolvedWorld: 'business' | 'personal' =
+          rawWorld === 'personal' ? 'personal' : (rawWorld === 'business' ? 'business' : inferWorldScope(r.narration, r.type, [], { personalWorldEnabled }).world);
+        if (!personalWorldEnabled) {
+          resolvedWorld = 'business';
         }
+
+        let catId = r.importCategoryId || (r as any).categoryId || (r as any).category_id || '';
+        if (!catId && r.proposedNewCategory?.name) {
+          const cacheKey = `${r.proposedNewCategory.type}:${r.proposedNewCategory.name.toLowerCase()}`;
+          if (createdCatCache.has(cacheKey)) {
+            catId = createdCatCache.get(cacheKey)!;
+          } else {
+            try {
+              const resCat = await findOrCreateCategoryForOrg(sb, orgId, {
+                ...r.proposedNewCategory,
+                world: resolvedWorld,
+              }, actorUserId);
+              catId = resCat.category.id;
+              createdCatCache.set(cacheKey, catId);
+              if (resCat.created) {
+                categoriesCreatedOnImport.push({ id: resCat.category.id, name: resCat.category.name });
+              }
+            } catch (catErr) {
+              console.warn('[imports] Failed to auto-create proposed category:', catErr);
+            }
+          }
+        }
+
+        const riskFlags = Array.isArray(r.riskFlags) ? r.riskFlags : [];
+        const hasHardRisk = riskFlags.includes('RULE_CONFLICT') || riskFlags.includes('TRANSFER_CANDIDATE');
+        const needsReview = Boolean(r.needsReview) || !catId || hasHardRisk;
+
+        finalRows.push({
+          ...r,
+          usage: resolvedWorld,
+          worldScope: resolvedWorld,
+          importCategoryId: catId,
+          suggestedCategoryId: r.suggestedCategoryId || catId || undefined,
+          needsReview,
+          riskFlags,
+        });
       }
 
       // Call the import_commit RPC function (with handoff-compliant chunked server fallback if RPC fails on legacy DB)
@@ -409,9 +451,11 @@ export function createImportsRouter(): Router {
           const absAmt = Math.abs(Number(row.amount || 0));
           const catId = row.importCategoryId ? String(row.importCategoryId).trim() : '';
           const projId = (row as any).projectId ? String((row as any).projectId).trim() : '';
-          const isClassified = Boolean(catId);
-          const worldScope = (row as any).usage === 'personal' ? 'personal' : 'business';
+          const isClassified = Boolean(catId) && !row.needsReview;
+          const worldScope = (row.usage || row.worldScope) === 'personal' ? 'personal' : 'business';
           const tags = Array.from(new Set(['imported', `import:${safeName}`, worldScope]));
+          const confidenceVal = typeof row.confidence === 'number' ? Math.min(100, Math.max(0, row.confidence)) : (isClassified ? 85 : null);
+          const classifiedByVal = isClassified ? (row.classifiedBy || (row.classificationSource === 'ai' ? 'ai' : 'auto')) : null;
 
           if (isClassified) {
             autoClassifiedCount++;
@@ -435,15 +479,18 @@ export function createImportsRouter(): Router {
             amount: absAmt,
             currency: statementCurr,
             type: row.type === 'credit' ? 'credit' : 'debit',
-            category_id: catId || null,
+            category_id: isClassified ? (catId || null) : null,
+            suggested_category_id: row.suggestedCategoryId || catId || null,
             project_id: projId || null,
+            world_scope: worldScope,
             status: isClassified ? 'classified' : 'pending',
-            confidence: isClassified ? 100 : null,
+            confidence: confidenceVal,
+            risk_flags: Array.isArray(row.riskFlags) ? row.riskFlags : [],
             tags,
             attachments: [],
             idempotency_key: `${idempotencyKey}:row:${idx + 1}`,
             classified_at: isClassified ? new Date().toISOString() : null,
-            classified_by: isClassified ? 'user' : null,
+            classified_by: classifiedByVal,
             source_import_id: idempotencyKey,
           });
         });
@@ -526,7 +573,7 @@ export function createImportsRouter(): Router {
           // Get the newly imported transactions scoped strictly to this batch
           const { data: newTxns, error: fetchErr } = await sb
             .from('transactions')
-            .select('id, description, narration, status, category_id')
+            .select('id, description, narration, amount, type, world_scope, tags, status, category_id')
             .eq('organization_id', orgId)
             .eq('bank_account_id', bankAccountId)
             .eq('source_import_id', batchId)
@@ -534,14 +581,31 @@ export function createImportsRouter(): Router {
             .order('created_at', { ascending: false })
             .limit(rows.length + 5);
 
+          // Ensure personal world_scope column is synced even on legacy DBs before migration 0049
+          try {
+            const { data: personalTagged } = await sb
+              .from('transactions')
+              .select('id, tags, world_scope')
+              .eq('organization_id', orgId)
+              .eq('source_import_id', batchId);
+            const personalIds = (personalTagged || [])
+              .filter((t: any) => Array.isArray(t.tags) && t.tags.includes('personal') && t.world_scope !== 'personal')
+              .map((t: any) => t.id);
+            if (personalIds.length > 0) {
+              await sb.from('transactions').update({ world_scope: 'personal' }).in('id', personalIds).eq('organization_id', orgId);
+            }
+          } catch {
+            /* graceful if world_scope column missing */
+          }
+
           if (!fetchErr && newTxns && newTxns.length > 0) {
             let classified = 0;
 
-            // Match newly inserted transactions to rows by narration/description
-            for (const row of rows) {
-              if (!row.importCategoryId) continue;
+            // Only backfill rows that were ALREADY approved for auto-placement (!row.needsReview)
+            // on legacy DBs before Migration 0049. NEVER overwrite needsReview=true rows into 'classified' (§10, §11)!
+            for (const row of finalRows) {
+              if (!row.importCategoryId || row.needsReview) continue;
 
-              // Find the matching transaction (by narration match)
               const matchedTxn = newTxns.find(t => {
                 const txnDesc = (t.narration || t.description || '').toLowerCase().trim();
                 const rowDesc = (row.narration || '').toLowerCase().trim();
@@ -553,123 +617,263 @@ export function createImportsRouter(): Router {
                   .from('transactions')
                   .update({
                     category_id: row.importCategoryId,
+                    world_scope: row.worldScope || row.usage || 'business',
                     status: 'classified',
-                    classified_by: 'auto',
+                    classified_by: row.classifiedBy || (row.classificationSource === 'ai' ? 'ai' : 'auto'),
                     classified_at: new Date().toISOString(),
-                    confidence: 85,
+                    confidence: typeof row.confidence === 'number' ? row.confidence : 85,
                   })
                   .eq('id', matchedTxn.id);
 
                 if (!updateErr) {
-                  matchedTxn.category_id = row.importCategoryId; // Mark as done
+                  matchedTxn.category_id = row.importCategoryId;
                   classified++;
                 }
               }
             }
 
-            // For any remaining unclassified transactions, try rule-based + AI batch classification
-            const stillPending = newTxns.filter(t => !t.category_id);
+            // Build lookup of narrations already explicitly flagged needsReview during import preview
+            const explicitlyPendingNarrations = new Set(
+              finalRows
+                .filter(r => r.needsReview)
+                .map(r => (r.narration || '').toLowerCase().trim())
+            );
+
+            // For genuinely uncategorized rows (not explicitly queued for manual review by preview),
+            // run §11 rules-first cascade -> org-resolved AI gateway fallback using tenant policy
+            const stillPending = newTxns.filter(t => {
+              if (t.category_id) return false;
+              const desc = (t.narration || t.description || '').toLowerCase().trim();
+              if (explicitlyPendingNarrations.has(desc)) return false;
+              return true;
+            });
+
             if (stillPending.length > 0 && autoClassify) {
               try {
-                // Load categories and rules from Supabase
-                const { data: cats } = await sb
-                  .from('categories')
-                  .select('id, name, type, patterns')
-                  .eq('organization_id', orgId);
-
-                const { data: rules } = await sb
-                  .from('classification_rules')
-                  .select('*')
-                  .eq('organization_id', orgId)
-                  .eq('is_active', true);
+                const [{ data: cats }, fullRules, tenantPolicy, platformSettings] = await Promise.all([
+                  sb.from('categories').select('id, name, type, patterns, account_id, color, icon').eq('organization_id', orgId),
+                  loadFullRules(sb, orgId),
+                  loadTenantPolicy(sb, orgId),
+                  getGlobalPlatformSettings(),
+                ]);
 
                 if (cats && cats.length > 0) {
-                  // Try AI batch classification for remaining
-                  const { classifyBatchWithAI } = await import('../lib/aiClient.js');
-                  const { getDefaultAIConfig } = await import('../config/aiConfig.js');
-                  const aiConfig = getDefaultAIConfig();
-                  if (aiConfig) {
-                    (aiConfig as any).organizationId = orgId;
+                  const domainCats = cats.map((c: any) => ({
+                    id: String(c.id),
+                    organizationId: orgId,
+                    name: String(c.name),
+                    type: c.type,
+                    accountId: String(c.account_id || ''),
+                    color: String(c.color || '#38bdf8'),
+                    icon: String(c.icon || 'tag'),
+                    patterns: Array.isArray(c.patterns) ? c.patterns : [],
+                  }));
+
+                  const needsAIForPost: any[] = [];
+                  const matchedRuleIds: string[] = [];
+
+                  // PHASE 1 (§11): Deterministic org rules & patterns FIRST
+                  for (const txn of stillPending as any[]) {
+                    const narr = txn.narration || txn.description || '';
+                    const ruleRes = classifyTransaction(
+                      narr,
+                      Math.abs(Number(txn.amount || 0)),
+                      txn.type === 'credit' ? 'credit' : 'debit',
+                      domainCats,
+                      [],
+                      fullRules,
+                      {
+                        organizationId: orgId,
+                        accountId: bankAccountId,
+                        world: txn.world_scope === 'personal' ? 'personal' : 'business',
+                        personalWorldEnabled,
+                        tenantPolicy,
+                      }
+                    );
+
+                    if (ruleRes.matchedRuleId) matchedRuleIds.push(ruleRes.matchedRuleId);
+
+                    if (
+                      ruleRes.placement === 'auto_approved' &&
+                      ruleRes.categoryId &&
+                      (!ruleRes.riskFlags || ruleRes.riskFlags.length === 0)
+                    ) {
+                      await sb.from('transactions').update({
+                        category_id: ruleRes.categoryId,
+                        suggested_category_id: ruleRes.categoryId,
+                        world_scope: personalWorldEnabled && ruleRes.world === 'personal' ? 'personal' : 'business',
+                        status: 'classified',
+                        classified_by: 'auto',
+                        classified_at: new Date().toISOString(),
+                        confidence: ruleRes.confidence,
+                        risk_flags: [],
+                      }).eq('id', txn.id);
+                      classified++;
+
+                      await recordClassificationEvidence(sb, orgId, {
+                        transactionId: txn.id,
+                        rawNarration: narr,
+                        normalizedTokens: ruleRes.normalizedTokens,
+                        candidateRules: ruleRes.candidateRules,
+                        selectedRuleId: ruleRes.matchedRuleId || null,
+                        selectedRuleVersion: ruleRes.matchedRuleVersion || null,
+                        confidence: ruleRes.confidence,
+                        confidenceBand: ruleRes.confidenceBand || 'high',
+                        riskFlags: ruleRes.riskFlags || [],
+                        decisionReason: ruleRes.reasoning,
+                        placement: 'auto_approved',
+                        finalDecision: { categoryId: ruleRes.categoryId, world: ruleRes.world || 'business' },
+                        actorId: actorUserId,
+                      });
+                    } else {
+                      needsAIForPost.push({ txn, ruleRes });
+                    }
                   }
 
-                  if (aiConfig) {
+                  if (matchedRuleIds.length > 0) {
+                    void recordRuleMatchUsage(sb, orgId, matchedRuleIds);
+                  }
+
+                  // PHASE 2 (§11): Resolve org AI config (BYOK / Platform Gateway) only for unresolved rows
+                  if (needsAIForPost.length > 0 && platformSettings.feature_flags.ai_category_suggestions) {
+                    const { classifyBatchWithAI } = await import('../lib/aiClient.js');
+                    const { getDefaultAIConfig } = await import('../config/aiConfig.js');
+                    let aiConfig: any = null;
                     try {
-                      const batchInput = stillPending.map(t => ({
-                        narration: t.narration || t.description || '',
-                        amount: 0,
-                        type: 'debit' as const,
-                      }));
+                      const resolved = await resolveOrgAIConfig(orgId);
+                      if (resolved.source !== 'none' && resolved.apiKey) {
+                        aiConfig = {
+                          provider: resolved.provider,
+                          modelName: resolved.modelName,
+                          apiKey: resolved.apiKey,
+                          baseUrl: resolved.baseUrl,
+                          temperature: resolved.temperature,
+                          maxTokens: resolved.maxTokens,
+                          organizationId: orgId,
+                        };
+                      }
+                    } catch {
+                      /* fallback below */
+                    }
+                    if (!aiConfig) {
+                      const def = getDefaultAIConfig();
+                      if (def) aiConfig = { ...def, organizationId: orgId };
+                    }
 
-                      const aiBatchMap = await classifyBatchWithAI(
-                        {
-                          transactions: batchInput,
-                          availableCategories: cats.map(c => ({
-                            id: c.id,
-                            name: c.name,
-                            type: c.type,
-                          })),
-                        },
-                        aiConfig
-                      );
+                    if (aiConfig) {
+                      try {
+                        const learningContext = await loadLearningPromptContext(sb, orgId, domainCats, fullRules);
+                        const batchInput = needsAIForPost.map(({ txn }) => ({
+                          narration: txn.narration || txn.description || '',
+                          amount: Math.abs(Number(txn.amount || 0)),
+                          type: (txn.type === 'credit' ? 'credit' : 'debit') as 'debit' | 'credit',
+                        }));
 
-                      let aiIdx = 0;
-                      for (const txn of stillPending) {
-                        const aiResult = aiBatchMap.get(aiIdx);
-                        if (aiResult) {
-                          const cat = cats.find(c =>
+                        const aiBatchMap = await classifyBatchWithAI(
+                          {
+                            transactions: batchInput,
+                            availableCategories: domainCats.map(c => ({
+                              id: c.id,
+                              name: c.name,
+                              type: c.type,
+                            })),
+                            learningContext,
+                          },
+                          aiConfig
+                        );
+
+                        for (let aiIdx = 0; aiIdx < needsAIForPost.length; aiIdx++) {
+                          const { txn, ruleRes } = needsAIForPost[aiIdx];
+                          const aiResult = aiBatchMap.get(aiIdx);
+                          if (!aiResult) continue;
+
+                          const inferredWorld: 'business' | 'personal' =
+                            personalWorldEnabled && (aiResult.world === 'personal' || ruleRes.world === 'personal')
+                              ? 'personal'
+                              : (txn.world_scope === 'personal' && personalWorldEnabled ? 'personal' : 'business');
+
+                          let cat = domainCats.find(c =>
                             c.name.toLowerCase() === aiResult.suggestedCategory.toLowerCase()
                           );
+                          if (!cat && aiResult.createNewCategory && (aiResult.newCategoryName || aiResult.suggestedCategory)) {
+                            try {
+                              const expectedType = txn.type === 'credit' ? 'income' : 'expense';
+                              const resCat = await findOrCreateCategoryForOrg(sb, orgId, {
+                                name: aiResult.newCategoryName || aiResult.suggestedCategory,
+                                type: expectedType,
+                                world: inferredWorld,
+                                color: inferredWorld === 'personal' ? '#f59e0b' : '#38bdf8',
+                                icon: inferredWorld === 'personal' ? 'user' : 'tag',
+                                reason: aiResult.reasoning || 'Proposed during statement import',
+                              }, actorUserId);
+                              cat = resCat.category;
+                              domainCats.push(cat);
+                            } catch {
+                              /* non-fatal */
+                            }
+                          }
+
                           if (cat) {
-                            const riskFlags = detectRiskFlags(
-                              txn.narration || txn.description || '',
-                              Number((txn as any).amount || 0),
-                              (txn as any).type || 'debit'
-                            );
-                            const canAutoApprove = aiResult.confidence >= 80 && riskFlags.length === 0;
+                            const riskFlags = Array.from(new Set([
+                              ...(ruleRes.riskFlags || []),
+                              ...detectRiskFlags(
+                                txn.narration || txn.description || '',
+                                Math.abs(Number(txn.amount || 0)),
+                                txn.type === 'credit' ? 'credit' : 'debit',
+                                [],
+                                {
+                                  highValueThreshold: tenantPolicy.highValueThreshold,
+                                  duplicateWindowDays: tenantPolicy.duplicateWindowDays,
+                                  world: inferredWorld,
+                                }
+                              ),
+                            ]));
+                            const canAutoApprove =
+                              tenantPolicy.allowsAutoApproval &&
+                              aiResult.confidence >= tenantPolicy.highThreshold &&
+                              riskFlags.length === 0 &&
+                              !aiResult.createNewCategory;
 
                             if (canAutoApprove) {
                               await sb.from('transactions').update({
                                 category_id: cat.id,
+                                suggested_category_id: cat.id,
+                                world_scope: inferredWorld,
                                 status: 'classified',
-                                classified_by: 'auto',
+                                classified_by: 'ai',
                                 classified_at: new Date().toISOString(),
                                 confidence: aiResult.confidence,
+                                risk_flags: [],
                               }).eq('id', txn.id);
                               classified++;
                             } else {
-                              // Queue for Review per Handoff v1.2 §11 (Never auto-approve with risks or medium/low confidence)
                               await sb.from('transactions').update({
                                 suggested_category_id: cat.id,
+                                world_scope: inferredWorld,
                                 status: 'pending',
                                 confidence: aiResult.confidence,
                                 risk_flags: riskFlags,
                               }).eq('id', txn.id);
                             }
+
+                            await recordClassificationEvidence(sb, orgId, {
+                              transactionId: txn.id,
+                              rawNarration: txn.narration || txn.description || '',
+                              normalizedTokens: ruleRes.normalizedTokens,
+                              candidateRules: ruleRes.candidateRules,
+                              modelVersion: aiConfig.modelName || null,
+                              confidence: aiResult.confidence,
+                              confidenceBand: aiResult.confidence >= tenantPolicy.highThreshold ? 'high' : aiResult.confidence >= tenantPolicy.mediumThreshold ? 'medium' : 'low',
+                              riskFlags,
+                              decisionReason: aiResult.reasoning || 'AI post-import classification',
+                              placement: canAutoApprove ? 'auto_approved' : 'manual_review',
+                              finalDecision: { categoryId: cat.id, world: inferredWorld },
+                              actorId: actorUserId,
+                            });
                           }
                         }
-                        aiIdx++;
-                      }
-                    } catch (aiErr) {
-                      console.warn('[import] AI batch classification failed for remaining txns:', aiErr);
-                      
-                      // Fallback: simple keyword matching from category patterns
-                      for (const txn of stillPending) {
-                        const desc = (txn.narration || txn.description || '').toLowerCase();
-                        for (const cat of cats) {
-                          const patterns = Array.isArray(cat.patterns) ? cat.patterns : [];
-                          const matched = patterns.some((p: string) => desc.includes(p.toLowerCase()));
-                          if (matched) {
-                            await sb.from('transactions').update({
-                              category_id: cat.id,
-                              status: 'classified',
-                              classified_by: 'auto',
-                              classified_at: new Date().toISOString(),
-                              confidence: 75,
-                            }).eq('id', txn.id);
-                            classified++;
-                            break;
-                          }
-                        }
+                      } catch (aiErr) {
+                        console.warn('[import] AI batch classification failed for remaining txns:', aiErr);
                       }
                     }
                   }
@@ -681,10 +885,9 @@ export function createImportsRouter(): Router {
 
             if (classified > 0) {
               console.log(`[import] Auto-classified ${classified}/${newTxns.length} imported transactions`);
-              // Update the response data
               if (data.summary) {
-                data.summary.autoClassified = classified;
-                data.summary.needsReview = Math.max(0, newTxns.length - classified);
+                data.summary.autoClassified = (Number(data.summary.autoClassified) || 0) + classified;
+                data.summary.needsReview = Math.max(0, (Number(data.summary.needsReview) || newTxns.length) - classified);
               }
             }
           }
@@ -736,6 +939,64 @@ export function createImportsRouter(): Router {
                 world_scope: txn.world_scope || 'business',
               }, (req as any).authUser?.id);
             }
+          }
+
+          // Reconcile newly imported transactions with active recurring schedules (§10, §33 #1, #7)
+          // so an imported monthly charge marks that recurring period settled and never double-counts.
+          try {
+            const { data: activeSchedules } = await sb
+              .from('recurring_transactions')
+              .select('*')
+              .eq('organization_id', orgId)
+              .eq('is_active', true);
+
+            if (activeSchedules && activeSchedules.length > 0) {
+              const { matchTransactionsToRecurringSchedules } = await import('../services/recurringEngine.js');
+              const recMatches = matchTransactionsToRecurringSchedules({
+                importedTransactions: batchRows,
+                activeSchedules,
+              });
+
+              for (const m of recMatches) {
+                const sched = activeSchedules.find((s: any) => String(s.id) === m.scheduleId);
+                if (!sched) continue;
+
+                // Record matched_import occurrence (idempotent per template + period)
+                try {
+                  await sb.from('recurring_occurrences').upsert(
+                    {
+                      id: `rocc-${m.scheduleId}-${m.periodKey}`,
+                      organization_id: orgId,
+                      template_id: m.scheduleId,
+                      scheduled_period_key: m.periodKey,
+                      scheduled_date: m.scheduledDate,
+                      amount: m.transactionAmount,
+                      currency: sched.currency || 'USD',
+                      status: 'matched_import',
+                      transaction_id: m.transactionId,
+                      source: 'import_match',
+                      posted_at: new Date().toISOString(),
+                      notes: `Matched imported statement transaction ${m.transactionId} (${m.confidence}% confidence)`,
+                    },
+                    { onConflict: 'template_id,scheduled_period_key', ignoreDuplicates: true },
+                  );
+                } catch {
+                  /* graceful if migration 0048 not yet applied */
+                }
+
+                // Advance next_occurrence & increment generated_occurrence_count so the period isn't re-generated
+                await sb
+                  .from('recurring_transactions')
+                  .update({
+                    next_occurrence: m.nextOccurrenceAfterMatch,
+                    generated_occurrence_count: Number(sched.generated_occurrence_count || 0) + 1,
+                  })
+                  .eq('id', m.scheduleId)
+                  .eq('organization_id', orgId);
+              }
+            }
+          } catch (recMatchErr) {
+            console.warn('[imports] Post-commit recurring reconciliation warning (non-fatal):', recMatchErr);
           }
         }
       } catch (postCommitErr) {

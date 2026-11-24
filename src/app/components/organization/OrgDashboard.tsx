@@ -271,6 +271,14 @@ function ExpandableKPICard({
   );
 }
 
+const UPCOMING_SOURCE_LABELS: Record<string, string> = {
+  recurring: 'Recurring',
+  loan: 'Loan',
+  payroll: 'Payroll',
+  invoice: 'Invoice',
+  reimbursement: 'Reimbursement',
+};
+
 // Timeline Event Component
 function TimelineEvent({
   date,
@@ -280,7 +288,11 @@ function TimelineEvent({
   type,
   delay = 0,
   theme = 'dark',
-  isMasked = false
+  isMasked = false,
+  sourceType,
+  isOverdue = false,
+  daysOverdue,
+  subtitle,
 }: {
   date: string;
   title: string;
@@ -290,7 +302,18 @@ function TimelineEvent({
   delay?: number;
   theme?: 'light' | 'dark';
   isMasked?: boolean;
+  sourceType?: string;
+  isOverdue?: boolean;
+  daysOverdue?: number;
+  subtitle?: string;
 }) {
+  const hasCents = Number.isFinite(amount) && Math.abs(amount % 1) > 0.004;
+  const formattedAmt = formatCurrency(amount, currency, {
+    minimumFractionDigits: hasCents ? 2 : 0,
+    maximumFractionDigits: hasCents ? 2 : 0,
+  });
+  const sourceLabel = sourceType ? UPCOMING_SOURCE_LABELS[sourceType] : undefined;
+
   return (
     <motion.div
       initial={{ opacity: 0, x: 20 }}
@@ -305,26 +328,47 @@ function TimelineEvent({
       <div 
         className="absolute left-0 top-0 -translate-x-[9px] w-4 h-4 rounded-full"
         style={{
-          background: type === 'income' 
-            ? 'linear-gradient(135deg, #10b981, #059669)' 
-            : 'linear-gradient(135deg, #ef4444, #dc2626)',
-          boxShadow: type === 'income'
-            ? '0 0 15px rgba(16, 185, 129, 0.6)'
-            : '0 0 15px rgba(239, 68, 68, 0.6)',
+          background: isOverdue
+            ? 'linear-gradient(135deg, #f59e0b, #d97706)'
+            : type === 'income' 
+              ? 'linear-gradient(135deg, #10b981, #059669)' 
+              : 'linear-gradient(135deg, #ef4444, #dc2626)',
+          boxShadow: isOverdue
+            ? '0 0 15px rgba(245, 158, 11, 0.65)'
+            : type === 'income'
+              ? '0 0 15px rgba(16, 185, 129, 0.6)'
+              : '0 0 15px rgba(239, 68, 68, 0.6)',
         }}
       />
       
       <div className="flex items-start justify-between gap-4">
-        <div>
-          <p 
-            className="text-xs mb-1 font-medium"
-            style={{ color: theme === 'dark' ? '#64748b' : '#94a3b8' }}
-          >
-            {date}
-          </p>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5 mb-1">
+            <p 
+              className="text-xs font-medium"
+              style={{ color: isOverdue ? '#fbbf24' : theme === 'dark' ? '#64748b' : '#94a3b8' }}
+            >
+              {date}
+            </p>
+            {isOverdue && (
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold uppercase tracking-wide bg-amber-500/15 text-amber-400 border border-amber-500/35">
+                Overdue{daysOverdue ? ` · ${daysOverdue}d` : ''}
+              </span>
+            )}
+            {sourceLabel && (
+              <span className={`text-[10px] font-mono ${theme === 'dark' ? 'text-slate-500' : 'text-slate-400'}`}>
+                • {sourceLabel}
+              </span>
+            )}
+          </div>
           <p className={`font-medium text-sm mb-1 ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>{title}</p>
+          {subtitle && (
+            <p className={`text-[11px] mb-1 ${theme === 'dark' ? 'text-slate-400' : 'text-slate-500'}`}>
+              {subtitle}
+            </p>
+          )}
           <p className={`text-xs font-mono font-semibold ${type === 'income' ? 'text-emerald-400' : 'text-red-400'}`}>
-            {isMasked ? '•••••• (Confidential)' : `${type === 'income' ? '+' : '-'}${formatCurrency(amount, currency)}`}
+            {isMasked ? '•••••• (Confidential)' : `${type === 'income' ? '+' : '-'}${formattedAmt}`}
           </p>
         </div>
       </div>
@@ -332,7 +376,19 @@ function TimelineEvent({
   );
 }
 
-type UpcomingLine = { date: string; title: string; amount: number; currency: string; isMasked?: boolean };
+type UpcomingLine = {
+  id?: string;
+  date: string;
+  isoDate?: string;
+  title: string;
+  amount: number;
+  currency: string;
+  isMasked?: boolean;
+  sourceType?: string;
+  isOverdue?: boolean;
+  daysOverdue?: number;
+  subtitle?: string;
+};
 
 function upcomingPanelSurface(theme: 'light' | 'dark') {
   return theme === 'dark'
@@ -345,8 +401,12 @@ function UpcomingPanelContent({
   theme,
   totalUpcomingPayments,
   totalUpcomingExpenses,
+  totalOverduePayments = 0,
+  totalOverdueExpenses = 0,
   upcomingPayments,
   upcomingExpenses,
+  overduePayments = [],
+  overdueExpenses = [],
   goToOrgView,
   onDismiss,
   dismissStyle = 'close',
@@ -355,13 +415,20 @@ function UpcomingPanelContent({
   theme: 'light' | 'dark';
   totalUpcomingPayments: number;
   totalUpcomingExpenses: number;
+  totalOverduePayments?: number;
+  totalOverdueExpenses?: number;
   upcomingPayments: UpcomingLine[];
   upcomingExpenses: UpcomingLine[];
+  overduePayments?: UpcomingLine[];
+  overdueExpenses?: UpcomingLine[];
   goToOrgView?: (view: string) => void;
   onDismiss?: () => void;
   dismissStyle?: 'close' | 'collapse';
   currency?: string;
 }) {
+  const combinedPayments = [...overduePayments, ...upcomingPayments];
+  const combinedExpenses = [...overdueExpenses, ...upcomingExpenses];
+
   return (
     <>
       <div className="mb-8 flex items-start justify-between gap-3">
@@ -419,6 +486,11 @@ function UpcomingPanelContent({
             <p className={`text-xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
               {formatCurrency(totalUpcomingPayments, currency, { compact: true })}
             </p>
+            {totalOverduePayments > 0 && (
+              <p className="text-[11px] font-mono text-amber-400 mt-1">
+                Overdue: {formatCurrency(totalOverduePayments, currency, { compact: true })}
+              </p>
+            )}
           </motion.div>
           <motion.div
             initial={{ opacity: 0, scale: 0.9 }}
@@ -435,6 +507,11 @@ function UpcomingPanelContent({
             <p className={`text-xl font-bold ${theme === 'dark' ? 'text-white' : 'text-slate-900'}`}>
               {formatCurrency(totalUpcomingExpenses, currency, { compact: true })}
             </p>
+            {totalOverdueExpenses > 0 && (
+              <p className="text-[11px] font-mono text-amber-400 mt-1">
+                Overdue: {formatCurrency(totalOverdueExpenses, currency, { compact: true })}
+              </p>
+            )}
           </motion.div>
         </div>
       </div>
@@ -460,10 +537,10 @@ function UpcomingPanelContent({
           </div>
         </div>
         <div className="space-y-0">
-          {upcomingPayments.length > 0 ? (
-            upcomingPayments.map((event, idx) => (
+          {combinedPayments.length > 0 ? (
+            combinedPayments.map((event, idx) => (
               <TimelineEvent
-                key={`pay-${idx}`}
+                key={event.id || `pay-${idx}`}
                 date={event.date}
                 title={event.title}
                 amount={event.amount}
@@ -471,6 +548,10 @@ function UpcomingPanelContent({
                 type="income"
                 delay={0.05 + idx * 0.05}
                 theme={theme}
+                sourceType={event.sourceType}
+                isOverdue={event.isOverdue}
+                daysOverdue={event.daysOverdue}
+                subtitle={event.subtitle}
               />
             ))
           ) : (
@@ -500,10 +581,10 @@ function UpcomingPanelContent({
           </div>
         </div>
         <div className="space-y-0">
-          {upcomingExpenses.length > 0 ? (
-            upcomingExpenses.map((event, idx) => (
+          {combinedExpenses.length > 0 ? (
+            combinedExpenses.map((event, idx) => (
               <TimelineEvent
-                key={`exp-${idx}`}
+                key={event.id || `exp-${idx}`}
                 date={event.date}
                 title={event.title}
                 amount={event.amount}
@@ -512,6 +593,10 @@ function UpcomingPanelContent({
                 delay={0.1 + idx * 0.05}
                 theme={theme}
                 isMasked={event.isMasked}
+                sourceType={event.sourceType}
+                isOverdue={event.isOverdue}
+                daysOverdue={event.daysOverdue}
+                subtitle={event.subtitle}
               />
             ))
           ) : (
@@ -913,7 +998,11 @@ export function OrgDashboard() {
   const analytics = dashboardFallbackAnalytics;
   const { theme } = useTheme();
   const { currentOrganization, userRole, accessRole } = useAuth();
-  const canViewPayroll = userRole === 'owner' || userRole === 'admin' || accessRole === 'org_admin';
+  const canViewPayroll =
+    userRole === 'owner' ||
+    userRole === 'admin' ||
+    userRole === 'accountant' ||
+    accessRole === 'org_admin';
   const orgCurrency = currentOrganization?.currency || 'USD';
   const goToOrgView = useOrgWorkspaceNav();
 
@@ -955,7 +1044,17 @@ export function OrgDashboard() {
   } = useService(
     () => svc.reports.getDashboardSummary(),
     [svc.orgId],
-    ['bankAccounts', 'transactions', 'budgets', 'recurringTransactions'],
+    [
+      'bankAccounts',
+      'transactions',
+      'budgets',
+      'recurringTransactions',
+      'loans',
+      'expenses',
+      'payslips',
+      'invoices',
+      'organizationMembers',
+    ],
   );
 
   const refreshDashboardData = () => {
@@ -1044,64 +1143,74 @@ export function OrgDashboard() {
         ? 'Yearly Profit'
         : 'Monthly Profit';
 
-  // Real upcoming transactions with RBAC payroll confidentiality
-  const upcomingPayments = useMemo(() => {
-    if (!dashboardKPIs?.upcomingPayments || dashboardKPIs.upcomingPayments.length === 0) {
-      return [];
-    }
-    return dashboardKPIs.upcomingPayments.map((p: any) => {
+  // Real upcoming & overdue transactions with RBAC payroll confidentiality
+  const maskPayrollItems = (items?: any[]) => {
+    if (!Array.isArray(items) || items.length === 0) return [];
+    return items.map((item: any) => {
       const isPayroll =
-        /payroll|salary|wage/i.test(p.title || '') ||
-        /payroll|salary|wage/i.test(p.category || '');
+        item.sourceType === 'payroll' ||
+        /payroll|salary|wage/i.test(item.title || '') ||
+        /payroll|salary|wage/i.test(item.category || '');
       if (isPayroll && !canViewPayroll) {
         return {
-          ...p,
+          ...item,
           title: 'Team Payroll (Confidential)',
           amount: 0,
           isMasked: true,
         };
       }
-      return p;
+      return item;
     });
-  }, [dashboardKPIs?.upcomingPayments, canViewPayroll]);
+  };
 
-  const upcomingExpenses = useMemo(() => {
-    if (!dashboardKPIs?.upcomingExpenses || dashboardKPIs.upcomingExpenses.length === 0) {
-      return [];
-    }
-    return dashboardKPIs.upcomingExpenses.map((e: any) => {
-      const isPayroll =
-        /payroll|salary|wage/i.test(e.title || '') ||
-        /payroll|salary|wage/i.test(e.category || '');
-      if (isPayroll && !canViewPayroll) {
-        return {
-          ...e,
-          title: 'Team Payroll (Confidential)',
-          amount: 0,
-          isMasked: true,
-        };
-      }
-      return e;
-    });
-  }, [dashboardKPIs?.upcomingExpenses, canViewPayroll]);
+  const upcomingPayments = useMemo(
+    () => maskPayrollItems(dashboardKPIs?.upcomingPayments),
+    [dashboardKPIs?.upcomingPayments, canViewPayroll],
+  );
 
-  const totalUpcomingPayments = useMemo(() => {
+  const upcomingExpenses = useMemo(
+    () => maskPayrollItems(dashboardKPIs?.upcomingExpenses),
+    [dashboardKPIs?.upcomingExpenses, canViewPayroll],
+  );
+
+  const overduePayments = useMemo(
+    () => maskPayrollItems(dashboardKPIs?.overduePayments),
+    [dashboardKPIs?.overduePayments, canViewPayroll],
+  );
+
+  const overdueExpenses = useMemo(
+    () => maskPayrollItems(dashboardKPIs?.overdueExpenses),
+    [dashboardKPIs?.overdueExpenses, canViewPayroll],
+  );
+
+  const sumUnmasked = (items: any[], serverTotal?: number) => {
     if (!canViewPayroll) {
-      return upcomingPayments
-        .filter((p: any) => !p.isMasked)
-        .reduce((sum: number, p: any) => sum + convertCurrency(Number(p.amount || 0), p.currency || orgCurrency, orgCurrency), 0);
+      return items
+        .filter((i: any) => !i.isMasked)
+        .reduce((sum: number, i: any) => sum + convertCurrency(Number(i.amount || 0), i.currency || orgCurrency, orgCurrency), 0);
     }
-    return dashboardKPIs?.totalUpcomingPayments ?? upcomingPayments.reduce((sum: number, p: any) => sum + convertCurrency(Number(p.amount || 0), p.currency || orgCurrency, orgCurrency), 0);
-  }, [canViewPayroll, dashboardKPIs?.totalUpcomingPayments, upcomingPayments, orgCurrency]);
+    return serverTotal ?? items.reduce((sum: number, i: any) => sum + convertCurrency(Number(i.amount || 0), i.currency || orgCurrency, orgCurrency), 0);
+  };
 
-  const totalUpcomingExpenses = useMemo(() => {
-    if (!canViewPayroll) {
-      return upcomingExpenses
-        .filter((e: any) => !e.isMasked)
-        .reduce((sum: number, e: any) => sum + convertCurrency(Number(e.amount || 0), e.currency || orgCurrency, orgCurrency), 0);
-    }
-    return dashboardKPIs?.totalUpcomingExpenses ?? upcomingExpenses.reduce((sum: number, e: any) => sum + convertCurrency(Number(e.amount || 0), e.currency || orgCurrency, orgCurrency), 0);
-  }, [canViewPayroll, dashboardKPIs?.totalUpcomingExpenses, upcomingExpenses, orgCurrency]);
+  const totalUpcomingPayments = useMemo(
+    () => sumUnmasked(upcomingPayments, dashboardKPIs?.totalUpcomingPayments),
+    [canViewPayroll, dashboardKPIs?.totalUpcomingPayments, upcomingPayments, orgCurrency],
+  );
+
+  const totalUpcomingExpenses = useMemo(
+    () => sumUnmasked(upcomingExpenses, dashboardKPIs?.totalUpcomingExpenses),
+    [canViewPayroll, dashboardKPIs?.totalUpcomingExpenses, upcomingExpenses, orgCurrency],
+  );
+
+  const totalOverduePayments = useMemo(
+    () => sumUnmasked(overduePayments, dashboardKPIs?.totalOverduePayments),
+    [canViewPayroll, dashboardKPIs?.totalOverduePayments, overduePayments, orgCurrency],
+  );
+
+  const totalOverdueExpenses = useMemo(
+    () => sumUnmasked(overdueExpenses, dashboardKPIs?.totalOverdueExpenses),
+    [canViewPayroll, dashboardKPIs?.totalOverdueExpenses, overdueExpenses, orgCurrency],
+  );
 
   return (
     <div
@@ -1513,8 +1622,12 @@ export function OrgDashboard() {
                 theme={theme}
                 totalUpcomingPayments={totalUpcomingPayments}
                 totalUpcomingExpenses={totalUpcomingExpenses}
+                totalOverduePayments={totalOverduePayments}
+                totalOverdueExpenses={totalOverdueExpenses}
                 upcomingPayments={upcomingPayments}
                 upcomingExpenses={upcomingExpenses}
+                overduePayments={overduePayments}
+                overdueExpenses={overdueExpenses}
                 goToOrgView={goToOrgView ?? undefined}
                 onDismiss={() => setDesktopUpcomingOpen(false)}
                 dismissStyle="collapse"
@@ -1584,8 +1697,12 @@ export function OrgDashboard() {
               theme={theme}
               totalUpcomingPayments={totalUpcomingPayments}
               totalUpcomingExpenses={totalUpcomingExpenses}
+              totalOverduePayments={totalOverduePayments}
+              totalOverdueExpenses={totalOverdueExpenses}
               upcomingPayments={upcomingPayments}
               upcomingExpenses={upcomingExpenses}
+              overduePayments={overduePayments}
+              overdueExpenses={overdueExpenses}
               goToOrgView={(v) => {
                 setMobileUpcomingOpen(false);
                 goToOrgView?.(v);

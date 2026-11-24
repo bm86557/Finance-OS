@@ -25,6 +25,15 @@ import {
 import { resolveOrgAIConfig } from '../lib/aiGateway.js';
 import { getGlobalPlatformSettings } from './platformSettings.js';
 import type { Category } from '../../src/services/types.js';
+import { requireOrgRole } from '../middleware/auth.js';
+import { recomputeServerBankBalance } from './transactions.js';
+import {
+  loadOrgPersonalWorldEnabled,
+  isTransactionImmutable,
+  upsertVersionedRule,
+  recordClassificationEvidence,
+  computeCalibratedRuleConfidence,
+} from '../services/learningEngineService.js';
 
 export function createAIClassificationRouter(): Router {
   const r = Router({ mergeParams: true });
@@ -82,10 +91,10 @@ export function createAIClassificationRouter(): Router {
   });
   
   /**
-   * Update AI configuration (admin only)
+   * Update AI configuration (owner/admin only per §5)
    * POST /organizations/:organizationId/ai-classification/config
    */
-  r.post('/config', async (req: Request, res: Response) => {
+  r.post('/config', requireOrgRole('owner', 'admin'), async (req: Request, res: Response) => {
     const sb = getSupabaseAdminClient();
     if (!sb) {
       return fail(res, 503, 'Supabase not configured');
@@ -262,7 +271,7 @@ export function createAIClassificationRouter(): Router {
    * Record feedback for learning
    * POST /organizations/:organizationId/ai-classification/feedback
    */
-  r.post('/feedback', async (req: Request, res: Response) => {
+  r.post('/feedback', requireOrgRole('owner', 'admin', 'accountant', 'manager', 'employee', 'member'), async (req: Request, res: Response) => {
     const sb = getSupabaseAdminClient();
     if (!sb) {
       return fail(res, 503, 'Supabase not configured');
@@ -278,6 +287,8 @@ export function createAIClassificationRouter(): Router {
       action,
       ai_reasoning,
       correction_reason,
+      world,
+      scope,
     } = req.body;
     
     if (!transaction_id || !action) {
@@ -285,9 +296,36 @@ export function createAIClassificationRouter(): Router {
     }
     
     try {
-      // Get the authenticated user ID from the request
       const userId = req.authUser?.id || null;
-      
+      const callerRole = req.orgMembership?.role;
+      const canCreateOrgRules = callerRole === 'owner' || callerRole === 'admin' || callerRole === 'accountant';
+
+      // Verify transaction belongs to org & is not posted/reconciled or in a locked period (§8, §11)
+      const { data: existingTxn } = await sb
+        .from('transactions')
+        .select('id, status, date, bank_account_id, world_scope, description, narration, department_id')
+        .eq('id', transaction_id)
+        .eq('organization_id', orgId)
+        .maybeSingle();
+
+      if (!existingTxn) {
+        return notFound(res, 'Transaction');
+      }
+
+      const imm = await isTransactionImmutable(sb, orgId, existingTxn);
+      if (imm.immutable) {
+        return fail(res, 400, imm.reason || 'Transaction is immutable');
+      }
+
+      const personalWorldEnabled = await loadOrgPersonalWorldEnabled(sb, orgId);
+      if (world === 'personal' && !personalWorldEnabled) {
+        return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled for this organization.');
+      }
+      const resolvedWorld: 'business' | 'personal' =
+        world === 'personal' || (!world && existingTxn.world_scope === 'personal' && personalWorldEnabled)
+          ? 'personal'
+          : 'business';
+
       // Record feedback
       const { error: feedbackError } = await sb
         .from('classification_feedback')
@@ -305,33 +343,27 @@ export function createAIClassificationRouter(): Router {
       
       if (feedbackError) throw feedbackError;
       
-      // Update transaction with final category & department
+      // Update transaction with final category, world_scope & department
       let resolvedDeptId: string | undefined;
       if (final_category_id) {
         try {
-          const [{ data: txnRow }, { data: orgDepts }, { data: catRow }] = await Promise.all([
-            sb.from('transactions').select('description, narration, department_id').eq('id', transaction_id).maybeSingle(),
+          const [{ data: orgDepts }, { data: catRow }] = await Promise.all([
             sb.from('departments').select('id, name, code').eq('organization_id', orgId),
             sb.from('categories').select('name').eq('id', final_category_id).maybeSingle(),
           ]);
 
           const depts = Array.isArray(orgDepts) ? orgDepts : [];
 
-          // 1. Explicitly provided department_id
           if (department_id) {
             const matched = depts.find((d: any) => d.id === department_id || String(d.id).toLowerCase() === String(department_id).toLowerCase());
-            if (matched) {
-              resolvedDeptId = matched.id;
-            }
+            if (matched) resolvedDeptId = matched.id;
           }
 
-          // 2. Infer department from category name and transaction text
           if (!resolvedDeptId && depts.length > 0) {
             const catName = String(catRow?.name || '').toLowerCase();
-            const text = `${txnRow?.description || ''} ${txnRow?.narration || ''} ${ai_reasoning || ''}`.toLowerCase();
+            const text = `${existingTxn.description || ''} ${existingTxn.narration || ''} ${ai_reasoning || ''}`.toLowerCase();
             const combined = `${catName} ${text}`;
 
-            // Direct department name mention in category
             for (const d of depts) {
               const base = String(d.name || '').toLowerCase().replace(/\s*department\s*/g, '').trim();
               if (base.length >= 3 && (catName.includes(base) || text.includes(base))) {
@@ -340,7 +372,6 @@ export function createAIClassificationRouter(): Router {
               }
             }
 
-            // Keyword heuristics mapping categories & narrations to domain departments
             if (!resolvedDeptId) {
               const rules = [
                 {
@@ -382,6 +413,7 @@ export function createAIClassificationRouter(): Router {
 
         const updatePayload: Record<string, any> = {
           category_id: final_category_id,
+          world_scope: resolvedWorld,
           status: 'classified',
           classified_by: 'user',
           classified_at: new Date().toISOString(),
@@ -394,24 +426,30 @@ export function createAIClassificationRouter(): Router {
         const { error: txnError } = await sb
           .from('transactions')
           .update(updatePayload)
-          .eq('id', transaction_id);
+          .eq('id', transaction_id)
+          .eq('organization_id', orgId);
         
         if (txnError) console.error('Failed to update transaction:', txnError);
+
+        if (existingTxn.bank_account_id) {
+          void recomputeServerBankBalance(orgId, String(existingTxn.bank_account_id));
+        }
       }
       
-      // Learn from feedback (correction or acceptance)
-      if (final_category_id) {
+      // Only create/update org-wide rules when scope !== 'row' AND caller is authorized (§5, §11, §33 #12)
+      if (final_category_id && scope !== 'row' && canCreateOrgRules) {
         await learnFromCorrection(
           orgId,
           transaction_id,
           final_category_id,
           suggested_category_id,
           resolvedDeptId,
-          sb
+          sb,
+          resolvedWorld
         );
       }
       
-      ok(res, { recorded: true, department_id: resolvedDeptId }, 'Feedback recorded successfully');
+      ok(res, { recorded: true, department_id: resolvedDeptId, world: resolvedWorld }, 'Feedback recorded successfully');
     } catch (error) {
       console.error('Failed to record feedback:', error);
       fail(res, 500, 'Failed to record feedback');
@@ -540,7 +578,7 @@ async function getCategories(orgId: string, sb: any): Promise<Category[]> {
 }
 
 /**
- * Helper: Learn from user correction
+ * Helper: Learn from user correction (unified with §11 versioned rules + category patterns + evidence)
  */
 async function learnFromCorrection(
   orgId: string,
@@ -548,86 +586,60 @@ async function learnFromCorrection(
   correctCategoryId: string,
   wrongCategoryId: string | null,
   departmentId: string | undefined,
-  sb: any
+  sb: any,
+  explicitWorld?: 'business' | 'personal'
 ): Promise<void> {
   try {
-    // Get transaction details
     const { data: txn } = await sb
       .from('transactions')
-      .select('narration')
+      .select('narration, description, type, world_scope, tags')
       .eq('id', transactionId)
-      .single();
-    
-    if (!txn) return;
-    
-    // Extract pattern (merchant name or keywords)
-    const pattern = extractMerchantName(txn.narration);
-    if (!pattern || !pattern.trim()) return;
-    
-    // Check if a rule already exists for this organization & pattern
-    const { data: existingRule } = await sb
-      .from('classification_rules')
-      .select('id, match_count, correct_count, wrong_count')
       .eq('organization_id', orgId)
-      .ilike('pattern', pattern.trim())
       .maybeSingle();
-    
-    if (existingRule) {
-      const { error: updateError } = await sb
-        .from('classification_rules')
-        .update({
-          category_id: correctCategoryId,
-          department_id: departmentId || null,
-          prediction: {
-            category_id: correctCategoryId,
-            department_id: departmentId || null,
-            world: 'business',
-          },
-          confidence: 100,
-          source: 'user',
-          correct_count: (existingRule.correct_count || 0) + 1,
-          match_count: (existingRule.match_count || 0) + 1,
-          last_used_at: new Date().toISOString(),
-          is_active: true,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', existingRule.id);
 
-      if (updateError) {
-        console.error('Failed to update learning rule:', updateError);
-      }
-    } else {
-      const { error: insertError } = await sb
-        .from('classification_rules')
-        .insert({
-          organization_id: orgId,
-          pattern: pattern.trim(),
-          category_id: correctCategoryId,
-          department_id: departmentId || null,
-          prediction: {
-            category_id: correctCategoryId,
-            department_id: departmentId || null,
-            world: 'business',
-          },
-          confidence: 100,
-          source: 'user',
-          correct_count: 1,
-          match_count: 1,
-          wrong_count: 0,
-          last_used_at: new Date().toISOString(),
-          is_active: true,
-        });
+    if (!txn) return;
 
-      if (insertError) {
-        console.error('Failed to create learning rule:', insertError);
-      }
-    }
-    
+    const narration = String(txn.narration || txn.description || '').trim();
+    if (!narration) return;
+
+    const tags: string[] = Array.isArray(txn.tags) ? txn.tags : [];
+    const world: 'business' | 'personal' =
+      explicitWorld || (txn.world_scope === 'personal' || tags.includes('personal') ? 'personal' : 'business');
+    const action = wrongCategoryId && wrongCategoryId !== correctCategoryId ? 'corrected' : 'accepted';
+
+    const ruleRes = await upsertVersionedRule(sb, orgId, {
+      narration,
+      categoryId: correctCategoryId,
+      previousCategoryId: wrongCategoryId,
+      world,
+      direction: txn.type === 'credit' ? 'credit' : 'debit',
+      departmentId,
+      action,
+      source: 'user',
+      sourceTransactionId: transactionId,
+      changeReason: action === 'corrected' ? 'ai_feedback_correction' : 'ai_feedback_confirmation',
+    });
+
+    await recordClassificationEvidence(sb, orgId, {
+      transactionId,
+      rawNarration: narration,
+      selectedRuleId: ruleRes.ruleId || null,
+      selectedRuleVersion: ruleRes.version || null,
+      confidence: 100,
+      confidenceBand: 'high',
+      riskFlags: [],
+      decisionReason: action === 'corrected' ? 'User corrected AI classification' : 'User confirmed AI classification',
+      placement: 'auto_approved',
+      humanFeedback: { action, previousCategoryId: wrongCategoryId, correctCategoryId, world },
+      finalDecision: { categoryId: correctCategoryId, departmentId: departmentId || null, world },
+    });
+
     // Mark wrong rules as less confident / inactive
-    if (wrongCategoryId && wrongCategoryId !== correctCategoryId) {
+    const pattern = extractMerchantName(narration);
+    if (wrongCategoryId && wrongCategoryId !== correctCategoryId && pattern && pattern.trim()) {
       const { data: wrongRules } = await sb
         .from('classification_rules')
-        .select('id, wrong_count, is_active')
+        .select('id, wrong_count, correct_count, is_active')
         .eq('organization_id', orgId)
         .ilike('pattern', pattern.trim())
         .eq('category_id', wrongCategoryId);
@@ -635,11 +647,14 @@ async function learnFromCorrection(
       if (wrongRules && wrongRules.length > 0) {
         for (const wr of wrongRules) {
           const nextWrong = (wr.wrong_count || 0) + 1;
+          const nextConf = computeCalibratedRuleConfidence(Number(wr.correct_count || 0), nextWrong, true);
           await sb
             .from('classification_rules')
             .update({
               wrong_count: nextWrong,
+              confidence: nextConf,
               is_active: nextWrong >= 3 ? false : wr.is_active,
+              status: nextWrong >= 3 ? 'disabled' : 'active',
               updated_at: new Date().toISOString(),
             })
             .eq('id', wr.id);

@@ -29,7 +29,7 @@ import { BudgetPlanning } from './BudgetPlanning';
 import { CashFlowForecast } from './CashFlowForecast';
 import { ProjectProfitability } from './ProjectProfitability';
 import { ProjectTransactionsView } from './ProjectTransactionsView';
-import { ProjectProfitDetailView } from './ProjectProfitDetailView';
+
 import { WhatIfSimulator } from './WhatIfSimulator';
 import { ProfitIntelligenceView } from './ProfitIntelligenceView';
 import { AssetsDepreciationView } from './AssetsDepreciationView';
@@ -248,7 +248,7 @@ export function OrganizationWorkspace() {
         return <ProjectProfitability />;
       case 'project-transactions': return <ProjectTransactionsView />;
 
-      case 'project-detail': return <ProjectProfitDetailView />;
+      case 'project-detail': return <ProjectProfitability />;
 
       case 'simulator':
         return <WhatIfSimulator />;

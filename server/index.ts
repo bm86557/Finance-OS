@@ -22,6 +22,7 @@ import { env } from './config/env.js';
 import { getSupabaseAdminClient } from './lib/supabaseAdmin.js';
 import { createApiV1Router } from './routes/apiV1.js';
 import { startOutboxWorker } from './lib/outboxWorker.js';
+import { startRecurringWorker } from './lib/recurringWorker.js';
 
 const app = express();
 app.use(helmet());
@@ -67,6 +68,7 @@ if (!process.env.VERCEL) {
   app.listen(env.port, () => {
     console.log(`[finance-os] API http://localhost:${env.port} — Supabase PostgreSQL exclusive + /api/v1 REST (§1-§19)`);
     startOutboxWorker();
+    startRecurringWorker();
   });
 }
 

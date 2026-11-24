@@ -36,7 +36,7 @@ import {
   isPlatformUser,
 } from '../middleware/auth.js';
 import { loginRateLimiter } from '../middleware/rateLimit.js';
-import { requirePlanFeature } from '../middleware/planEntitlement.js';
+import { requirePlanFeature, requireAnyPlanFeature } from '../middleware/planEntitlement.js';
 import {
   resolveAuthoritativeOrgPlan,
   createOrUpdateOrgSubscription,
@@ -68,7 +68,13 @@ import { createImportsRouter } from './imports.js';
 import { createAuditRouter } from './audit.js';
 import { createEmployeeMeRouter } from './employee.js';
 import { createPlatformRouter } from './platform.js';
-import { createCostingRouter } from './costing.js';
+import {
+  createCostingRouter,
+  createCommissionStructuresRouter,
+  createExchangeRatesReadRouter,
+  createExchangeRatesWriteRouter,
+  createQuotesRouter,
+} from './costing.js';
 import { createDebugForecastRouter } from './debug-forecast.js';
 import { createSimulatorRouter } from './simulator.js';
 import { createProfitIntelligenceRouter } from './profitIntelligence.js';
@@ -528,7 +534,7 @@ export function createApiV1Router(): Router {
       try {
         const sb = getSupabaseAdminClient()!;
         const sbUser = await findAuthUserByEmail(sb, emailNorm);
-        
+
         let memRows: any[] = [];
         if (sbUser) {
           const { data, error } = await sb
@@ -618,15 +624,15 @@ export function createApiV1Router(): Router {
 
       let membership: OrganizationMember | null = memRow
         ? {
-            userId: memRow.user_id as string,
-            organizationId: memRow.organization_id as string,
-            role: memRow.role as OrganizationMember['role'],
-            accessRole: memRow.access_role as OrganizationMember['accessRole'],
-            portalType: memRow.portal_type as OrganizationMember['portalType'],
-            status: (memRow.status as OrganizationMember['status']) || 'pending',
-            department: (memRow.department as string) || undefined,
-            joinedAt: memRow.joined_at ?? new Date().toISOString(),
-          }
+          userId: memRow.user_id as string,
+          organizationId: memRow.organization_id as string,
+          role: memRow.role as OrganizationMember['role'],
+          accessRole: memRow.access_role as OrganizationMember['accessRole'],
+          portalType: memRow.portal_type as OrganizationMember['portalType'],
+          status: (memRow.status as OrganizationMember['status']) || 'pending',
+          department: (memRow.department as string) || undefined,
+          joinedAt: memRow.joined_at ?? new Date().toISOString(),
+        }
         : null;
 
       if (!membership && targetUserId) {
@@ -764,7 +770,7 @@ export function createApiV1Router(): Router {
   });
 
 
-r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
+  r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
     // The browser's Supabase session is cleared client-side via supabase.auth.signOut(). Server-side
     // we revoke the recorded session row so the session list reflects reality.
     const caller = req.authUser;
@@ -970,7 +976,7 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
   // point would also (incorrectly) reject every regular org member's deeper `/organizations/:id/*`
   // request, since Express prefix-matches `/organizations` against those paths too.
   r.use('/organizations', createOrganizationsListRouter());
-  
+
   // Platform-level organization invitations (similar to team member invites)
   // Uses Supabase RLS for security, so no backend auth required
   r.use('/platform/invitations', platformInvitationsRouter);
@@ -995,7 +1001,7 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
   r.use('/organizations/:organizationId/departments', createDepartmentsRouter());
   r.use('/organizations/:organizationId/projects', requirePlanFeature('projects'), createProjectsRouter());
   r.use('/organizations/:organizationId/profit-intelligence', requirePlanFeature('profit_intelligence'), createProfitIntelligenceRouter());
-  r.use('/organizations/:organizationId/overhead-allocations', requirePlanFeature('profit_intelligence'), createOverheadAllocationsRouter());
+  r.use('/organizations/:organizationId/overhead-allocations', requireAnyPlanFeature('costing_engine', 'profit_intelligence'), createOverheadAllocationsRouter());
   r.use('/organizations/:organizationId/recurring-transactions', requirePlanFeature('recurring_transactions'), createRecurringRouter());
   r.use('/organizations/:organizationId/assets', requirePlanFeature('assets'), createAssetsRouter());
   r.use('/organizations/:organizationId/inventory', requirePlanFeature('inventory'), createInventoryRouter());
@@ -1011,7 +1017,11 @@ r.post('/auth/logout', requireAuth, async (req: Request, res: Response) => {
   r.use('/organizations/:organizationId/imports', requirePlanFeature('statement_import'), createImportsRouter());
   r.use('/organizations/:organizationId/audit-logs', createAuditRouter());
   r.use('/organizations/:organizationId/me', createEmployeeMeRouter());
-  r.use('/organizations/:organizationId', createCostingRouter());
+  // Core read-only exchange rates for org members; all costing writes/commissions/quotes strictly gated by `costing_engine` (§2, §32, §33 #11)
+  r.use('/organizations/:organizationId/exchange-rates', createExchangeRatesReadRouter());
+  r.use('/organizations/:organizationId/exchange-rates', requirePlanFeature('costing_engine'), createExchangeRatesWriteRouter());
+  r.use('/organizations/:organizationId/commission-structures', requirePlanFeature('costing_engine'), createCommissionStructuresRouter());
+  r.use('/organizations/:organizationId/quotes', requirePlanFeature('costing_engine'), createQuotesRouter());
   r.use('/organizations/:organizationId/costing', requirePlanFeature('costing_engine'), createCostingRouter());
   r.use('/organizations/:organizationId/notifications', createOrgNotificationsRouter());
   r.use('/organizations/:organizationId/debug-forecast', createDebugForecastRouter());

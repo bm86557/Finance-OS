@@ -17,10 +17,14 @@
  * When `VITE_API_BASE_URL` is set, uses org-scoped REST routes; otherwise `dataStore`.
  */
 
-import { RecurringTransaction } from '@/services/types';
+import type {
+  DetectedRecurringCandidate,
+  RecurringOccurrenceItem,
+  RecurringTransaction,
+  ServiceResponse,
+} from '@/services/types';
 import { isHttpBackendConfigured, apiGet, apiPostJson, apiRequest } from '@/lib/apiClient';
 import { dataStore, generateId, simulateDelay } from './dataStore';
-import type { ServiceResponse } from './types';
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -34,8 +38,12 @@ function requireOrg<T>(organizationId: string): ServiceResponse<T> | null {
   return null;
 }
 
-/** Returns an error message if next occurrence is before start, or null if valid. */
-export function validateRecurringDateOrder(startDate: string, nextOccurrence: string): string | null {
+/** Returns an error message if start/next/end dates are invalid, or null if valid. */
+export function validateRecurringDateOrder(
+  startDate: string,
+  nextOccurrence: string,
+  endDate?: string,
+): string | null {
   const s = startDate.trim().slice(0, 10);
   const n = nextOccurrence.trim().slice(0, 10);
   if (!ISO_DATE.test(s) || !ISO_DATE.test(n)) {
@@ -43,6 +51,18 @@ export function validateRecurringDateOrder(startDate: string, nextOccurrence: st
   }
   if (n < s) {
     return 'Next occurrence must be on or after the start date.';
+  }
+  if (endDate && endDate.trim()) {
+    const e = endDate.trim().slice(0, 10);
+    if (!ISO_DATE.test(e)) {
+      return 'End date must be a valid date.';
+    }
+    if (e < s) {
+      return 'End date must be on or after the start date.';
+    }
+    if (n > e) {
+      return 'Next occurrence cannot be after the end date.';
+    }
   }
   return null;
 }
@@ -63,7 +83,7 @@ export const recurringTransactionService = {
     organizationId: string,
     data: Omit<RecurringTransaction, 'id' | 'organizationId'>,
   ): Promise<ServiceResponse<RecurringTransaction>> {
-    const dateErr = validateRecurringDateOrder(data.startDate, data.nextOccurrence);
+    const dateErr = validateRecurringDateOrder(data.startDate, data.nextOccurrence, data.endDate);
     if (dateErr) {
       return { success: false, data: null as any, error: dateErr };
     }
@@ -161,13 +181,21 @@ export const recurringTransactionService = {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<any>(organizationId);
       if (err) return err;
-      return apiPostJson<{ asOfDate?: string }, any>(
+      const validAsOf = asOfDate && ISO_DATE.test(asOfDate.trim().slice(0, 10))
+        ? asOfDate.trim().slice(0, 10)
+        : new Date().toISOString().split('T')[0];
+      const result = await apiPostJson<{ asOfDate?: string }, any>(
         `${REC(organizationId)}/generate`,
-        { asOfDate: asOfDate || new Date().toISOString().split('T')[0] },
+        { asOfDate: validAsOf },
       );
+      if (result.success) {
+        dataStore.notify('recurringTransactions');
+        dataStore.notify('transactions');
+        dataStore.notify('bankAccounts');
+      }
+      return result;
     }
-    
-    // Local dataStore mode: not implemented (requires SQL logic)
+
     return { success: false, data: null as any, error: 'Generation only works with Supabase backend' };
   },
 
@@ -180,11 +208,11 @@ export const recurringTransactionService = {
       if (result.success) {
         dataStore.notify('recurringTransactions');
         dataStore.notify('transactions');
+        dataStore.notify('bankAccounts');
       }
       return result;
     }
-    
-    // Local dataStore mode: not implemented (requires SQL logic)
+
     return { success: false, data: null as any, error: 'Generation only works with Supabase backend' };
   },
 
@@ -192,30 +220,108 @@ export const recurringTransactionService = {
     active: number;
     monthlyIncome: number;
     monthlyExpense: number;
+    netMonthly?: number;
     dueSoon: number;
     overdue: number;
-    byCurrency: Record<string, number>;
+    pendingApproval?: number;
+    currency?: string;
+    byCurrency: Record<string, any>;
   }>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<any>(organizationId);
       if (err) return err;
       return apiGet<any>(`${REC(organizationId)}/totals`);
     }
-    
-    // Local dataStore mode: calculate manually (simplified, no normalization)
+
     await simulateDelay();
     const all = dataStore.recurringTransactions.filter(r => r.organizationId === organizationId);
     const active = all.filter(r => r.isActive).length;
-    return { 
-      success: true, 
-      data: { 
-        active, 
-        monthlyIncome: 0, 
-        monthlyExpense: 0, 
-        dueSoon: 0, 
-        overdue: 0, 
-        byCurrency: {} 
-      } 
+    return {
+      success: true,
+      data: {
+        active,
+        monthlyIncome: 0,
+        monthlyExpense: 0,
+        netMonthly: 0,
+        dueSoon: 0,
+        overdue: 0,
+        pendingApproval: 0,
+        currency: 'USD',
+        byCurrency: {},
+      },
     };
+  },
+
+  async getSuggestions(
+    organizationId: string,
+    world: 'business' | 'personal' | 'all' = 'business',
+  ): Promise<ServiceResponse<DetectedRecurringCandidate[]>> {
+    if (!isHttpBackendConfigured()) {
+      return { success: true, data: [] };
+    }
+    const err = requireOrg<DetectedRecurringCandidate[]>(organizationId);
+    if (err) return err;
+    return apiGet<DetectedRecurringCandidate[]>(`${REC(organizationId)}/suggestions?world=${encodeURIComponent(world)}`);
+  },
+
+  async promoteSuggestion(
+    organizationId: string,
+    candidate: Partial<DetectedRecurringCandidate> & { requiresApproval?: boolean; autoGenerate?: boolean },
+  ): Promise<ServiceResponse<RecurringTransaction>> {
+    const err = requireOrg<RecurringTransaction>(organizationId);
+    if (err) return err;
+    const result = await apiPostJson<typeof candidate, RecurringTransaction>(
+      `${REC(organizationId)}/suggestions/promote`,
+      candidate,
+    );
+    if (result.success) {
+      dataStore.notify('recurringTransactions');
+    }
+    return result;
+  },
+
+  async getOccurrences(
+    organizationId: string,
+    status?: string,
+  ): Promise<ServiceResponse<RecurringOccurrenceItem[]>> {
+    if (!isHttpBackendConfigured()) {
+      return { success: true, data: [] };
+    }
+    const err = requireOrg<RecurringOccurrenceItem[]>(organizationId);
+    if (err) return err;
+    const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+    return apiGet<RecurringOccurrenceItem[]>(`${REC(organizationId)}/occurrences${qs}`);
+  },
+
+  async approveOccurrence(organizationId: string, occurrenceId: string): Promise<ServiceResponse<any>> {
+    const err = requireOrg<any>(organizationId);
+    if (err) return err;
+    const result = await apiRequest<any>(
+      `${REC(organizationId)}/occurrences/${encodeURIComponent(occurrenceId)}/approve`,
+      { method: 'POST', body: '{}' },
+    );
+    if (result.success) {
+      dataStore.notify('recurringTransactions');
+      dataStore.notify('transactions');
+      dataStore.notify('bankAccounts');
+    }
+    return result;
+  },
+
+  async rejectOccurrence(
+    organizationId: string,
+    occurrenceId: string,
+    reason?: string,
+  ): Promise<ServiceResponse<any>> {
+    const err = requireOrg<any>(organizationId);
+    if (err) return err;
+    const result = await apiRequest<any>(
+      `${REC(organizationId)}/occurrences/${encodeURIComponent(occurrenceId)}/reject`,
+      { method: 'POST', body: JSON.stringify({ reason }) },
+    );
+    if (result.success) {
+      dataStore.notify('recurringTransactions');
+    }
+    return result;
   },
 };

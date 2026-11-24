@@ -1,29 +1,30 @@
 /**
- * §7 — Departments. Mounted at `/organizations/:organizationId/departments` (mergeParams).
- * Supports Supabase DB persistence when configured + fallback to in-memory store.
+ * §7 & §12.2 — Departments & Department Cost Matrix.
+ * Mounted at `/organizations/:organizationId/departments` (mergeParams).
+ * Backed exclusively by Supabase PostgreSQL with RBAC, audit logging, and
+ * strict Handoff v1.2 period/capacity/overhead alignment under the fixed 160h/month FTE model.
  */
 
 import { Router, type Request, type Response } from 'express';
-import type { Department, OverheadAllocation } from '../../src/services/types.js';
+import type { Department } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
+import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
+import {
+  allocateOverheadPools,
+  isCoveredByDeclaredOverheadPool,
+  isEligibleBusinessCostingTransaction,
+  resolveCostingPeriod,
+  toDecimalString,
+  type DepartmentDriverStats,
+} from '../services/costingEngine.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
   return Array.isArray(p) ? p[0] : (p ?? '');
-}
-
-function mapDbToDomainAllocation(row: Record<string, any>): OverheadAllocation {
-  return {
-    id: String(row.id),
-    organizationId: String(row.organization_id),
-    name: String(row.name ?? ''),
-    allocationBase: row.allocation_base || 'headcount',
-    accountIds: Array.isArray(row.account_ids) ? row.account_ids : [],
-    departments: Array.isArray(row.departments) ? row.departments : [],
-    amount: row.amount != null ? Number(row.amount) : undefined,
-  };
 }
 
 function mapDbToDomainDepartment(row: Record<string, any>): Department {
@@ -54,24 +55,23 @@ function mapDomainToDbDepartment(dept: Department): Record<string, unknown> {
   };
 }
 
-
 export async function calculateDepartmentProfitability(
   orgId: string,
   dateFrom?: string,
-  dateTo?: string
+  dateTo?: string,
+  period?: string,
 ): Promise<any[]> {
   const sb = getSupabaseAdminClient();
 
-  // Direct calculation from Supabase tables if connected, else in-memory store
   let departments: Department[] = [];
   let orgTxns: any[] = [];
   let members: any[] = [];
-  let timesheets: any[] = [];
   let projects: any[] = [];
   let accounts: any[] = [];
   let allocations: any[] = [];
   let sbCategories: any[] = [];
-
+  let agencyTeams: any[] = [];
+  let agencyTeamMembers: any[] = [];
   let orgCurrency = 'USD';
 
   if (sb) {
@@ -83,17 +83,21 @@ export async function calculateDepartmentProfitability(
         { data: sbMembers },
         { data: sbProjects },
         { data: sbAllocs },
-        { data: sbTimesheetEntries },
-        { data: fetchedCategories }
+        { data: sbAccounts },
+        { data: fetchedCategories },
+        { data: sbTeams },
+        { data: sbTeamMembers },
       ] = await Promise.all([
         sb.from('organizations').select('base_currency, currency').eq('id', orgId),
-        sb.from('departments').select('*').eq('organization_id', orgId),
+        sb.from('departments').select('*').eq('organization_id', orgId).order('name', { ascending: true }),
         sb.from('transactions').select('*').eq('organization_id', orgId),
         sb.from('organization_members').select('*').eq('organization_id', orgId),
         sb.from('projects').select('*').eq('organization_id', orgId),
         sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
-        sb.from('timesheet_entries').select('*').eq('organization_id', orgId),
+        sb.from('accounts').select('id, balance, currency').eq('organization_id', orgId),
         sb.from('categories').select('id, name').eq('organization_id', orgId),
+        sb.from('agency_teams').select('*').eq('organization_id', orgId),
+        sb.from('agency_team_members').select('*').eq('organization_id', orgId),
       ]);
 
       if (orgRows?.[0]) {
@@ -101,6 +105,9 @@ export async function calculateDepartmentProfitability(
       }
 
       sbCategories = fetchedCategories || [];
+      accounts = sbAccounts || [];
+      agencyTeams = sbTeams || [];
+      agencyTeamMembers = sbTeamMembers || [];
 
       if (sbDepts && sbDepts.length > 0) {
         departments = sbDepts.map((d: any) => ({
@@ -116,20 +123,7 @@ export async function calculateDepartmentProfitability(
         }));
         orgTxns = sbTxns || [];
         members = sbMembers || [];
-        projects = (sbProjects || []).map((p: any) => ({
-          id: String(p.id),
-          organizationId: String(p.organization_id),
-          name: String(p.name),
-          code: String(p.code || ''),
-          clientName: String(p.client_name || ''),
-          departmentId: String(p.department_id || ''),
-          status: p.status,
-          startDate: p.start_date,
-          endDate: p.end_date,
-          quotedAmount: Number(p.quoted_amount || 0),
-          actualCost: Number(p.actual_cost || 0),
-          currency: p.currency || 'USD',
-        }));
+        projects = sbProjects || [];
         allocations = (sbAllocs || []).map((a: any) => ({
           id: String(a.id),
           organizationId: String(a.organization_id),
@@ -141,28 +135,28 @@ export async function calculateDepartmentProfitability(
           policyVersion: String(a.policy_version || 'v1.2-costing'),
           isOperating: a.is_operating !== false,
         }));
-        timesheets = (sbTimesheetEntries || []).map((t: any) => ({
-          id: String(t.id),
-          organizationId: String(t.organization_id),
-          userId: String(t.user_id),
-          projectId: String(t.project_id),
-          hours: Number(t.hours || 0),
-          date: t.date,
-          status: t.status,
-          billable: t.billable !== false,
-        }));
       }
     } catch (sbFetchErr) {
       console.warn('[departments.profitability] Supabase direct query error:', sbFetchErr);
     }
   }
 
+  // Resolve an explicit, matched period window (defaults to Current Calendar Month = 1M)
+  // so transactions, scheduled hours, overhead pools, budgets, and 160h/FTE capacity
+  // ALWAYS share the exact same time basis (§12.2, §33 #5).
+  const eligibleAllTxns = orgTxns.filter(t => isEligibleBusinessCostingTransaction(t));
+  const resolvedPeriod = resolveCostingPeriod({
+    from: dateFrom,
+    to: dateTo,
+    period,
+    transactions: eligibleAllTxns,
+  });
+  const effectiveFrom = resolvedPeriod.fromDate;
+  const effectiveTo = resolvedPeriod.toDate;
+  const periodMonths = resolvedPeriod.periodMonths;
 
+  const activeMembers = members.filter(m => String(m.status || 'active').toLowerCase() === 'active');
 
-  // Pre-calculate org totals for proportional allocation bases
-  const activeMembers = members.filter(m => (m.status || 'active') === 'active');
-
-  // Helper: Resolve a department identifier or member's text department to an active department ID
   const matchDepartmentId = (rawVal: string | undefined | null): string | null => {
     if (!rawVal) return null;
     const val = String(rawVal).trim().toLowerCase();
@@ -183,12 +177,9 @@ export async function calculateDepartmentProfitability(
     return null;
   };
 
-  // Helper: Strict AI / Semantic Department Attribution ONLY for explicit department credit inflows (e.g. "Marketing Campaign")
   const inferCreditDepartmentId = (t: any): string | null => {
     const text = `${t.description || ''} ${t.narration || ''}`.toLowerCase();
     if (!text.trim()) return null;
-
-    // Match explicit whole-word department phrases on credit inflows (e.g. "marketing campaign", "development department")
     for (const dept of departments) {
       const fullDeptName = dept.name.toLowerCase().trim();
       const baseName = fullDeptName.replace(/\s*department\s*/g, '').trim();
@@ -205,89 +196,119 @@ export async function calculateDepartmentProfitability(
     return null;
   };
 
-  // Initialize deptDirects and map each user_id to their home department
-  // Initialize deptDirects and map each user_id to their home department (§12.2 Direct Cost Matrix)
   const deptDirects = new Map<string, {
     revenue: number;
+    postedStaffLabor: number;
+    contractedMonthlySalary: number;
     allocatedStaffLabor: number;
     directDepartmentExpenses: number;
     directCosts: number;
+    laborCostSource: 'posted_payroll' | 'accrued_salary_160h' | 'none';
     headcount: number;
     billableHours: number;
     squareFootage: number;
     customWeight: number;
   }>();
   const userDeptMap = new Map<string, string>();
-  let totalOrgRevenue = 0;
-  let totalOrgDirectCosts = 0;
-  let totalOrgHeadcount = 0;
 
   for (const dept of departments) {
     const deptMembers = activeMembers.filter(m => {
       const resolved = matchDepartmentId(m.department_id || m.departmentId) || matchDepartmentId(m.department);
       return resolved === dept.id;
     });
+
+    let contractedMonthlySalary = 0;
     for (const m of deptMembers) {
       const uid = String(m.user_id || m.userId || m.id || '');
       if (uid) userDeptMap.set(uid, dept.id);
+
+      const sCurr = String(m.salary_currency || orgCurrency).toUpperCase();
+      const fixedSal = Number(m.fixed_salary || m.salary || 0);
+      if (fixedSal > 0) {
+        contractedMonthlySalary += convertCurrency(fixedSal, sCurr, orgCurrency);
+      } else if (Number(m.hourly_rate || 0) > 0) {
+        contractedMonthlySalary += convertCurrency(Number(m.hourly_rate) * 160, sCurr, orgCurrency);
+      }
     }
+
     deptDirects.set(dept.id, {
       revenue: 0,
+      postedStaffLabor: 0,
+      contractedMonthlySalary: Math.round(contractedMonthlySalary * 100) / 100,
       allocatedStaffLabor: 0,
       directDepartmentExpenses: 0,
       directCosts: 0,
+      laborCostSource: 'none',
       headcount: deptMembers.length,
       billableHours: 0,
-      squareFootage: Number((dept as any).squareFootage ?? (dept as any).square_footage ?? 0),
-      customWeight: Number((dept as any).customWeight ?? (dept as any).custom_weight ?? 1),
+      squareFootage: Number(dept.squareFootage ?? 0),
+      customWeight: Number(dept.customWeight ?? 1),
     });
-    totalOrgHeadcount += deptMembers.length;
   }
 
-  // Map projects and compute per-project logged hours by department (Model A: Timesheet Effort Split)
   const projectMap = new Map<string, any>();
   for (const p of projects) {
     projectMap.set(String(p.id), p);
   }
 
-  const projectDeptHours = new Map<string, Map<string, number>>();
-  for (const ts of timesheets) {
-    const hrs = Number(ts.hours || 0);
-    if (hrs <= 0) continue;
-    const uid = String(ts.user_id || ts.userId || '');
-    const pid = String(ts.project_id || ts.projectId || '');
-    const proj = projectMap.get(pid);
-    const deptId =
-      userDeptMap.get(uid) ||
-      matchDepartmentId(proj?.departmentId || proj?.department_id) ||
-      null;
+  // Schedule-driven Mon–Fri 160h/month project allocation filtered to the EXACT SAME period
+  const scheduleEngine = computeOrgProjectsProfitability({
+    projects,
+    transactions: orgTxns,
+    members,
+    departments,
+    overheadAllocations: allocations,
+    agencyTeams,
+    agencyTeamMembers,
+    bankAccounts: accounts,
+    orgCurrency,
+    fromDate: effectiveFrom,
+    toDate: effectiveTo,
+  });
 
-    if (deptId && deptDirects.has(deptId)) {
-      if (ts.billable !== false) {
-        const cur = deptDirects.get(deptId)!;
-        cur.billableHours = Math.round((cur.billableHours + hrs) * 10) / 10;
+  // 1) Active-staff scheduled hours per department (strictly active members in that dept — never injects phantom hours into 0-staff depts!)
+  for (const [rawDeptId, hrs] of scheduleEngine.deptActiveStaffScheduledHours.entries()) {
+    const deptId = matchDepartmentId(rawDeptId) || rawDeptId;
+    const cur = deptId ? deptDirects.get(deptId) : undefined;
+    if (cur && cur.headcount > 0 && hrs > 0) {
+      cur.billableHours = Math.round((cur.billableHours + hrs) * 10) / 10;
+    }
+  }
+
+  // 2) Project multi-department effort split map for attributing project revenue credits
+  const projectDeptHours = new Map<string, Map<string, number>>();
+  for (const [pid, dMap] of scheduleEngine.projectDeptScheduledHours.entries()) {
+    const resolvedMap = new Map<string, number>();
+    for (const [rawDeptId, hrs] of dMap.entries()) {
+      const deptId = matchDepartmentId(rawDeptId) || rawDeptId;
+      if (deptId && deptDirects.has(deptId) && hrs > 0) {
+        resolvedMap.set(deptId, (resolvedMap.get(deptId) || 0) + hrs);
       }
-      if (pid) {
-        if (!projectDeptHours.has(pid)) projectDeptHours.set(pid, new Map());
-        const pMap = projectDeptHours.get(pid)!;
-        pMap.set(deptId, (pMap.get(deptId) || 0) + hrs);
-      }
+    }
+    if (resolvedMap.size > 0) {
+      projectDeptHours.set(pid, resolvedMap);
     }
   }
 
   const categoryNameMap = new Map<string, string>();
-  if (Array.isArray(sbCategories)) {
-    for (const c of sbCategories) {
-      if (c.id && c.name) categoryNameMap.set(String(c.id), String(c.name).toLowerCase());
-    }
+  for (const c of sbCategories) {
+    if (c.id && c.name) categoryNameMap.set(String(c.id), String(c.name).toLowerCase());
   }
-  const inferDeptFromCat = (catId?: string | null): string | null => {
+
+  const inferDeptFromCat = (catId?: string | null, description = ''): string | null => {
     if (!catId) return null;
     const cName = categoryNameMap.get(String(catId)) || '';
     if (!cName) return null;
+
+    // Anti-double-counting guard (§33 #10): never infer an unassigned expense into a department's
+    // Direct Costs if an active operating Overhead Pool already covers that cost bucket!
+    if (isCoveredByDeclaredOverheadPool(cName, description, allocations)) {
+      return null;
+    }
+
     for (const dept of departments) {
       const dName = String(dept.name || '').toLowerCase();
-      if (dName.includes('development') && (cName.includes('software') || cName.includes('tools') || cName.includes('cloud') || cName.includes('saas') || cName.includes('dev') || cName.includes('hosting') || cName.includes('api') || cName.includes('tech'))) {
+      if (dName.includes('development') && (cName.includes('software') || cName.includes('tools') || cName.includes('dev') || cName.includes('api') || cName.includes('tech'))) {
         return dept.id;
       }
       if (dName.includes('marketing') && (cName.includes('marketing') || cName.includes('advertising') || cName.includes('ads') || cName.includes('promo') || cName.includes('campaign') || cName.includes('seo') || cName.includes('social'))) {
@@ -297,21 +318,15 @@ export async function calculateDepartmentProfitability(
     return null;
   };
 
-  // Single-Pass Transaction Allocator (Guarantees 0% double-counting across departments)
+  // Single-Pass Transaction Allocator (strictly business-world, non-transfer, period-filtered)
   for (const t of orgTxns) {
-    const status = String(t.status || 'classified').toLowerCase();
-    if (['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status)) continue;
-
-    const tags: string[] = Array.isArray(t.tags) ? t.tags.map(String) : [];
-    if (t.is_transfer || t.transfer_group_id || tags.includes('transfer')) continue;
-
-    const tDate = String(t.date || '').slice(0, 10);
-    if (dateFrom && tDate < dateFrom) continue;
-    if (dateTo && tDate > dateTo) continue;
+    if (!isEligibleBusinessCostingTransaction(t, effectiveFrom, effectiveTo)) continue;
 
     const rawAmount = Math.abs(Number(t.amount || 0));
     if (rawAmount <= 0) continue;
-    const amount = convertCurrency(rawAmount, t.currency || orgCurrency, orgCurrency);
+    const txnCurrency = String(t.currency || orgCurrency).toUpperCase();
+    const amount = convertCurrency(rawAmount, txnCurrency, orgCurrency);
+    const tags: string[] = Array.isArray(t.tags) ? t.tags.map(String) : [];
 
     const explicitDeptId = matchDepartmentId(t.departmentId || t.department_id);
     const projId = String(t.projectId || t.project_id || '');
@@ -319,7 +334,6 @@ export async function calculateDepartmentProfitability(
     const projDeptId = proj ? matchDepartmentId(proj.departmentId || proj.department_id) : null;
 
     if (t.type === 'credit') {
-      // Priority 1: Project-Linked Multi-Department Effort Split (Model A)
       const pHoursMap = projId ? projectDeptHours.get(projId) : undefined;
       const totalProjHours = pHoursMap
         ? Array.from(pHoursMap.values()).reduce((s, h) => s + h, 0)
@@ -332,24 +346,22 @@ export async function calculateDepartmentProfitability(
           if (stat) stat.revenue += share;
         }
       } else {
-        // Priority 2 & 3: Explicit Dept -> Project Home Dept -> Explicit Credit Department Match
         const targetDeptId = explicitDeptId || projDeptId || inferCreditDepartmentId(t);
         if (targetDeptId && deptDirects.has(targetDeptId)) {
           deptDirects.get(targetDeptId)!.revenue += amount;
         }
       }
     } else if (t.type === 'debit') {
-      // Priority 1: Check for Payslip Split Allocations on this transaction (Zero Double-Counting)
-      // Tag format: payslip_alloc:<payslipId>:<userId>:<deptId>:<gross>:<period>
       const allocTags = tags.filter(tag => tag.startsWith('payslip_alloc:'));
       let allocatedSum = 0;
 
       for (const aTag of allocTags) {
         const parts = aTag.split(':');
-        // parts[0] = 'payslip_alloc', parts[1] = payslipId, parts[2] = userId, parts[3] = deptId, parts[4] = gross, parts[6] = kind
         const tagUserId = parts[2] || '';
         const tagDeptRaw = parts[3] || '';
-        const tagGross = Number(parts[4] || 0);
+        // FX-convert tagGross from transaction currency into orgCurrency (§8, §33 #6)
+        const tagGrossRaw = Number(parts[4] || 0);
+        const tagGross = convertCurrency(tagGrossRaw, txnCurrency, orgCurrency);
         const tagKind = parts[6] || 'salary';
         if (tagGross <= 0) continue;
 
@@ -365,190 +377,108 @@ export async function calculateDepartmentProfitability(
           if (tagKind === 'reimbursement') {
             st.directDepartmentExpenses += effectiveAlloc;
           } else {
-            st.allocatedStaffLabor += effectiveAlloc;
+            st.postedStaffLabor += effectiveAlloc;
           }
-          st.directCosts += effectiveAlloc;
           allocatedSum += effectiveAlloc;
         }
       }
 
-      // Priority 2: Direct department expenses (non-labor operational debits)
       const unallocatedRemainder = Math.max(0, amount - allocatedSum);
       if (unallocatedRemainder > 0) {
-        const targetDeptId = explicitDeptId || projDeptId || inferDeptFromCat(t.category_id || t.categoryId);
+        const desc = String(t.description || t.narration || '').toLowerCase();
+        const targetDeptId = explicitDeptId || projDeptId || inferDeptFromCat(t.category_id || t.categoryId, desc);
         if (targetDeptId && deptDirects.has(targetDeptId)) {
           const st = deptDirects.get(targetDeptId)!;
-          const desc = String(t.description || '').toLowerCase();
-          const narr = String(t.narration || '').toLowerCase();
           const isDirectSalary = desc.includes('salary') || desc.includes('payroll') || tags.includes('salary');
           if (isDirectSalary) {
-            st.allocatedStaffLabor += unallocatedRemainder;
+            st.postedStaffLabor += unallocatedRemainder;
           } else {
             st.directDepartmentExpenses += unallocatedRemainder;
           }
-          st.directCosts += unallocatedRemainder;
         }
       }
     }
   }
 
+  // Finalize Direct Costs per department (reconciling posted payroll vs 160h/mo contracted salaries without double-counting)
   for (const stat of deptDirects.values()) {
     stat.revenue = Math.round(stat.revenue * 100) / 100;
-    stat.allocatedStaffLabor = Math.round(stat.allocatedStaffLabor * 100) / 100;
     stat.directDepartmentExpenses = Math.round(stat.directDepartmentExpenses * 100) / 100;
+    const postedLabor = Math.round(stat.postedStaffLabor * 100) / 100;
+    const accruedSalary = Math.round(stat.contractedMonthlySalary * periodMonths * 100) / 100;
+
+    if (postedLabor > 0) {
+      stat.allocatedStaffLabor = postedLabor;
+      stat.laborCostSource = 'posted_payroll';
+    } else if (accruedSalary > 0) {
+      stat.allocatedStaffLabor = accruedSalary;
+      stat.laborCostSource = 'accrued_salary_160h';
+    } else {
+      stat.allocatedStaffLabor = 0;
+      stat.laborCostSource = 'none';
+    }
+
     stat.directCosts = Math.round((stat.allocatedStaffLabor + stat.directDepartmentExpenses) * 100) / 100;
-    totalOrgRevenue += stat.revenue;
-    totalOrgDirectCosts += stat.directCosts;
   }
 
-  // --- §12.3 Multi-Driver Overhead Allocation Engine (Zero-Leakage Residual Reconciliation) ---
-  const deptPoolContributions = new Map<string, any[]>();
-  for (const dept of departments) {
-    deptPoolContributions.set(dept.id, []);
-  }
+  // --- §12.3 Authoritative Multi-Driver Overhead Allocation Engine (Zero-Leakage Hamilton-Hare) ---
+  const driverStats: DepartmentDriverStats[] = departments.map(dept => {
+    const s = deptDirects.get(dept.id)!;
+    return {
+      departmentId: dept.id,
+      departmentName: dept.name,
+      headcount: s.headcount,
+      revenue: s.revenue,
+      directCosts: s.directCosts,
+      scheduledHours: s.billableHours,
+      squareFootage: s.squareFootage,
+      customWeight: s.customWeight,
+    };
+  });
 
-  let totalAllocatedSharedOverhead = 0;
-
-  for (const alloc of allocations) {
-    let pool = alloc.amount != null && alloc.amount > 0 ? Number(alloc.amount) : 0;
-    if (pool === 0 && alloc.accountIds?.length > 0) {
-      pool = alloc.accountIds.reduce((sum: number, accId: string) => {
-        const acc = accounts.find(a => a.id === accId);
-        return sum + Math.abs(Number(acc?.balance || 0));
-      }, 0);
-    }
-    if (pool <= 0) continue;
-
-    const base = String(alloc.allocationBase || 'headcount').toLowerCase();
-    const numDepts = Math.max(1, departments.length);
-
-    // Compute driver values for each department
-    const driverEntries: Array<{
-      deptId: string;
-      driverValue: number;
-    }> = [];
-
-    let totalDriverValue = 0;
-
-    for (const dept of departments) {
-      const stats = deptDirects.get(dept.id) || {
-        headcount: 0,
-        revenue: 0,
-        directCosts: 0,
-        billableHours: 0,
-        squareFootage: 0,
-        customWeight: 1,
-      };
-
-      let val = 0;
-      if (base === 'headcount') {
-        val = stats.headcount;
-      } else if (base === 'revenue') {
-        val = Math.max(0, stats.revenue);
-      } else if (base === 'direct_cost') {
-        val = Math.max(0, stats.directCosts);
-      } else if (base === 'square_footage') {
-        val = Math.max(0, stats.squareFootage);
-      } else if (base === 'time_utilization') {
-        val = Math.max(0, stats.billableHours);
-      } else if (base === 'department_ratio' || base === 'manual_weight') {
-        val = Math.max(0, stats.customWeight);
-      } else if (base === 'custom') {
-        const deptAlloc = alloc.departments?.find((d: any) => (d.departmentId || d.department_id) === dept.id);
-        val = Math.max(0, Number(deptAlloc?.percentage || deptAlloc?.weight || 0));
-      } else {
-        // equal
-        val = 1;
-      }
-
-      driverEntries.push({ deptId: dept.id, driverValue: val });
-      totalDriverValue += val;
-    }
-
-    // If total driver value is 0 (e.g. no square footage or revenue recorded anywhere),
-    // fallback cleanly to equal distribution across all departments
-    const effectiveTotalDriver = totalDriverValue > 0 ? totalDriverValue : numDepts;
-
-    // Hamilton-Hare / Largest Remainder deterministic integer-cent allocation
-    const poolCents = Math.round(pool * 100);
-    let distributedCents = 0;
-
-    const intermediate = driverEntries.map(entry => {
-      const share = totalDriverValue > 0 ? entry.driverValue / effectiveTotalDriver : 1 / numDepts;
-      const exactCents = poolCents * share;
-      const floorCents = Math.floor(exactCents);
-      const remainder = exactCents - floorCents;
-      distributedCents += floorCents;
-      return {
-        deptId: entry.deptId,
-        driverValue: entry.driverValue,
-        share,
-        cents: floorCents,
-        remainder,
-      };
-    });
-
-    // Distribute leftover cents deterministically to departments with highest remainders
-    const leftoverCents = poolCents - distributedCents;
-    const sortedRemainder = [...intermediate].sort((a, b) => b.remainder - a.remainder || a.deptId.localeCompare(b.deptId));
-    for (let i = 0; i < leftoverCents; i++) {
-      sortedRemainder[i].cents += 1;
-    }
-
-    // Record final allocation for each department
-    for (const item of intermediate) {
-      const allocatedAmount = Math.round(item.cents) / 100;
-      const sharePercent = Math.round(item.share * 10000) / 100;
-      deptPoolContributions.get(item.deptId)?.push({
-        poolId: alloc.id,
-        poolName: alloc.name,
-        driverBase: base as any,
-        driverValue: Math.round(item.driverValue * 100) / 100,
-        totalDriverValue: Math.round(effectiveTotalDriver * 100) / 100,
-        driverSharePercent: sharePercent,
-        allocatedAmount,
-      });
-    }
-    totalAllocatedSharedOverhead += pool;
-  }
+  const overheadResult = allocateOverheadPools({
+    departments: driverStats,
+    allocations,
+    accounts,
+    periodMonths,
+    orgCurrency,
+  });
 
   const profitability = departments.map(dept => {
-    const stats = deptDirects.get(dept.id) || {
-      revenue: 0,
-      allocatedStaffLabor: 0,
-      directDepartmentExpenses: 0,
-      directCosts: 0,
-      headcount: 0,
-      billableHours: 0,
-      squareFootage: 0,
-      customWeight: 1,
-    };
-    const { revenue, allocatedStaffLabor, directDepartmentExpenses, directCosts, headcount, billableHours, squareFootage } = stats;
+    const stats = deptDirects.get(dept.id)!;
+    const {
+      revenue,
+      allocatedStaffLabor,
+      directDepartmentExpenses,
+      directCosts,
+      laborCostSource,
+      headcount,
+      billableHours,
+      squareFootage,
+    } = stats;
 
-    const includedPools = deptPoolContributions.get(dept.id) || [];
-    const allocatedOverhead = Math.round(includedPools.reduce((sum, p) => sum + p.allocatedAmount, 0) * 100) / 100;
+    const includedPools = overheadResult.deptPoolLines.get(dept.id) || [];
+    const allocatedOverhead = overheadResult.deptPoolTotals.get(dept.id) || 0;
 
     // Full Department Cost (§12.2) = direct_department_cost + allocated_shared_overhead
     const fullDepartmentCost = Math.round((directCosts + allocatedOverhead) * 100) / 100;
-    const totalCost = fullDepartmentCost;
     const netProfit = Math.round((revenue - fullDepartmentCost) * 100) / 100;
+    // Strictly null when revenue <= 0 (§33 #9 — never 0% or -100%)
     const profitMargin = revenue > 0
       ? Math.round(((revenue - fullDepartmentCost) / revenue) * 1000) / 10
       : null;
 
-    // Standard FTE working capacity in financial systems = 160 hours / month (40 hrs/wk * 4 wks)
-    // When headcount is 0, standard capacity is null per Handoff v1.2 §12.1 L620.
-    const capacityHours = headcount > 0 ? headcount * 160 : null;
+    // Fixed 160h/month per FTE scaled by periodMonths; strictly null when headcount === 0 (§12.1 L620)
+    const capacityHours = headcount > 0 ? Math.round(headcount * 160 * periodMonths * 100) / 100 : null;
     const totalHours = capacityHours;
-    const totalMinutes = capacityHours != null ? capacityHours * 60 : null;
+    const totalMinutes = capacityHours != null ? Math.round(capacityHours * 60) : null;
 
-    // Real utilization: billable hours logged against standard capacity
-    const utilization = (capacityHours != null && capacityHours > 0 && billableHours > 0)
+    // Utilization strictly null when capacity is undefined (0 staff)
+    const utilization = (capacityHours != null && capacityHours > 0)
       ? Math.round((billableHours / capacityHours) * 1000) / 10
       : null;
 
-    // --- §12.2 Dual Management Views (F-04 L1069: compute minute rates from unrounded totals) ---
-    // 1. Direct Cost View: direct costs only (labor + direct department expenses)
+    // Dual Management Views (§12.2, F-04 L1069: minute rates computed from unrounded totals)
     let directCostPerHour: number | null = null;
     let directCostPerMinute: number | null = null;
     if (capacityHours != null && capacityHours > 0 && directCosts > 0) {
@@ -556,7 +486,6 @@ export async function calculateDepartmentProfitability(
       directCostPerMinute = Math.round((directCosts / (capacityHours * 60)) * 10000) / 10000;
     }
 
-    // 2. Fully Loaded Cost View: direct costs + allocated shared overhead
     let costPerHour: number | null = null;
     let costPerMinute: number | null = null;
     if (capacityHours != null && capacityHours > 0 && fullDepartmentCost > 0) {
@@ -564,7 +493,6 @@ export async function calculateDepartmentProfitability(
       costPerMinute = Math.round((fullDepartmentCost / (capacityHours * 60)) * 10000) / 10000;
     }
 
-    // 3. Productive Capacity Cost Rate: based on hours actually logged on projects/timesheets
     const productiveHours = billableHours > 0 ? billableHours : null;
     let productiveCostPerHour: number | null = null;
     let productiveCostPerMinute: number | null = null;
@@ -573,25 +501,31 @@ export async function calculateDepartmentProfitability(
       productiveCostPerMinute = Math.round((fullDepartmentCost / (productiveHours * 60)) * 10000) / 10000;
     }
 
-    const budgetAmount = Number(dept.budget || 0);
-    // Department direct operational expenditures applied against budget
-    const budgetSpent = Math.round(directCosts);
-    const budgetRemaining = Math.max(0, budgetAmount - budgetSpent);
+    const monthlyBudget = Number(dept.budget || 0);
+    const budgetAmount = Math.round(monthlyBudget * periodMonths * 100) / 100;
+    const budgetSpent = Math.round(directCosts * 100) / 100;
+    const budgetRemaining = Math.max(0, Math.round((budgetAmount - budgetSpent) * 100) / 100);
     const budgetUtilization = budgetAmount > 0 ? Math.round((budgetSpent / budgetAmount) * 1000) / 10 : 0;
-    const standardRate = (budgetAmount > 0 && capacityHours && capacityHours > 0)
+    const standardRate = (budgetAmount > 0 && capacityHours != null && capacityHours > 0)
       ? Math.round((budgetAmount / capacityHours) * 100) / 100
       : costPerHour;
 
-    const costMatrixMeta: any = {
-      period: (dateFrom && dateTo) ? `${dateFrom} to ${dateTo}` : 'Current Month (Rolling)',
+    const capacityBasis = capacityHours != null ? 'fte_160h' : 'none';
+
+    const costMatrixMeta = {
+      period: resolvedPeriod.periodLabel,
+      periodMonths,
       currency: orgCurrency,
       policyVersion: 'v1.2-costing',
       calculationTimestamp: new Date().toISOString(),
       dataFreshness: 'realtime_transactions',
       selectedCapacityHours: capacityHours,
-      selectedCapacityBasis: capacityHours != null ? 'fte_160h' : 'none',
-      includedPoolsCount: allocations.length,
-      totalPoolsAmount: totalAllocatedSharedOverhead,
+      selectedCapacityBasis: capacityBasis,
+      includedPoolsCount: overheadResult.includedPoolsCount,
+      excludedNonOperatingPoolsCount: overheadResult.excludedNonOperatingCount,
+      totalPoolsAmount: overheadResult.totalEligiblePoolAmount,
+      unallocatedOverhead: overheadResult.unallocatedRemainder,
+      laborCostSource,
     };
 
     return {
@@ -607,7 +541,7 @@ export async function calculateDepartmentProfitability(
       netProfit,
       profitMargin,
       headcount,
-      revenuePerHead: headcount > 0 ? Math.round(revenue / headcount) : null,
+      revenuePerHead: headcount > 0 ? Math.round((revenue / headcount) * 100) / 100 : null,
       squareFootage,
       totalHours,
       totalMinutes,
@@ -620,9 +554,20 @@ export async function calculateDepartmentProfitability(
       productiveHours,
       productiveCostPerHour,
       productiveCostPerMinute,
-      capacityBasis: 'fte_160h',
-      overheadSource: allocations.length > 0 ? 'declared_pools' : 'none',
+      capacityBasis,
+      overheadSource: overheadResult.includedPoolsCount > 0 ? 'declared_pools' : 'none',
       costMatrixMeta,
+      decimals: {
+        revenue: toDecimalString(revenue, 2)!,
+        directCosts: toDecimalString(directCosts, 2)!,
+        allocatedOverhead: toDecimalString(allocatedOverhead, 2)!,
+        fullDepartmentCost: toDecimalString(fullDepartmentCost, 2)!,
+        netProfit: toDecimalString(netProfit, 2)!,
+        costPerHour: toDecimalString(costPerHour, 2),
+        costPerMinute: toDecimalString(costPerMinute, 4),
+        directCostPerHour: toDecimalString(directCostPerHour, 2),
+        directCostPerMinute: toDecimalString(directCostPerMinute, 4),
+      },
       budget: budgetAmount,
       budgetSpent,
       budgetRemaining,
@@ -641,11 +586,13 @@ export function createDepartmentsRouter(): Router {
     const orgId = getOrgId(req);
     const rawFrom = req.query.from || req.query.dateFrom || req.query.startDate;
     const rawTo = req.query.to || req.query.dateTo || req.query.endDate;
-    const dateFrom = typeof rawFrom === 'string' ? rawFrom : undefined;
-    const dateTo = typeof rawTo === 'string' ? rawTo : undefined;
+    const rawPeriod = req.query.period;
+    const dateFrom = typeof rawFrom === 'string' && rawFrom ? rawFrom : undefined;
+    const dateTo = typeof rawTo === 'string' && rawTo ? rawTo : undefined;
+    const period = typeof rawPeriod === 'string' && rawPeriod ? rawPeriod : undefined;
 
     try {
-      const profitability = await calculateDepartmentProfitability(orgId, dateFrom, dateTo);
+      const profitability = await calculateDepartmentProfitability(orgId, dateFrom, dateTo, period);
       return ok(res, profitability);
     } catch (err: any) {
       console.error('[departments.profitability] Error:', err);
@@ -688,14 +635,18 @@ export function createDepartmentsRouter(): Router {
     return ok(res, mapDbToDomainDepartment(data));
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Department, 'id' | 'organizationId'>;
+    if (!data?.name || !data.name.trim()) {
+      return fail(res, 400, 'Department name is required');
+    }
+
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
     const newId = (data as any).id || ('dept-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9));
-    const newDept: Department = { ...data, id: newId, organizationId: orgId };
+    const newDept: Department = { ...data, name: data.name.trim(), id: newId, organizationId: orgId };
 
     const dbRow = mapDomainToDbDepartment(newDept);
     const { data: insertedData, error } = await sb
@@ -709,23 +660,42 @@ export function createDepartmentsRouter(): Router {
       return fail(res, 500, error.message);
     }
 
-    return created(res, mapDbToDomainDepartment(insertedData), 'Department created');
+    const mapped = mapDbToDomainDepartment(insertedData);
+    try {
+      await logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'department_created',
+        entityType: 'department',
+        entityId: mapped.id,
+        description: `Created department "${mapped.name}"`,
+        afterState: mapped as unknown as Record<string, unknown>,
+      });
+    } catch { /* non-blocking audit log */ }
+
+    return created(res, mapped, 'Department created');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const updates = req.body as Partial<Department>;
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
+    const { data: beforeRow } = await sb
+      .from('departments')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('organization_id', orgId)
+      .maybeSingle();
+
     const dbUpdates: Record<string, unknown> = {};
-    if (updates.name !== undefined) dbUpdates.name = updates.name;
+    if (updates.name !== undefined) dbUpdates.name = updates.name.trim();
     if (updates.code !== undefined) dbUpdates.code = updates.code;
     if (updates.budget !== undefined) dbUpdates.budget = updates.budget;
     if (updates.costCenter !== undefined) dbUpdates.cost_center = updates.costCenter;
     if (updates.isActive !== undefined) dbUpdates.is_active = updates.isActive;
-    if (updates.squareFootage !== undefined) dbUpdates.square_footage = updates.squareFootage;
-    if (updates.customWeight !== undefined) dbUpdates.custom_weight = updates.customWeight;
+    if (updates.squareFootage !== undefined) dbUpdates.square_footage = Math.max(0, Number(updates.squareFootage));
+    if (updates.customWeight !== undefined) dbUpdates.custom_weight = Math.max(0, Number(updates.customWeight));
 
     const { data, error } = await sb
       .from('departments')
@@ -737,13 +707,34 @@ export function createDepartmentsRouter(): Router {
 
     if (error) return fail(res, 500, error.message);
     if (!data) return notFound(res, 'Department');
-    return ok(res, mapDbToDomainDepartment(data));
+
+    const mapped = mapDbToDomainDepartment(data);
+    try {
+      await logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'department_updated',
+        entityType: 'department',
+        entityId: mapped.id,
+        description: `Updated department "${mapped.name}"`,
+        beforeState: beforeRow ? (mapDbToDomainDepartment(beforeRow) as unknown as Record<string, unknown>) : null,
+        afterState: mapped as unknown as Record<string, unknown>,
+      });
+    } catch { /* non-blocking audit log */ }
+
+    return ok(res, mapped);
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const { data: beforeRow } = await sb
+      .from('departments')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('organization_id', orgId)
+      .maybeSingle();
 
     const { error } = await sb
       .from('departments')
@@ -752,6 +743,18 @@ export function createDepartmentsRouter(): Router {
       .eq('organization_id', orgId);
 
     if (error) return fail(res, 500, error.message);
+
+    try {
+      await logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'department_deleted',
+        entityType: 'department',
+        entityId: String(req.params.id),
+        description: `Deleted department "${beforeRow?.name || req.params.id}"`,
+        beforeState: beforeRow ? (mapDbToDomainDepartment(beforeRow) as unknown as Record<string, unknown>) : null,
+      });
+    } catch { /* non-blocking audit log */ }
+
     return ok(res, null, 'Department deleted');
   });
 

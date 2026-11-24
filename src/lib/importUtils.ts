@@ -1,5 +1,7 @@
 // Enhanced Statement Import - Utility Functions
 
+import type { ProposedNewCategory } from './classificationEngine';
+
 export interface ImportedTransaction {
   id: string;
   date: string;
@@ -14,12 +16,21 @@ export interface ImportedTransaction {
   rawData: Record<string, any>;
   /** Review step: business vs personal spend */
   usage?: 'business' | 'personal';
+  worldConfidence?: number;
+  worldReason?: string;
   /** Review step: chart category to apply on import */
   importCategoryId?: string;
+  /** Proposed new category to auto-create if no existing category matches */
+  proposedNewCategory?: ProposedNewCategory | null;
   /** Review step: project assigned to transaction */
   projectId?: string;
   /** Classification source: 'ai' (AI model) or 'rules' (rule engine) */
   classificationSource?: 'ai' | 'rules';
+  classifiedBy?: string;
+  reasoning?: string;
+  needsReview?: boolean;
+  placement?: 'auto_approved' | 'bulk_review' | 'manual_review';
+  riskFlags?: string[];
 }
 
 export interface ColumnMapping {

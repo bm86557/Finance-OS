@@ -1,13 +1,18 @@
 import { useMemo, useState } from 'react';
 import { motion } from 'motion/react';
 import { formatCurrency, formatDate } from '@/lib/formatters';
-import { Repeat, Plus, Edit, Trash2, Pause, Play, Clock, TrendingUp, TrendingDown } from 'lucide-react';
+import { Repeat, Plus, Edit, Trash2, Pause, Play, Clock, TrendingUp, TrendingDown, Sparkles, Check, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { useTheme } from '../../../contexts/ThemeContext';
+import { useAuth } from '@/contexts/AuthContext';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService, useServiceArray } from '@/hooks/useService';
-import type { RecurringTransaction as ServiceRT } from '@/services/types';
+import type {
+  DetectedRecurringCandidate,
+  RecurringOccurrenceItem,
+  RecurringTransaction as ServiceRT,
+} from '@/services/types';
 import { validateRecurringDateOrder } from '@/services/recurringTransactionService';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '../ui/dialog';
 
@@ -62,7 +67,7 @@ function toRowVM(
     nextDue: r.nextOccurrence,
     status: r.isActive ? 'active' : 'paused',
     runsProgress,
-    autoGenerate: true,
+    autoGenerate: Boolean(r.autoGenerate ?? false),
     scopeLabel,
   };
 }
@@ -81,7 +86,9 @@ function todayISODate(): string {
 
 export function RecurringTransactions() {
   const { theme } = useTheme();
+  const { currentOrganization } = useAuth();
   const svc = useOrgServices();
+  const orgCurrency = currentOrganization?.currency || 'USD';
 
   const { data: rawList, loading, error, refetch: refetchRecurring } = useServiceArray(
     () => svc.recurring.getAll(),
@@ -93,6 +100,18 @@ export function RecurringTransactions() {
     () => svc.recurring.getTotals(),
     [svc.orgId],
     ['recurringTransactions'],
+  );
+
+  const { data: suggestions, refetch: refetchSuggestions } = useServiceArray<DetectedRecurringCandidate>(
+    () => svc.recurring.getSuggestions('business'),
+    [svc.orgId],
+    ['recurringTransactions', 'transactions'],
+  );
+
+  const { data: pendingOccurrences, refetch: refetchOccurrences } = useServiceArray<RecurringOccurrenceItem>(
+    () => svc.recurring.getOccurrences('pending_approval'),
+    [svc.orgId],
+    ['recurringTransactions', 'transactions'],
   );
 
   const { data: categories } = useServiceArray(
@@ -174,7 +193,7 @@ export function RecurringTransactions() {
 
   const [formDescription, setFormDescription] = useState('');
   const [formAmount, setFormAmount] = useState('');
-  const [formCurrency, setFormCurrency] = useState('PKR');
+  const [formCurrency, setFormCurrency] = useState(orgCurrency);
   const [formType, setFormType] = useState<UiType>('expense');
   const [formCategoryId, setFormCategoryId] = useState('');
   const [formBankId, setFormBankId] = useState('');
@@ -182,7 +201,11 @@ export function RecurringTransactions() {
   const [formStart, setFormStart] = useState(todayISODate());
   const [formNext, setFormNext] = useState(todayISODate());
   const [formEnd, setFormEnd] = useState('');
+  const [formAutoGenerate, setFormAutoGenerate] = useState(false);
+  const [formRequiresApproval, setFormRequiresApproval] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [promotingKey, setPromotingKey] = useState<string | null>(null);
+  const [reviewingOccId, setReviewingOccId] = useState<string | null>(null);
 
   const [filterStatus, setFilterStatus] = useState<'all' | 'active' | 'paused'>('all');
   const [filterType, setFilterType] = useState<'all' | 'income' | 'expense'>('all');
@@ -196,7 +219,7 @@ export function RecurringTransactions() {
   const resetForm = () => {
     setFormDescription('');
     setFormAmount('');
-    setFormCurrency('PKR');
+    setFormCurrency(orgCurrency);
     setFormType('expense');
     setFormCategoryId(categories[0]?.id ?? '');
     setFormBankId(bankAccounts[0]?.id ?? '');
@@ -205,6 +228,8 @@ export function RecurringTransactions() {
     setFormStart(t);
     setFormNext(t);
     setFormEnd('');
+    setFormAutoGenerate(false);
+    setFormRequiresApproval(false);
     setEditingId(null);
   };
 
@@ -225,6 +250,8 @@ export function RecurringTransactions() {
     setFormStart(txn.startDate.slice(0, 10));
     setFormNext(txn.nextOccurrence.slice(0, 10));
     setFormEnd(txn.endDate ? txn.endDate.slice(0, 10) : '');
+    setFormAutoGenerate(Boolean(txn.autoGenerate));
+    setFormRequiresApproval(Boolean(txn.requiresApproval));
     setEditOpen(true);
   };
 
@@ -243,7 +270,7 @@ export function RecurringTransactions() {
       toast.error('Choose an account.');
       return;
     }
-    const dateErr = validateRecurringDateOrder(formStart, formNext);
+    const dateErr = validateRecurringDateOrder(formStart, formNext, formEnd || undefined);
     if (dateErr) {
       toast.error(dateErr);
       return;
@@ -262,11 +289,14 @@ export function RecurringTransactions() {
         nextOccurrence: formNext,
         endDate: formEnd || undefined,
         isActive: true,
+        autoGenerate: formAutoGenerate,
+        requiresApproval: formRequiresApproval,
       });
       if (res.success) {
         toast.success('Recurring schedule saved');
         setCreateOpen(false);
         resetForm();
+        await Promise.all([refetchRecurring(), refetchTotals(), refetchSuggestions()]);
       } else {
         toast.error(res.error ?? 'Could not create.');
       }
@@ -287,7 +317,7 @@ export function RecurringTransactions() {
       toast.error('Choose an account.');
       return;
     }
-    const dateErr = validateRecurringDateOrder(formStart, formNext);
+    const dateErr = validateRecurringDateOrder(formStart, formNext, formEnd || undefined);
     if (dateErr) {
       toast.error(dateErr);
       return;
@@ -305,11 +335,14 @@ export function RecurringTransactions() {
         startDate: formStart,
         nextOccurrence: formNext,
         endDate: formEnd || undefined,
+        autoGenerate: formAutoGenerate,
+        requiresApproval: formRequiresApproval,
       });
       if (res.success) {
         toast.success('Schedule updated');
         setEditOpen(false);
         resetForm();
+        await Promise.all([refetchRecurring(), refetchTotals(), refetchSuggestions()]);
       } else {
         toast.error(res.error ?? 'Could not update.');
       }
@@ -322,6 +355,7 @@ export function RecurringTransactions() {
     const res = await svc.recurring.toggle(id);
     if (res.success) {
       toast.success(res.data?.isActive ? 'Resumed' : 'Paused');
+      await Promise.all([refetchRecurring(), refetchTotals()]);
     } else {
       toast.error(res.error ?? 'Could not update status.');
     }
@@ -332,6 +366,7 @@ export function RecurringTransactions() {
     const res = await svc.recurring.delete(id);
     if (res.success) {
       toast.success('Removed');
+      await Promise.all([refetchRecurring(), refetchTotals(), refetchSuggestions()]);
     } else {
       toast.error(res.error ?? 'Could not delete.');
     }
@@ -339,11 +374,10 @@ export function RecurringTransactions() {
 
   const handleGenerate = async () => {
     if (!window.confirm('Generate transactions for all due recurring schedules up to today?')) return;
-    const res = await svc.recurring.generate(svc.orgId);
+    const res = await svc.recurring.generate();
     if (res.success) {
       toast.success(res.message || 'Transactions generated');
-      // Refetch data to update Period Status and Runs for all affected schedules
-      await Promise.all([refetchRecurring(), refetchTotals()]);
+      await Promise.all([refetchRecurring(), refetchTotals(), refetchOccurrences()]);
     } else {
       toast.error(res.error || 'Could not generate.');
     }
@@ -352,15 +386,70 @@ export function RecurringTransactions() {
   const handleGenerateSingle = async (recurringId: string) => {
     const res = await svc.recurring.generateSingle(recurringId);
     if (res.success) {
-      toast.success('Transaction generated and added to ledger');
-      // Refetch data to update: next occurrence, generated count, period status, and runs progress
-      await Promise.all([refetchRecurring(), refetchTotals()]);
+      toast.success(res.message || 'Transaction generated and added to ledger');
+      await Promise.all([refetchRecurring(), refetchTotals(), refetchOccurrences()]);
     } else {
       toast.error(res.error || 'Could not generate transaction.');
     }
   };
 
+  const handlePromoteSuggestion = async (cand: DetectedRecurringCandidate) => {
+    const resolvedBankId = cand.bankAccountId || bankAccounts[0]?.id || '';
+    if (!resolvedBankId) {
+      toast.error('Add a bank account under Accounts & Wallets first.');
+      return;
+    }
+    setPromotingKey(cand.candidateKey);
+    try {
+      const res = await svc.recurring.promoteSuggestion({
+        ...cand,
+        bankAccountId: resolvedBankId,
+        requiresApproval: true,
+        autoGenerate: false,
+      });
+      if (res.success) {
+        toast.success(`Recurring schedule "${cand.suggestedTitle}" created`);
+        await Promise.all([refetchRecurring(), refetchTotals(), refetchSuggestions()]);
+      } else {
+        toast.error(res.error || 'Could not create schedule from suggestion.');
+      }
+    } finally {
+      setPromotingKey(null);
+    }
+  };
+
+  const handleApproveOccurrence = async (occurrenceId: string) => {
+    setReviewingOccId(occurrenceId);
+    try {
+      const res = await svc.recurring.approveOccurrence(occurrenceId);
+      if (res.success) {
+        toast.success(res.message || 'Occurrence approved and posted to ledger');
+        await Promise.all([refetchRecurring(), refetchTotals(), refetchOccurrences()]);
+      } else {
+        toast.error(res.error || 'Could not approve occurrence.');
+      }
+    } finally {
+      setReviewingOccId(null);
+    }
+  };
+
+  const handleRejectOccurrence = async (occurrenceId: string) => {
+    setReviewingOccId(occurrenceId);
+    try {
+      const res = await svc.recurring.rejectOccurrence(occurrenceId, 'Skipped by reviewer');
+      if (res.success) {
+        toast.success('Occurrence skipped');
+        await Promise.all([refetchRecurring(), refetchTotals(), refetchOccurrences()]);
+      } else {
+        toast.error(res.error || 'Could not skip occurrence.');
+      }
+    } finally {
+      setReviewingOccId(null);
+    }
+  };
+
   const activeRows = rows.filter((t) => t.status === 'active');
+  const displayCurrency = totals?.currency || orgCurrency;
   const totalMonthlyIncome = totals?.monthlyIncome ?? 0;
   const totalMonthlyExpense = totals?.monthlyExpense ?? 0;
 
@@ -398,9 +487,14 @@ export function RecurringTransactions() {
             onChange={(e) => setFormCurrency(e.target.value)}
             className="h-11 w-full rounded-xl border border-slate-600 bg-slate-900 px-3 text-sm text-white"
           >
-            <option value="PKR">PKR</option>
             <option value="USD">USD</option>
+            <option value="PKR">PKR</option>
+            <option value="EUR">EUR</option>
+            <option value="GBP">GBP</option>
             <option value="AED">AED</option>
+            <option value="CAD">CAD</option>
+            <option value="AUD">AUD</option>
+            <option value="SGD">SGD</option>
           </select>
         </div>
       </div>
@@ -497,19 +591,42 @@ export function RecurringTransactions() {
         {formEnd && formStart && (
           <p className="mt-1 text-xs text-blue-300">
             {(() => {
-              const start = new Date(formStart);
-              const end = new Date(formEnd);
+              const start = new Date(`${formStart}T00:00:00Z`);
+              const end = new Date(`${formEnd}T00:00:00Z`);
+              if (end < start) return 'End date must be on or after start date';
               const diffDays = Math.floor((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
-              const approxOccurrences = 
+              let months = (end.getUTCFullYear() - start.getUTCFullYear()) * 12 + (end.getUTCMonth() - start.getUTCMonth());
+              if (end.getUTCDate() < start.getUTCDate()) months -= 1;
+              const approxOccurrences =
                 formFrequency === 'daily' ? diffDays :
                 formFrequency === 'weekly' ? Math.floor(diffDays / 7) :
-                formFrequency === 'monthly' ? Math.floor(diffDays / 30.4375) :
-                formFrequency === 'quarterly' ? Math.floor(diffDays / 91.3125) :
-                formFrequency === 'yearly' ? Math.floor(diffDays / 365.25) : 0;
+                formFrequency === 'monthly' ? Math.max(0, months) :
+                formFrequency === 'quarterly' ? Math.floor(Math.max(0, months) / 3) :
+                formFrequency === 'yearly' ? Math.floor(Math.max(0, months) / 12) : 0;
               return `≈ ${Math.max(0, approxOccurrences)} ${formFrequency} occurrences`;
             })()}
           </p>
         )}
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 pt-1">
+        <label className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/70 px-3 py-2.5 text-xs text-slate-200 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={formAutoGenerate}
+            onChange={(e) => setFormAutoGenerate(e.target.checked)}
+            className="rounded border-slate-600"
+          />
+          <span>Auto-generate on due date</span>
+        </label>
+        <label className="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-900/70 px-3 py-2.5 text-xs text-slate-200 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={formRequiresApproval}
+            onChange={(e) => setFormRequiresApproval(e.target.checked)}
+            className="rounded border-slate-600"
+          />
+          <span>Require approval before posting</span>
+        </label>
       </div>
     </div>
   );
@@ -625,7 +742,7 @@ export function RecurringTransactions() {
           <div className="flex items-center justify-between">
             <div>
               <p className="mb-1 text-sm text-slate-400">Monthly income</p>
-              <p className="text-2xl font-bold text-emerald-400">{formatCurrency(totalMonthlyIncome, 'PKR')}</p>
+              <p className="text-2xl font-bold text-emerald-400">{formatCurrency(totalMonthlyIncome, displayCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -649,7 +766,7 @@ export function RecurringTransactions() {
           <div className="flex items-center justify-between">
             <div>
               <p className="mb-1 text-sm text-slate-400">Monthly expense</p>
-              <p className="text-2xl font-bold text-red-400">{formatCurrency(totalMonthlyExpense, 'PKR')}</p>
+              <p className="text-2xl font-bold text-red-400">{formatCurrency(totalMonthlyExpense, displayCurrency)}</p>
             </div>
             <div
               className="flex h-12 w-12 items-center justify-center rounded-xl"
@@ -678,7 +795,7 @@ export function RecurringTransactions() {
                   totalMonthlyIncome - totalMonthlyExpense >= 0 ? 'text-emerald-400' : 'text-red-400'
                 }`}
               >
-                {formatCurrency(totalMonthlyIncome - totalMonthlyExpense, 'PKR')}
+                {formatCurrency(totalMonthlyIncome - totalMonthlyExpense, displayCurrency)}
               </p>
             </div>
             <div
@@ -693,6 +810,134 @@ export function RecurringTransactions() {
           </div>
         </motion.div>
       </div>
+
+      {pendingOccurrences.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl p-5 border border-amber-500/30"
+          style={AXIOM.containers.list}
+        >
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Clock className="size-4 text-amber-400" />
+              <h2 className="text-sm font-bold text-amber-300 uppercase tracking-wider font-mono">
+                Pending Recurring Approvals ({pendingOccurrences.length})
+              </h2>
+            </div>
+            <span className="text-xs text-slate-400">Requires approval before posting to ledger</span>
+          </div>
+          <div className="space-y-2">
+            {pendingOccurrences.map((occ) => (
+              <div
+                key={occ.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-700/60 bg-slate-900/50 px-4 py-3"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-white">{occ.templateDescription}</p>
+                  <p className="text-xs text-slate-400 font-mono">
+                    Period {occ.scheduledPeriodKey} • Due {formatDate(occ.scheduledDate)} • {occ.source}
+                  </p>
+                </div>
+                <div className="flex items-center gap-3">
+                  <span
+                    className={`font-mono text-sm font-bold ${
+                      occ.templateType === 'credit' ? 'text-emerald-400' : 'text-red-400'
+                    }`}
+                  >
+                    {occ.templateType === 'credit' ? '+' : '-'}
+                    {formatCurrency(occ.amount, occ.currency)}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={reviewingOccId === occ.id}
+                    onClick={() => void handleApproveOccurrence(occ.id)}
+                    className="inline-flex items-center gap-1 rounded-lg bg-emerald-600/80 hover:bg-emerald-500 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                  >
+                    <Check className="size-3.5" />
+                    Approve &amp; Post
+                  </button>
+                  <button
+                    type="button"
+                    disabled={reviewingOccId === occ.id}
+                    onClick={() => void handleRejectOccurrence(occ.id)}
+                    className="inline-flex items-center gap-1 rounded-lg bg-slate-700/80 hover:bg-slate-600 px-3 py-1.5 text-xs font-semibold text-slate-200 disabled:opacity-50"
+                  >
+                    <X className="size-3.5" />
+                    Skip
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      )}
+
+      {suggestions.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="rounded-2xl p-5 border border-cyan-500/30"
+          style={AXIOM.containers.list}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <div className="flex items-center gap-2">
+              <Sparkles className="size-4 text-cyan-400" />
+              <h2 className="text-sm font-bold text-cyan-300 uppercase tracking-wider font-mono">
+                Detected Recurring Patterns ({suggestions.length})
+              </h2>
+            </div>
+            <span className="text-xs text-slate-400">
+              Identified from posted ledger cadence — confirm to create a recurring schedule
+            </span>
+          </div>
+          <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+            {suggestions.slice(0, 6).map((cand) => (
+              <div
+                key={cand.candidateKey}
+                className="flex flex-col justify-between gap-3 rounded-xl border border-slate-700/60 bg-slate-900/50 p-4"
+              >
+                <div>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <p className="text-sm font-semibold text-white truncate">{cand.suggestedTitle}</p>
+                    <span
+                      className={`font-mono text-sm font-bold shrink-0 ${
+                        cand.direction === 'credit' ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {cand.direction === 'credit' ? '+' : '-'}
+                      {formatCurrency(cand.suggestedAmount, cand.currency)}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400">{cand.explanation}</p>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                    <span className="rounded px-2 py-0.5 capitalize bg-purple-500/20 text-purple-300">
+                      {cand.frequency}
+                    </span>
+                    <span className="rounded px-2 py-0.5 bg-cyan-500/15 text-cyan-300">
+                      {cand.confidenceScore}% confidence
+                    </span>
+                    <span className="text-slate-400">
+                      Next expected: {formatDate(cand.suggestedNextOccurrence)}
+                    </span>
+                  </div>
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={promotingKey === cand.candidateKey}
+                    onClick={() => void handlePromoteSuggestion(cand)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-cyan-600/80 hover:bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+                  >
+                    <Plus className="size-3.5" />
+                    {promotingKey === cand.candidateKey ? 'Creating…' : 'Create Schedule'}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+      )}
 
       <motion.div
         initial={{ opacity: 0, y: 20 }}

@@ -1004,11 +1004,13 @@ export function createTransactionsRouter(): Router {
         updates.currency !== undefined ||
         updates.type !== undefined ||
         updates.date !== undefined ||
+        updates.categoryId !== undefined ||
+        (updates as any).worldScope !== undefined ||
         (updates as any).bankAccountId !== undefined ||
         (updates as any).bank_account_id !== undefined;
 
-      if (existing.status === 'posted' && isFinancialMutation) {
-        return fail(res, 400, 'Posted transactions are immutable. Financial corrections must be performed via transaction reversal (POST /transactions/:id/reverse).');
+      if (['posted', 'reconciled'].includes(String(existing.status || '')) && isFinancialMutation) {
+        return fail(res, 400, 'Posted or reconciled transactions are immutable. Financial corrections must be performed via transaction reversal (POST /transactions/:id/reverse).');
       }
 
       if (updates.date && await isPeriodLocked(sb, orgId, updates.date)) {
@@ -1016,6 +1018,23 @@ export function createTransactionsRouter(): Router {
       }
       if (existing.date && isFinancialMutation && await isPeriodLocked(sb, orgId, existing.date)) {
         return fail(res, 400, 'Cannot mutate a transaction in a locked accounting period');
+      }
+
+      const incomingWorld = (updates as any).worldScope ?? (updates as any).world_scope ?? (updates as any).world;
+      if (incomingWorld === 'personal') {
+        const { data: orgRow } = await sb
+          .from('organizations')
+          .select('personal_world_enabled, settings')
+          .eq('id', orgId)
+          .maybeSingle();
+        const personalEnabled =
+          (orgRow as any)?.personal_world_enabled ??
+          (orgRow as any)?.settings?.personal_world_enabled ??
+          (orgRow as any)?.settings?.features?.personal_finance ??
+          true;
+        if (personalEnabled === false) {
+          return fail(res, 400, 'WORLD_DISABLED: Personal finance tracking is disabled in organization settings.');
+        }
       }
 
       const dbUpdates: Record<string, unknown> = {};
@@ -1032,6 +1051,9 @@ export function createTransactionsRouter(): Router {
       }
       if (updates.projectId !== undefined) {
         dbUpdates.project_id = updates.projectId && updates.projectId !== '__none__' ? updates.projectId : null;
+      }
+      if (incomingWorld === 'business' || incomingWorld === 'personal') {
+        dbUpdates.world_scope = incomingWorld;
       }
       if (updates.status !== undefined) dbUpdates.status = updates.status;
       if (updates.date !== undefined) dbUpdates.date = updates.date;

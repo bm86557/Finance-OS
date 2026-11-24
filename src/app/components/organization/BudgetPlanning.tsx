@@ -9,6 +9,7 @@ import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService, useServiceArray } from '@/hooks/useService';
 import { useAuth } from '@/contexts/AuthContext';
+import { isHttpBackendConfigured } from '@/lib/apiClient';
 import type { Budget as ServiceBudget } from '@/services/types';
 
 // ── View-model extends service Budget with computed UI fields ───────────
@@ -204,7 +205,8 @@ export function BudgetPlanning() {
 
     const serverSpent = b.spentAmount != null && !isNaN(Number(b.spentAmount)) ? Number(b.spentAmount) : 0;
     const computedSpent = Math.round(matchingSpent * 100) / 100;
-    const actualSpent = computedSpent > 0 ? computedSpent : serverSpent;
+    // Handoff §0 #5: Backend is authoritative when HTTP API is active (excludes transfers, loan principal & converts FX).
+    const actualSpent = isHttpBackendConfigured() ? serverSpent : (computedSpent > 0 ? computedSpent : serverSpent);
     const pct = b.budgetedAmount > 0 ? (actualSpent / b.budgetedAmount) * 100 : 0;
     const catInfo = b.categoryId ? categoryMap.get(b.categoryId) : undefined;
     const deptName = b.departmentId ? departmentMap.get(b.departmentId) : undefined;

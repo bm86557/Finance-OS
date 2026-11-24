@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { formatCurrency } from '@/lib/formatters';
 import {
@@ -13,27 +13,37 @@ import {
   Edit2,
   Briefcase,
   Layers,
-  Settings2,
   CheckCircle2,
   Clock,
-  ArrowRight,
-  PieChart,
+  Save,
+  Download,
+  Lock,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { AXIOM } from '../../../styles/axiom-tokens';
 import { useOrgServices } from '@/hooks/useOrgServices';
 import { useService, useServiceArray } from '@/hooks/useService';
-import type { DepartmentProfitability, OverheadAllocation, CommissionStructure, ExchangeRate } from '@/services/types';
-import { useTheme } from '../../../contexts/ThemeContext';
+import type {
+  DepartmentProfitability,
+  OverheadAllocation,
+  OverheadAllocationBase,
+  CommissionStructure,
+  Quote,
+  QuoteCalculationResult,
+} from '@/services/types';
 import { useAuth } from '@/contexts/AuthContext';
+
+type CostingPeriodKey = '1M' | '3M' | '1Y' | 'ALL';
+
+const DEC2 = { minimumFractionDigits: 2, maximumFractionDigits: 2 };
 
 interface DepartmentRow {
   id: string;
   name: string;
   costPerHour: number | null;
-  directCostPerHour?: number | null;
-  directCostPerMinute?: number | null;
-  costPerMinute?: number | null;
+  directCostPerHour: number | null;
+  directCostPerMinute: number | null;
+  costPerMinute: number | null;
   allocatedStaffLabor?: number;
   directDepartmentExpenses?: number;
   headcount: number;
@@ -42,7 +52,9 @@ interface DepartmentRow {
   directCosts: number;
   allocatedOverhead: number;
   profit: number;
-  margin: number;
+  /** Strictly null (Undefined) when revenue <= 0 (§33 #9) */
+  margin: number | null;
+  /** Strictly null (Undefined) when headcount === 0 (§12.1 L620) */
   utilization: number | null;
   totalHours: number | null;
   billableHours: number;
@@ -51,52 +63,42 @@ interface DepartmentRow {
   budgetRemaining?: number;
   budgetUtilization?: number;
   standardRate?: number | null;
-  capacityBasis?: string;
-  policyVersion?: string;
+  capacityBasis: string;
+  policyVersion: string;
+  periodLabel: string;
+  periodMonths: number;
+  laborCostSource?: string;
 }
 
+/**
+ * Pure mapper from authoritative backend `DepartmentProfitability` payload.
+ * Never recomputes or fabricates margins / capacity denominators client-side (§6 L231, §33 #9).
+ */
 function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow {
-  const directCosts = Number(dp.directCosts ?? (dp as any).expenses ?? 0);
+  const directCosts = Number(dp.directCosts ?? 0);
   const allocatedOverhead = Number(dp.allocatedOverhead ?? 0);
-  const monthlyCost = directCosts + allocatedOverhead;
+  const monthlyCost = dp.fullDepartmentCost != null ? Number(dp.fullDepartmentCost) : directCosts + allocatedOverhead;
   const revenue = Number(dp.revenue ?? 0);
-  const netProfit = revenue - monthlyCost;
-  const margin = revenue > 0
-    ? (netProfit / revenue) * 100
-    : monthlyCost > 0
-    ? -100
-    : 0;
-
+  const netProfit = dp.netProfit != null ? Number(dp.netProfit) : revenue - monthlyCost;
   const headcount = Number(dp.headcount ?? 0);
-  // Per Handoff v1.2 §12.1 L620: zero-hour denominator is undefined (null), never 160h or $0
-  const totalHours = dp.totalHours != null
-    ? Number(dp.totalHours)
-    : (headcount > 0 ? headcount * 160 : null);
+  const totalHours = dp.totalHours != null ? Number(dp.totalHours) : null;
   const billableHours = Number(dp.billableHours ?? 0);
-  const utilization = dp.utilization != null
-    ? Number(dp.utilization)
-    : (billableHours > 0 && totalHours != null && totalHours > 0 ? Math.round((billableHours / totalHours) * 1000) / 10 : null);
-  const costPerHour = dp.costPerHour != null
-    ? Number(dp.costPerHour)
-    : (totalHours != null && totalHours > 0 && monthlyCost > 0 ? Math.round((monthlyCost / totalHours) * 100) / 100 : null);
-  const costPerMinute = dp.costPerMinute != null
-    ? Number(dp.costPerMinute)
-    : (totalHours != null && totalHours > 0 && monthlyCost > 0 ? Math.round((monthlyCost / (totalHours * 60)) * 10000) / 10000 : null);
-  const directCostPerHour = dp.directCostPerHour != null
-    ? Number(dp.directCostPerHour)
-    : (totalHours != null && totalHours > 0 && directCosts > 0 ? Math.round((directCosts / totalHours) * 100) / 100 : null);
   const budget = dp.budget != null ? Number(dp.budget) : undefined;
   const budgetSpent = dp.budgetSpent != null ? Number(dp.budgetSpent) : directCosts;
-  const budgetRemaining = budget != null ? Math.max(0, budget - budgetSpent) : undefined;
-  const budgetUtilization = budget != null && budget > 0 ? (budgetSpent / budget) * 100 : 0;
+  const budgetRemaining = dp.budgetRemaining != null
+    ? Number(dp.budgetRemaining)
+    : (budget != null ? Math.max(0, budget - budgetSpent) : undefined);
+  const budgetUtilization = dp.budgetUtilization != null
+    ? Number(dp.budgetUtilization)
+    : (budget != null && budget > 0 ? (budgetSpent / budget) * 100 : 0);
 
   return {
     id: dp.departmentId,
     name: dp.departmentName,
-    costPerHour,
-    directCostPerHour,
-    directCostPerMinute: dp.directCostPerMinute ?? null,
-    costPerMinute,
+    costPerHour: dp.costPerHour != null ? Number(dp.costPerHour) : null,
+    directCostPerHour: dp.directCostPerHour != null ? Number(dp.directCostPerHour) : null,
+    directCostPerMinute: dp.directCostPerMinute != null ? Number(dp.directCostPerMinute) : null,
+    costPerMinute: dp.costPerMinute != null ? Number(dp.costPerMinute) : null,
     allocatedStaffLabor: dp.allocatedStaffLabor,
     directDepartmentExpenses: dp.directDepartmentExpenses,
     headcount,
@@ -105,35 +107,34 @@ function mapDepartmentProfitability(dp: DepartmentProfitability): DepartmentRow 
     directCosts,
     allocatedOverhead,
     profit: netProfit,
-    margin,
-    utilization,
+    margin: dp.profitMargin != null ? Number(dp.profitMargin) : null,
+    utilization: dp.utilization != null ? Number(dp.utilization) : null,
     totalHours,
     billableHours,
     budget,
     budgetSpent,
     budgetRemaining,
     budgetUtilization,
-    standardRate: dp.standardRate ?? (budget && budget > 0 && totalHours && totalHours > 0 ? Math.round((budget / totalHours) * 100) / 100 : costPerHour),
+    standardRate: dp.standardRate ?? null,
     capacityBasis: dp.costMatrixMeta?.selectedCapacityBasis ?? dp.capacityBasis ?? (totalHours != null ? 'fte_160h' : 'none'),
     policyVersion: dp.costMatrixMeta?.policyVersion ?? 'v1.2-costing',
+    periodLabel: dp.costMatrixMeta?.period ?? 'Current Month',
+    periodMonths: dp.costMatrixMeta?.periodMonths ?? 1,
+    laborCostSource: dp.costMatrixMeta?.laborCostSource,
   };
 }
 
 export function CostingPricing() {
   const { currentOrganization } = useAuth();
-  const { theme } = useTheme();
   const svc = useOrgServices();
 
-  // ── 0. Accounts & Organization Active Currency ─────────────────────────
-  const { data: accounts } = useServiceArray(
-    () => svc.accounts.getAll(),
-    [svc.orgId]
-  );
-
+  // Authoritative Organization Base Currency matching backend calculations (§8 L382, L386)
   const currency = useMemo(() => {
-    const bankAcc = (accounts ?? []).find(a => (a.subtype === 'bank_account' || a.type === 'asset') && a.currency);
-    return bankAcc?.currency || currentOrganization?.currency || 'USD';
-  }, [accounts, currentOrganization]);
+    return (currentOrganization?.baseCurrency || currentOrganization?.currency || 'USD').toUpperCase();
+  }, [currentOrganization]);
+
+  // Period window selector for Department Cost Rates (defaults to Current Calendar Month = 1M)
+  const [costingPeriod, setCostingPeriod] = useState<CostingPeriodKey>('1M');
 
   // ── 1. Departments & Department Profitability ─────────────────────────────
   const {
@@ -142,7 +143,7 @@ export function CostingPricing() {
   } = useServiceArray(
     () => svc.departments.getAll(),
     [svc.orgId],
-    ['departments']
+    ['departments'],
   );
 
   const {
@@ -151,9 +152,9 @@ export function CostingPricing() {
     error: deptError,
     refetch: refetchDept,
   } = useService(
-    () => svc.departments.getProfitability(),
-    [svc.orgId],
-    ['departments', 'budgets', 'transactions', 'projects']
+    () => svc.departments.getProfitability({ period: costingPeriod }),
+    [svc.orgId, costingPeriod],
+    ['departments', 'budgets', 'transactions', 'projects', 'overheadAllocations'],
   );
 
   const billableDepartments = useMemo(() => {
@@ -167,8 +168,8 @@ export function CostingPricing() {
       if (dp) {
         const mapped = mapDepartmentProfitability(dp);
         if (d.budget != null && (mapped.budget == null || mapped.budget === 0)) {
-          mapped.budget = Number(d.budget);
-          const spent = mapped.budgetSpent || mapped.directCosts;
+          mapped.budget = Number(d.budget) * mapped.periodMonths;
+          const spent = mapped.budgetSpent ?? mapped.directCosts;
           mapped.budgetRemaining = Math.max(0, mapped.budget - spent);
           mapped.budgetUtilization = mapped.budget > 0 ? (spent / mapped.budget) * 100 : 0;
         }
@@ -180,6 +181,7 @@ export function CostingPricing() {
           name: d.name,
           costPerHour: null,
           directCostPerHour: null,
+          directCostPerMinute: null,
           costPerMinute: null,
           headcount: 0,
           monthlyRevenue: 0,
@@ -187,7 +189,7 @@ export function CostingPricing() {
           directCosts: 0,
           allocatedOverhead: 0,
           profit: 0,
-          margin: 0,
+          margin: null,
           utilization: null,
           totalHours: null,
           billableHours: 0,
@@ -198,6 +200,8 @@ export function CostingPricing() {
           standardRate: null,
           capacityBasis: 'none',
           policyVersion: 'v1.2-costing',
+          periodLabel: 'Current Month',
+          periodMonths: 1,
         });
       }
     }
@@ -211,6 +215,8 @@ export function CostingPricing() {
     return rows;
   }, [allDepartments, deptProfit]);
 
+  const activePeriodLabel = billableDepartments[0]?.periodLabel || 'Current Month';
+
   // ── 2. Project Profitability ────────────────────────────────────────────
   const {
     data: projectProfit,
@@ -218,55 +224,254 @@ export function CostingPricing() {
     refetch: refetchProjects,
   } = useServiceArray(
     () => svc.projects.getProfitability(),
-    [svc.orgId]
+    [svc.orgId],
   );
 
-  // ── 3. Overhead Allocations ─────────────────────────────────────────────
+  // ── 3. Overhead Allocations & Frozen Allocation Runs ────────────────────
   const {
     data: allocations,
     loading: allocLoading,
     refetch: refetchAlloc,
   } = useServiceArray(
     () => svc.costing.getOverheadAllocations(),
-    [svc.orgId]
+    [svc.orgId],
   );
 
-  // ── 4. Commission Structures ───────────────────────────────────────────
+  const {
+    data: allocationRuns,
+    refetch: refetchRuns,
+  } = useServiceArray(
+    () => svc.costing.getAllocationRuns(),
+    [svc.orgId],
+  );
+
+  const [freezingRun, setFreezingRun] = useState(false);
+
+  // ── 4. Saved Quotes (§14) ───────────────────────────────────────────────
+  const {
+    data: savedQuotes,
+    refetch: refetchQuotes,
+  } = useServiceArray(
+    () => svc.costing.getQuotes(),
+    [svc.orgId],
+  );
+
+  // ── 5. Commission Structures ────────────────────────────────────────────
   const {
     data: commissions,
-    loading: commLoading,
+    error: commError,
     refetch: refetchComm,
   } = useServiceArray(
     () => svc.costing.getCommissionStructures(),
-    [svc.orgId]
+    [svc.orgId],
   );
 
-  // ── 5. Exchange Rates ───────────────────────────────────────────────────
+  // ── 6. Exchange Rates (Org overrides merged with DB baselines) ──────────
   const { data: exchangeRates } = useServiceArray(
     () => svc.costing.getExchangeRates(),
-    [svc.orgId]
+    [svc.orgId],
   );
 
-  // ── Quote Profitability Checker State ───────────────────────────────────
+  // ── Quote Profitability Checker State (§14) ─────────────────────────────
+  const [quoteName, setQuoteName] = useState('');
+  const [quoteClient, setQuoteClient] = useState('');
   const [quoteAmount, setQuoteAmount] = useState('100000');
   const [estimatedHours, setEstimatedHours] = useState('120');
+  const [directPurchasesAmt, setDirectPurchasesAmt] = useState('0');
+  const [contingencyPct, setContingencyPct] = useState('0');
+  const [targetMarginPct, setTargetMarginPct] = useState('25');
   const [selectedDept, setSelectedDept] = useState('');
+  const [editingQuoteId, setEditingQuoteId] = useState<string | null>(null);
+  const [quoteSaving, setQuoteSaving] = useState(false);
+  const [remoteQuoteCalc, setRemoteQuoteCalc] = useState<QuoteCalculationResult | null>(null);
 
-  // Auto-select first billable department when loaded
+  // Auto-select first department WITH a defined loaded costPerHour (fallback to first dept only if none have rates)
   useEffect(() => {
     if (billableDepartments.length > 0) {
-      if (!selectedDept || !billableDepartments.some(d => d.id === selectedDept)) {
-        setSelectedDept(billableDepartments[0].id);
+      const hasCurrent = billableDepartments.some(d => d.id === selectedDept);
+      if (!selectedDept || !hasCurrent) {
+        const firstDefined = billableDepartments.find(d => d.costPerHour != null);
+        setSelectedDept(firstDefined ? firstDefined.id : billableDepartments[0].id);
       }
     }
   }, [billableDepartments, selectedDept]);
+
+  const selectedDeptObj = useMemo(
+    () => billableDepartments.find(d => d.id === selectedDept) || null,
+    [billableDepartments, selectedDept],
+  );
+
+  // Build canonical §14 Quote Input payload
+  const quotePayload = useMemo(() => {
+    if (!selectedDeptObj || selectedDeptObj.costPerHour == null) return null;
+    const hours = parseFloat(estimatedHours);
+    const revenue = parseFloat(quoteAmount);
+    const purchases = Math.max(0, parseFloat(directPurchasesAmt) || 0);
+    const contPct = Math.max(0, parseFloat(contingencyPct) || 0);
+    const tMargin = parseFloat(targetMarginPct);
+
+    if (!Number.isFinite(hours) || hours <= 0) return null;
+    if (!Number.isFinite(revenue) || revenue < 0) return null;
+
+    return {
+      roleEstimates: [
+        {
+          id: 'dept-primary',
+          roleName: selectedDeptObj.name,
+          departmentId: selectedDeptObj.id,
+          estimatedHours: hours,
+          costRate: selectedDeptObj.costPerHour,
+        },
+      ],
+      directPurchases: purchases > 0
+        ? [{ id: 'dp-1', description: 'Direct external purchases', amount: purchases, currency }]
+        : [],
+      overheadAmount: 0, // Already embedded in dept's loaded costPerHour — zero double-counting (§12.1)
+      contingencyPercent: contPct,
+      proposedPrice: revenue,
+      targetMarginPercent: Number.isFinite(tMargin) ? tMargin : 25,
+      targetMarkupPercent: Number.isFinite(tMargin) && tMargin >= 0 && tMargin < 100
+        ? Math.round(((tMargin / (100 - tMargin)) * 100) * 100) / 100
+        : 33.33,
+    };
+  }, [selectedDeptObj, estimatedHours, quoteAmount, directPurchasesAmt, contingencyPct, targetMarginPct, currency]);
+
+  // Immediate preview from service engine + authoritative reconciliation from backend POST /quotes/calculate
+  const localQuoteCalc = useMemo(() => {
+    if (!quotePayload) return null;
+    return svc.costing.calculateQuote(quotePayload);
+  }, [quotePayload, svc.costing]);
+
+  useEffect(() => {
+    if (!quotePayload || !svc.isReady) {
+      setRemoteQuoteCalc(null);
+      return;
+    }
+    const targetM = quotePayload.targetMarginPercent;
+    if (!Number.isFinite(targetM) || targetM < 0 || targetM >= 100) {
+      setRemoteQuoteCalc(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const res = await svc.costing.calculateQuoteRemote(quotePayload);
+        if (!cancelled && res.success && res.data) {
+          setRemoteQuoteCalc(res.data);
+        }
+      } catch {
+        /* local preview already matches server formula */
+      }
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [quotePayload, svc]);
+
+  const activeQuoteCalc = remoteQuoteCalc ?? localQuoteCalc;
+
+  const handleSaveQuote = async () => {
+    if (!quotePayload || !selectedDeptObj || !activeQuoteCalc) {
+      toast.error('Select a department with a valid cost rate and enter valid quote parameters.');
+      return;
+    }
+    if (!activeQuoteCalc.isTargetMarginValid) {
+      toast.error('Target margin must be between 0% and 99.99%.');
+      return;
+    }
+    const projectName = quoteName.trim() || `${selectedDeptObj.name} Quote (${estimatedHours}h)`;
+    setQuoteSaving(true);
+    try {
+      const res = await svc.costing.saveQuote({
+        id: editingQuoteId || undefined,
+        departmentId: selectedDeptObj.id,
+        clientName: quoteClient.trim() || 'Prospective Client',
+        projectName,
+        currency,
+        overheadMethod: currentAllocationMethod,
+        ...quotePayload,
+        versionNotes: editingQuoteId ? 'Updated quote parameters' : 'Initial baseline quote',
+      });
+      if (res.success && res.data) {
+        toast.success(editingQuoteId ? `Saved new quote version ${res.data.currentVersion}` : `Quote saved (${res.data.currentVersion})`);
+        setEditingQuoteId(res.data.id);
+        setQuoteName(res.data.projectName);
+        await refetchQuotes();
+      } else {
+        toast.error(res.error || 'Failed to save quote');
+      }
+    } catch {
+      toast.error('Failed to save quote');
+    } finally {
+      setQuoteSaving(false);
+    }
+  };
+
+  const handleLoadQuote = (q: Quote) => {
+    setEditingQuoteId(q.id);
+    setQuoteName(q.projectName);
+    setQuoteClient(q.clientName);
+    setQuoteAmount(String(q.proposedPrice));
+    const firstRole = q.roleEstimates?.[0];
+    if (firstRole?.estimatedHours) setEstimatedHours(String(firstRole.estimatedHours));
+    if (q.departmentId && billableDepartments.some(d => d.id === q.departmentId)) {
+      setSelectedDept(q.departmentId);
+    }
+    const purchTotal = (q.directPurchases || []).reduce((s, p) => s + Number(p.amount || 0), 0);
+    setDirectPurchasesAmt(String(purchTotal));
+    setContingencyPct(String(q.contingencyPercent || 0));
+    setTargetMarginPct(String(q.targetMarginPercent ?? 25));
+    toast.info(`Loaded quote "${q.projectName}" (${q.currentVersion})`);
+  };
+
+  const handleDeleteQuote = async (id: string) => {
+    if (!confirm('Delete this saved quote and its version history?')) return;
+    const res = await svc.costing.deleteQuote(id);
+    if (res.success) {
+      toast.success('Quote deleted');
+      if (editingQuoteId === id) setEditingQuoteId(null);
+      await refetchQuotes();
+    } else {
+      toast.error(res.error || 'Failed to delete quote');
+    }
+  };
+
+  const handleExportQuoteCsv = (q: Quote) => {
+    const rows = [
+      ['Field', 'Value'],
+      ['Quote ID', q.id],
+      ['Version', q.currentVersion],
+      ['Client', q.clientName],
+      ['Project / Quote Name', q.projectName],
+      ['Currency', q.currency],
+      ['Estimated Direct Labor', q.estimatedDirectLabor.toFixed(2)],
+      ['Direct Purchases', (q.directPurchasesTotal ?? 0).toFixed(2)],
+      ['Contingency', `${q.contingencyAmount.toFixed(2)} (${q.contingencyPercent}%)`],
+      ['Estimated Total Cost', q.estimatedTotalCost.toFixed(2)],
+      ['Proposed Price', q.proposedPrice.toFixed(2)],
+      ['Expected Profit', q.profitAmount.toFixed(2)],
+      ['Margin %', q.marginPercent != null ? `${q.marginPercent.toFixed(2)}%` : 'Undefined'],
+      ['Markup %', q.markupPercent != null ? `${q.markupPercent.toFixed(2)}%` : 'Undefined'],
+      ['Target Margin %', `${q.targetMarginPercent}%`],
+      ['Required Price for Target Margin', q.requiredPriceForTargetMargin != null ? q.requiredPriceForTargetMargin.toFixed(2) : 'Undefined'],
+      ['Revenue Recognized', 'false (Non-posting Quote)'],
+    ];
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${q.projectName.replace(/[^a-z0-9_-]+/gi, '_')}_${q.currentVersion}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
 
   // ── Commission Calculator State ─────────────────────────────────────────
   const [selectedCommissionId, setSelectedCommissionId] = useState<string>('');
   const [dealAmount, setDealAmount] = useState('10000');
   const [customFxRate, setCustomFxRate] = useState<number | null>(null);
 
-  // Auto-select first commission structure when loaded
   useEffect(() => {
     if (commissions.length > 0 && !selectedCommissionId) {
       setSelectedCommissionId(commissions[0].id);
@@ -277,41 +482,55 @@ export function CostingPricing() {
     return commissions.find(c => c.id === selectedCommissionId) || commissions[0] || null;
   }, [commissions, selectedCommissionId]);
 
-  // Resolve FX Rate from exchange_rates table against active bank account currency
-  const activeFxRate = useMemo(() => {
-    if (customFxRate != null) return customFxRate;
-    if (!selectedCommission) return 1;
+  // Resolve FX Rate with explicit provenance (never mislabel manual or fallback rates as "Live")
+  const fxResolution = useMemo((): { rate: number; sourceLabel: string } => {
+    if (customFxRate != null) {
+      return { rate: Math.max(0, customFxRate), sourceLabel: 'Manual Override' };
+    }
+    if (!selectedCommission) return { rate: 1, sourceLabel: 'Identity' };
     const from = selectedCommission.currency.toUpperCase();
     const to = currency.toUpperCase();
-    if (from === to) return 1;
+    if (from === to) return { rate: 1, sourceLabel: 'Same Currency' };
 
-    // 1. Direct match in exchangeRates table
     const direct = exchangeRates.find(r => r.base.toUpperCase() === from && r.quote.toUpperCase() === to);
-    if (direct && direct.rate > 0) return direct.rate;
+    if (direct && direct.rate > 0) {
+      const label = direct.organizationId
+        ? 'Org Override'
+        : direct.source === 'system_baseline'
+          ? 'Baseline'
+          : 'DB Rate';
+      return { rate: direct.rate, sourceLabel: label };
+    }
 
-    // 2. Inverse match in exchangeRates table
     const inverse = exchangeRates.find(r => r.base.toUpperCase() === to && r.quote.toUpperCase() === from);
-    if (inverse && inverse.rate > 0) return Math.round((1 / inverse.rate) * 10000) / 10000;
-
-    // 3. Standard fallback cross rates to USD
-    if (to === 'USD') {
-      if (from === 'AED') return 0.2723;
-      if (from === 'EUR') return 1.086;
-      if (from === 'GBP') return 1.28;
-      if (from === 'PKR') return 0.0036;
-    }
-    // 4. Standard fallback cross rates to PKR
-    if (to === 'PKR') {
-      if (from === 'USD') return 278;
-      if (from === 'AED') return 76;
-      if (from === 'EUR') return 302;
-      if (from === 'GBP') return 355;
+    if (inverse && inverse.rate > 0) {
+      const label = inverse.organizationId ? 'Org Inverse' : 'DB Inverse';
+      return { rate: Math.round((1 / inverse.rate) * 10000) / 10000, sourceLabel: label };
     }
 
-    return 1;
+    // Cross-convert via USD through available DB rates
+    const fromToUsd = exchangeRates.find(r => r.base.toUpperCase() === from && r.quote.toUpperCase() === 'USD')?.rate
+      ?? (() => {
+        const inv = exchangeRates.find(r => r.base.toUpperCase() === 'USD' && r.quote.toUpperCase() === from)?.rate;
+        return inv && inv > 0 ? 1 / inv : null;
+      })();
+    const usdToTarget = to === 'USD'
+      ? 1
+      : exchangeRates.find(r => r.base.toUpperCase() === 'USD' && r.quote.toUpperCase() === to)?.rate
+        ?? (() => {
+          const inv = exchangeRates.find(r => r.base.toUpperCase() === to && r.quote.toUpperCase() === 'USD')?.rate;
+          return inv && inv > 0 ? 1 / inv : null;
+        })();
+
+    if (fromToUsd && usdToTarget) {
+      return { rate: Math.round(fromToUsd * usdToTarget * 10000) / 10000, sourceLabel: 'Cross Rate' };
+    }
+
+    return { rate: 1, sourceLabel: 'Unconfigured (1.0)' };
   }, [customFxRate, selectedCommission, exchangeRates, currency]);
 
-  // Reset custom FX rate when selected commission changes
+  const activeFxRate = fxResolution.rate;
+
   useEffect(() => {
     setCustomFxRate(null);
   }, [selectedCommissionId]);
@@ -332,39 +551,22 @@ export function CostingPricing() {
   const [showMethodModal, setShowMethodModal] = useState(false);
   const [showAllocModal, setShowAllocModal] = useState(false);
   const [editingAllocId, setEditingAllocId] = useState<string | null>(null);
-  const [allocForm, setAllocForm] = useState({
+  const [allocForm, setAllocForm] = useState<{
+    name: string;
+    amount: string;
+    allocationBase: OverheadAllocationBase;
+    isOperating: boolean;
+    deptWeights: Record<string, string>;
+  }>({
     name: '',
     amount: '30000',
-    allocationBase: 'headcount' as OverheadAllocation['allocationBase'],
+    allocationBase: 'headcount',
+    isOperating: true,
+    deptWeights: {},
   });
   const [allocSubmitting, setAllocSubmitting] = useState(false);
 
-  // Calculate quote profit
-  const quoteAnalysis = useMemo(() => {
-    if (!quoteAmount || !estimatedHours) return null;
-    const dept = billableDepartments.find(d => d.id === selectedDept);
-    if (!dept || dept.costPerHour == null) return null;
-
-    const hours = parseFloat(estimatedHours);
-    const revenue = parseFloat(quoteAmount);
-    if (!Number.isFinite(hours) || !Number.isFinite(revenue) || revenue <= 0 || hours <= 0) return null;
-
-    const cost = dept.costPerHour * hours;
-    const profit = revenue - cost;
-    const margin = revenue > 0 ? (profit / revenue) * 100 : 0;
-
-    return {
-      cost,
-      revenue,
-      profit,
-      margin,
-      isProfitable: margin > 20,
-      deptName: dept.name,
-      costPerHour: dept.costPerHour,
-    };
-  }, [quoteAmount, estimatedHours, selectedDept, billableDepartments]);
-
-  // Calculate commission breakdown
+  // Commission breakdown (multiplicative: Middleman % deducted from your gross share)
   const commissionBreakdown = useMemo(() => {
     if (!selectedCommission || !dealAmount) return null;
     const amount = parseFloat(dealAmount);
@@ -372,11 +574,12 @@ export function CostingPricing() {
 
     const yourSplitPct = selectedCommission.yourProfitPercentage;
     const middlemanPct = selectedCommission.middlemanPercentage;
+    const safeFx = Math.max(0, activeFxRate);
 
-    const yourGrossShare = (amount * yourSplitPct) / 100;
-    const middlemanCut = (yourGrossShare * middlemanPct) / 100;
-    const yourNetShare = yourGrossShare - middlemanCut;
-    const inBaseCurrency = yourNetShare * activeFxRate;
+    const yourGrossShare = Math.round(((amount * yourSplitPct) / 100) * 100) / 100;
+    const middlemanCut = Math.round(((yourGrossShare * middlemanPct) / 100) * 100) / 100;
+    const yourNetShare = Math.round((yourGrossShare - middlemanCut) * 100) / 100;
+    const inBaseCurrency = Math.round((yourNetShare * safeFx) * 100) / 100;
 
     return {
       dealAmount: amount,
@@ -387,7 +590,7 @@ export function CostingPricing() {
       middlemanCut,
       yourNetShare,
       inBaseCurrency,
-      effectiveMarginPct: amount > 0 ? (yourNetShare / amount) * 100 : 0,
+      effectiveMarginPct: amount > 0 ? (yourNetShare / amount) * 100 : null,
     };
   }, [selectedCommission, dealAmount, activeFxRate]);
 
@@ -425,19 +628,14 @@ export function CostingPricing() {
     const yourSplit = parseFloat(commissionForm.yourProfitPercentage);
     const middleman = parseFloat(commissionForm.middlemanPercentage);
 
-    if (isNaN(yourSplit) || yourSplit < 0 || yourSplit > 100) {
+    // Multiplicative model: Net = Deal × (yourSplit/100) × (1 - middleman/100)
+    // Both percentages are independently valid in [0%, 100%].
+    if (!Number.isFinite(yourSplit) || yourSplit < 0 || yourSplit > 100) {
       toast.error('Your split percentage must be between 0% and 100%');
       return;
     }
-    if (isNaN(middleman) || middleman < 0 || middleman > 100) {
+    if (!Number.isFinite(middleman) || middleman < 0 || middleman > 100) {
       toast.error('Middleman cut must be between 0% and 100%');
-      return;
-    }
-    // Validation constraint
-    if (yourSplit + middleman > 100) {
-      toast.error(
-        `Total split cannot exceed 100% (Your split: ${yourSplit}%, Middleman cut: ${middleman}%, Sum: ${yourSplit + middleman}%)`
-      );
       return;
     }
 
@@ -475,7 +673,7 @@ export function CostingPricing() {
           toast.error(res.error || 'Failed to create commission structure');
         }
       }
-    } catch (err) {
+    } catch {
       toast.error('Failed to save commission structure');
     } finally {
       setCommissionSubmitting(false);
@@ -503,13 +701,13 @@ export function CostingPricing() {
   };
 
   // Overhead Allocation Handlers
-  const handleApplyMethod = async (method: OverheadAllocation['allocationBase']) => {
+  const handleApplyMethod = async (method: OverheadAllocationBase) => {
     try {
       const res = await svc.costing.setAllocationMethod(method);
       if (res.success) {
-        toast.success(`Overhead allocation method updated to By ${method.replace('_', ' ')}`);
+        toast.success(`Overhead allocation method updated to By ${method.replace(/_/g, ' ')}`);
         setShowMethodModal(false);
-        await Promise.all([refetchAlloc(), refetchDept()]);
+        await Promise.all([refetchAlloc(), refetchDept(), refetchProjects()]);
       } else {
         toast.error(res.error || 'Failed to update allocation method');
       }
@@ -518,12 +716,45 @@ export function CostingPricing() {
     }
   };
 
+  const handleFreezeAllocationRun = async () => {
+    setFreezingRun(true);
+    try {
+      const res = await svc.costing.freezeAllocationRun({ period: costingPeriod });
+      if (res.success && res.data) {
+        toast.success(`Frozen allocation snapshot (${res.data.periodStart} to ${res.data.periodEnd})`);
+        await refetchRuns();
+      } else {
+        toast.error(res.error || 'Failed to freeze allocation run');
+      }
+    } catch {
+      toast.error('Failed to freeze allocation run');
+    } finally {
+      setFreezingRun(false);
+    }
+  };
+
+  const buildInitialDeptWeights = useCallback(
+    (existing?: OverheadAllocation['departments']): Record<string, string> => {
+      const map: Record<string, string> = {};
+      const count = Math.max(1, billableDepartments.length);
+      const defaultPct = (100 / count).toFixed(1);
+      for (const d of billableDepartments) {
+        const match = existing?.find(x => x.departmentId === d.id);
+        map[d.id] = match != null ? String(match.percentage ?? match.weight ?? 0) : defaultPct;
+      }
+      return map;
+    },
+    [billableDepartments],
+  );
+
   const openNewAllocModal = () => {
     setEditingAllocId(null);
     setAllocForm({
       name: '',
       amount: '35000',
       allocationBase: allocations[0]?.allocationBase || 'headcount',
+      isOperating: true,
+      deptWeights: buildInitialDeptWeights(),
     });
     setShowAllocModal(true);
   };
@@ -534,9 +765,20 @@ export function CostingPricing() {
       name: alloc.name,
       amount: (alloc.amount || 0).toString(),
       allocationBase: alloc.allocationBase || 'headcount',
+      isOperating: alloc.isOperating !== false,
+      deptWeights: buildInitialDeptWeights(alloc.departments),
     });
     setShowAllocModal(true);
   };
+
+  const needsDepartmentWeights =
+    allocForm.allocationBase === 'manual_weight' ||
+    allocForm.allocationBase === 'department_ratio' ||
+    allocForm.allocationBase === 'custom';
+
+  const customWeightsTotal = useMemo(() => {
+    return Object.values(allocForm.deptWeights).reduce((s, v) => s + (parseFloat(v) || 0), 0);
+  }, [allocForm.deptWeights]);
 
   const handleSaveAlloc = async () => {
     const name = allocForm.name.trim();
@@ -545,8 +787,20 @@ export function CostingPricing() {
       return;
     }
     const amt = parseFloat(allocForm.amount);
-    if (isNaN(amt) || amt < 0) {
-      toast.error('Amount must be a positive number');
+    if (!Number.isFinite(amt) || amt < 0) {
+      toast.error('Amount must be a non-negative number');
+      return;
+    }
+
+    const departmentsPayload = needsDepartmentWeights
+      ? billableDepartments.map(d => ({
+          departmentId: d.id,
+          percentage: Math.max(0, parseFloat(allocForm.deptWeights[d.id] || '0') || 0),
+        }))
+      : [];
+
+    if (allocForm.allocationBase === 'custom' && departmentsPayload.length > 0 && Math.abs(customWeightsTotal - 100) > 0.05) {
+      toast.error(`Custom department percentages must total 100% (currently ${customWeightsTotal.toFixed(1)}%)`);
       return;
     }
 
@@ -557,11 +811,13 @@ export function CostingPricing() {
           name,
           amount: amt,
           allocationBase: allocForm.allocationBase,
+          isOperating: allocForm.isOperating,
+          departments: departmentsPayload,
         });
         if (res.success) {
           toast.success('Overhead pool updated');
           setShowAllocModal(false);
-          await Promise.all([refetchAlloc(), refetchDept()]);
+          await Promise.all([refetchAlloc(), refetchDept(), refetchProjects()]);
         } else {
           toast.error(res.error || 'Failed to update allocation');
         }
@@ -570,13 +826,14 @@ export function CostingPricing() {
           name,
           amount: amt,
           allocationBase: allocForm.allocationBase,
+          isOperating: allocForm.isOperating,
           accountIds: [],
-          departments: [],
+          departments: departmentsPayload,
         });
         if (res.success) {
           toast.success('New overhead pool created');
           setShowAllocModal(false);
-          await Promise.all([refetchAlloc(), refetchDept()]);
+          await Promise.all([refetchAlloc(), refetchDept(), refetchProjects()]);
         } else {
           toast.error(res.error || 'Failed to create allocation');
         }
@@ -594,7 +851,7 @@ export function CostingPricing() {
       const res = await svc.costing.deleteOverheadAllocation(id);
       if (res.success) {
         toast.success('Overhead pool deleted');
-        await Promise.all([refetchAlloc(), refetchDept()]);
+        await Promise.all([refetchAlloc(), refetchDept(), refetchProjects()]);
       } else {
         toast.error(res.error || 'Failed to delete');
       }
@@ -603,21 +860,44 @@ export function CostingPricing() {
     }
   };
 
-  const getMarginBadge = (margin: number, cost = 0) => {
-    if (margin > 30) return AXIOM.badges.success;
-    if (margin > 20) return AXIOM.badges.info;
-    if (margin > 0) return AXIOM.badges.warning;
-    if (margin === 0 && cost === 0) {
+  const getMarginBadge = (margin: number | null) => {
+    if (margin == null) {
       return {
         background: 'rgba(148, 163, 184, 0.15)',
         color: '#94a3b8',
         border: '1px solid rgba(148, 163, 184, 0.3)',
       };
     }
+    if (margin > 30) return AXIOM.badges.success;
+    if (margin > 20) return AXIOM.badges.info;
+    if (margin > 0) return AXIOM.badges.warning;
     return AXIOM.badges.danger;
   };
 
-  const currentAllocationMethod = allocations[0]?.allocationBase || 'headcount';
+  const operatingAllocations = useMemo(
+    () => allocations.filter(a => a.isOperating !== false),
+    [allocations],
+  );
+
+  const uniqueBases = useMemo(() => {
+    const set = new Set(operatingAllocations.map(a => a.allocationBase || 'headcount'));
+    return Array.from(set);
+  }, [operatingAllocations]);
+
+  const currentAllocationMethod: OverheadAllocationBase = (uniqueBases[0] as OverheadAllocationBase) || 'headcount';
+  const activeDistributionLabel =
+    uniqueBases.length === 0
+      ? 'No active pools'
+      : uniqueBases.length === 1
+        ? `By ${uniqueBases[0].replace(/_/g, ' ')}`
+        : `Mixed (${uniqueBases.map(b => b.replace(/_/g, ' ')).join(', ')})`;
+
+  const totalMonthlyOperatingPools = useMemo(
+    () => operatingAllocations.reduce((sum, a) => sum + (Number(a.amount) || 0), 0),
+    [operatingAllocations],
+  );
+
+  const latestFrozenRun = allocationRuns[0] || null;
 
   return (
     <div className="min-h-screen p-8 space-y-6" style={{ background: AXIOM.backgrounds.main }}>
@@ -648,19 +928,44 @@ export function CostingPricing() {
 
       {/* ── 1. Department Cost Rates ─────────────────────────────────────── */}
       <div>
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <div>
             <h2 className="text-2xl font-bold text-white">Department cost rates</h2>
             <p className="text-xs text-slate-400">
-              Computed from direct debits + allocated overhead across active team capacity
+              Computed from direct costs + allocated operating overhead across fixed 160h/mo FTE capacity · Period:{' '}
+              <span className="text-cyan-300 font-medium">{activePeriodLabel}</span> ({currency})
             </p>
           </div>
-          <button
-            onClick={() => Promise.all([refetchDept(), refetchAllDepts()])}
-            className="text-xs text-cyan-400 hover:text-cyan-300 font-medium px-3 py-1.5 rounded-lg border border-cyan-500/30 hover:border-cyan-500/50"
-          >
-            Refresh Rates
-          </button>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center rounded-lg border border-slate-700/70 bg-slate-900/60 p-0.5 text-xs">
+              {(
+                [
+                  { id: '1M', label: 'Current Month' },
+                  { id: '3M', label: '3M' },
+                  { id: '1Y', label: '1Y' },
+                  { id: 'ALL', label: 'All Time' },
+                ] as Array<{ id: CostingPeriodKey; label: string }>
+              ).map(p => (
+                <button
+                  key={p.id}
+                  onClick={() => setCostingPeriod(p.id)}
+                  className={`px-2.5 py-1 rounded-md font-medium transition-colors ${
+                    costingPeriod === p.id
+                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => Promise.all([refetchDept(), refetchAllDepts()])}
+              className="text-xs text-cyan-400 hover:text-cyan-300 font-medium px-3 py-1.5 rounded-lg border border-cyan-500/30 hover:border-cyan-500/50"
+            >
+              Refresh Rates
+            </button>
+          </div>
         </div>
 
         {deptError && (
@@ -695,8 +1000,8 @@ export function CostingPricing() {
               <div>
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-white font-semibold text-lg">{dept.name}</h3>
-                  <span className="px-2 py-1 rounded-lg text-xs font-medium" style={getMarginBadge(dept.margin, dept.monthlyCost)}>
-                    {dept.margin.toFixed(1)}% margin
+                  <span className="px-2 py-1 rounded-lg text-xs font-medium" style={getMarginBadge(dept.margin)}>
+                    {dept.margin != null ? `${dept.margin.toFixed(1)}% margin` : 'N/A margin'}
                   </span>
                 </div>
 
@@ -706,11 +1011,11 @@ export function CostingPricing() {
                     {dept.costPerHour != null ? (
                       <>
                         <p className="text-xl font-bold text-white">
-                          {formatCurrency(dept.costPerHour, currency)}
+                          {formatCurrency(dept.costPerHour, currency, DEC2)}
                         </p>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          {dept.costPerMinute != null ? `${formatCurrency(dept.costPerMinute, currency)}/min` : ''}
-                          {dept.directCostPerHour != null ? ` · Direct ${formatCurrency(dept.directCostPerHour, currency)}/hr` : ''}
+                          {dept.costPerMinute != null ? `${formatCurrency(dept.costPerMinute, currency, DEC2)}/min` : ''}
+                          {dept.directCostPerHour != null ? ` · Direct ${formatCurrency(dept.directCostPerHour, currency, DEC2)}/hr` : ''}
                         </p>
                       </>
                     ) : (
@@ -741,24 +1046,28 @@ export function CostingPricing() {
                   </span>
                   <span className="text-slate-200 font-medium">
                     {dept.totalHours != null && dept.headcount > 0
-                      ? `${dept.totalHours} hrs/mo (${dept.headcount} × 160h)`
+                      ? dept.periodMonths > 1
+                        ? `${dept.totalHours} hrs (${dept.headcount} × 160h × ${dept.periodMonths}mo)`
+                        : `${dept.totalHours} hrs/mo (${dept.headcount} × 160h)`
                       : '0 hrs/mo (No staff)'}
                   </span>
                   <span className="text-slate-400">|</span>
-                  <span className="text-slate-400">Timesheets:</span>
+                  <span className="text-slate-400">Scheduled Allocation:</span>
                   <span className="text-cyan-300 font-medium">
-                    {dept.billableHours > 0 
-                      ? `${dept.billableHours}h (${dept.utilization ?? 0}% billable)` 
-                      : dept.utilization != null 
-                      ? `${dept.utilization}% billable` 
-                      : 'No timesheet yet'}
+                    {dept.utilization != null
+                      ? `${dept.billableHours}h (${dept.utilization}% utilized)`
+                      : dept.billableHours > 0
+                        ? `${dept.billableHours}h (N/A — no staff)`
+                        : '0h allocated'}
                   </span>
                 </div>
 
                 {/* Department Budget Tracking */}
                 <div className="mb-4 p-3 rounded-xl bg-slate-900/60 border border-slate-700/60">
                   <div className="flex items-center justify-between text-xs mb-1.5">
-                    <span className="text-slate-400 font-medium">Department Budget</span>
+                    <span className="text-slate-400 font-medium">
+                      Department Budget{dept.periodMonths > 1 ? ` (${dept.periodMonths}mo)` : ''}
+                    </span>
                     <span className="text-white font-semibold">
                       {dept.budget != null && dept.budget > 0
                         ? formatCurrency(dept.budget, currency)
@@ -770,23 +1079,29 @@ export function CostingPricing() {
                       <div className="h-1.5 w-full bg-slate-800 rounded-full overflow-hidden mb-1.5">
                         <div
                           className={`h-full rounded-full transition-all ${
-                            (dept.budgetSpent ?? dept.monthlyCost) > dept.budget
+                            (dept.budgetSpent ?? dept.directCosts) > dept.budget
                               ? 'bg-red-500'
-                              : (dept.budgetSpent ?? dept.monthlyCost) > dept.budget * 0.8
-                              ? 'bg-amber-400'
-                              : 'bg-emerald-400'
+                              : (dept.budgetSpent ?? dept.directCosts) > dept.budget * 0.8
+                                ? 'bg-amber-400'
+                                : 'bg-emerald-400'
                           }`}
-                          style={{ width: `${Math.min(100, Math.max(0, !isNaN(dept.budgetSpent ?? dept.monthlyCost) && dept.budget > 0 ? (((dept.budgetSpent ?? dept.monthlyCost) / dept.budget) * 100) : 0))}%` }}
+                          style={{
+                            width: `${Math.min(
+                              100,
+                              Math.max(0, dept.budget > 0 ? (((dept.budgetSpent ?? dept.directCosts) / dept.budget) * 100) : 0),
+                            )}%`,
+                          }}
                         />
                       </div>
                       <div className="flex items-center justify-between text-[11px]">
-                        <span className={(dept.budgetSpent ?? dept.monthlyCost) > dept.budget ? 'text-red-400 font-medium' : 'text-slate-400'}>
-                          {formatCurrency(dept.budgetSpent ?? dept.monthlyCost, currency)} spent ({!isNaN(dept.budgetSpent ?? dept.monthlyCost) && dept.budget > 0 ? (((dept.budgetSpent ?? dept.monthlyCost) / dept.budget) * 100).toFixed(0) : '0'}%)
+                        <span className={(dept.budgetSpent ?? dept.directCosts) > dept.budget ? 'text-red-400 font-medium' : 'text-slate-400'}>
+                          {formatCurrency(dept.budgetSpent ?? dept.directCosts, currency)} spent (
+                          {dept.budget > 0 ? (((dept.budgetSpent ?? dept.directCosts) / dept.budget) * 100).toFixed(0) : '0'}%)
                         </span>
-                        <span className={(dept.budgetSpent ?? dept.monthlyCost) > dept.budget ? 'text-red-400 font-semibold' : 'text-emerald-400 font-medium'}>
-                          {(dept.budgetSpent ?? dept.monthlyCost) > dept.budget
-                            ? `Exceeded by ${formatCurrency((dept.budgetSpent ?? dept.monthlyCost) - dept.budget, currency)}`
-                            : `${formatCurrency(dept.budget - (dept.budgetSpent ?? dept.monthlyCost), currency)} remaining`}
+                        <span className={(dept.budgetSpent ?? dept.directCosts) > dept.budget ? 'text-red-400 font-semibold' : 'text-emerald-400 font-medium'}>
+                          {(dept.budgetSpent ?? dept.directCosts) > dept.budget
+                            ? `Exceeded by ${formatCurrency((dept.budgetSpent ?? dept.directCosts) - dept.budget, currency)}`
+                            : `${formatCurrency(dept.budget - (dept.budgetSpent ?? dept.directCosts), currency)} remaining`}
                         </span>
                       </div>
                     </>
@@ -820,8 +1135,11 @@ export function CostingPricing() {
                   </span>
                 </div>
                 <div className="flex items-center justify-between pt-1 text-[10px] text-slate-500">
-                  <span>Basis: {dept.capacityBasis || 'none'}</span>
-                  <span>{dept.policyVersion || 'v1.2-costing'}</span>
+                  <span>
+                    Basis: {dept.capacityBasis}
+                    {dept.laborCostSource && dept.laborCostSource !== 'none' ? ` · ${dept.laborCostSource}` : ''}
+                  </span>
+                  <span>{dept.policyVersion}</span>
                 </div>
               </div>
             </motion.div>
@@ -850,7 +1168,7 @@ export function CostingPricing() {
             </div>
             <div>
               <h2 className="text-xl font-bold text-white">Projects</h2>
-              <p className="text-sm text-slate-400">Quoted vs actual margin from your project list</p>
+              <p className="text-sm text-slate-400">Quoted vs actual margin (and operating margin on recognized revenue)</p>
             </div>
           </div>
           <button
@@ -874,53 +1192,78 @@ export function CostingPricing() {
                   <th className="py-2.5 pr-4 font-medium">Client</th>
                   <th className="py-2.5 pr-4 font-medium text-right">Quoted Amount</th>
                   <th className="py-2.5 pr-4 font-medium text-right">Actual Cost</th>
-                  <th className="py-2.5 pr-4 font-medium text-right">Logged Hours</th>
-                  <th className="py-2.5 pr-4 font-medium text-right">Profit Margin</th>
+                  <th className="py-2.5 pr-4 font-medium text-right">Scheduled Hours</th>
+                  <th className="py-2.5 pr-4 font-medium text-right">Quote / Op. Margin</th>
                   <th className="py-2.5 pr-4 font-medium text-center">Status</th>
                 </tr>
               </thead>
               <tbody>
-                {projectProfit.map(p => (
-                  <tr key={p.projectId} className="border-b border-slate-800/80 text-slate-200 hover:bg-slate-800/30 transition-colors">
-                    <td className="py-3.5 pr-4 font-medium text-white">{p.projectName}</td>
-                    <td className="py-3.5 pr-4 text-slate-400">{p.clientName || 'Direct'}</td>
-                    <td className="py-3.5 pr-4 text-right tabular-nums font-medium">
-                      {formatCurrency(p.quotedAmount, currency)}
-                    </td>
-                    <td className="py-3.5 pr-4 text-right tabular-nums text-amber-300 font-medium">
-                      {formatCurrency(p.actualCost, currency)}
-                    </td>
-                    <td className="py-3.5 pr-4 text-right tabular-nums">
-                      <span className="font-semibold text-cyan-400 font-mono">
-                        {p.loggedHours != null ? `${p.loggedHours.toFixed(1)} hrs` : '0.0 hrs'}
-                      </span>
-                      {p.contributorCount ? (
-                        <span className="block text-[11px] text-slate-400">
-                          {p.contributorCount} {p.contributorCount === 1 ? 'member' : 'members'}
+                {projectProfit.map(p => {
+                  const pCurr = (p as any).currency || currency;
+                  const quoteMargin = p.quoteMarginPct ?? (p.quotedAmount > 0 ? Math.round(((p.quotedAmount - p.actualCost) / p.quotedAmount) * 1000) / 10 : null);
+                  const opMargin = p.operatingMarginPct !== undefined ? p.operatingMarginPct : p.profitMargin;
+                  const recognizedRev = Number(p.revenue ?? 0);
+                  const schedHours = p.elapsedHours ?? p.loggedHours ?? 0;
+
+                  return (
+                    <tr key={p.projectId} className="border-b border-slate-800/80 text-slate-200 hover:bg-slate-800/30 transition-colors">
+                      <td className="py-3.5 pr-4 font-medium text-white">{p.projectName}</td>
+                      <td className="py-3.5 pr-4 text-slate-400">{p.clientName || 'Direct'}</td>
+                      <td className="py-3.5 pr-4 text-right tabular-nums font-medium">
+                        {formatCurrency(p.quotedAmount, pCurr)}
+                      </td>
+                      <td className="py-3.5 pr-4 text-right tabular-nums text-amber-300 font-medium">
+                        {formatCurrency(p.actualCost, pCurr)}
+                      </td>
+                      <td className="py-3.5 pr-4 text-right tabular-nums">
+                        <span className="font-semibold text-cyan-400 font-mono">
+                          {schedHours.toFixed(1)} hrs
                         </span>
-                      ) : null}
-                    </td>
-                    <td
-                      className={`py-3.5 pr-4 text-right tabular-nums font-bold ${
-                        p.profitMargin >= 0 ? 'text-emerald-400' : 'text-red-400'
-                      }`}
-                    >
-                      {p.profitMargin.toFixed(1)}%
-                    </td>
-                    <td className="py-3.5 pr-4 text-center">
-                      <span className="px-2 py-0.5 rounded text-xs capitalize bg-slate-800 text-slate-300 border border-slate-700">
-                        {p.status || 'Active'}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
+                        {p.contributorCount ? (
+                          <span className="block text-[11px] text-slate-400">
+                            {p.contributorCount} {p.contributorCount === 1 ? 'member' : 'members'}
+                          </span>
+                        ) : null}
+                      </td>
+                      <td className="py-3.5 pr-4 text-right tabular-nums">
+                        <span
+                          className={`font-bold ${
+                            quoteMargin == null
+                              ? 'text-slate-400'
+                              : quoteMargin >= 0
+                                ? 'text-emerald-400'
+                                : 'text-red-400'
+                          }`}
+                        >
+                          {quoteMargin != null ? `${quoteMargin.toFixed(1)}%` : 'N/A'}
+                        </span>
+                        <span
+                          className={`block text-[11px] ${
+                            opMargin == null
+                              ? 'text-slate-500'
+                              : opMargin >= 0
+                                ? 'text-emerald-400/80'
+                                : 'text-red-400/80'
+                          }`}
+                        >
+                          Op: {opMargin != null ? `${opMargin.toFixed(1)}%` : 'N/A'} ({formatCurrency(recognizedRev, pCurr)} rev)
+                        </span>
+                      </td>
+                      <td className="py-3.5 pr-4 text-center">
+                        <span className="px-2 py-0.5 rounded text-xs capitalize bg-slate-800 text-slate-300 border border-slate-700">
+                          {p.status || 'Active'}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </motion.div>
 
-      {/* ── 3. Quote Profitability Checker ───────────────────────────────── */}
+      {/* ── 3. Quote Profitability Checker (§14 Backend-Backed) ─────────── */}
       <motion.div
         initial={{ opacity: 0, y: 20 }}
         animate={{ opacity: 1, y: 0 }}
@@ -928,31 +1271,37 @@ export function CostingPricing() {
         className="p-6 rounded-2xl"
         style={AXIOM.containers.chartBlue}
       >
-        <div className="flex items-center gap-2 mb-2">
-          <div
-            className="w-10 h-10 rounded-xl flex items-center justify-center"
-            style={{
-              background: AXIOM.iconBoxes.purple,
-              boxShadow: AXIOM.shadows.iconPurple,
-            }}
-          >
-            <Zap className="size-5 text-white" />
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-2">
+          <div className="flex items-center gap-2">
+            <div
+              className="w-10 h-10 rounded-xl flex items-center justify-center"
+              style={{
+                background: AXIOM.iconBoxes.purple,
+                boxShadow: AXIOM.shadows.iconPurple,
+              }}
+            >
+              <Zap className="size-5 text-white" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold text-white">Quote Profitability Checker</h3>
+              <p className="text-sm text-slate-400">
+                Simulate expected margin &amp; markup against loaded department cost rates before committing
+              </p>
+            </div>
           </div>
-          <div>
-            <h3 className="text-xl font-bold text-white">Quote Profitability Checker</h3>
-            <p className="text-sm text-slate-400">
-              Simulate expected margin against current department cost rates before committing
-            </p>
-          </div>
+          <span className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-indigo-500/15 text-indigo-300 border border-indigo-400/30">
+            Sandbox Quote · Not Recognized Revenue
+          </span>
         </div>
 
-        <div className="space-y-6 mt-6">
+        <div className="space-y-4 mt-6">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label className="text-white font-medium mb-2 block text-sm">Quote Amount ({currency})</label>
               <input
                 type="number"
-                placeholder="350000"
+                min="0"
+                placeholder="100000"
                 value={quoteAmount}
                 onChange={e => setQuoteAmount(e.target.value)}
                 className="w-full px-4 py-3 rounded-xl text-white"
@@ -966,6 +1315,7 @@ export function CostingPricing() {
               <label className="text-white font-medium mb-2 block text-sm">Estimated Hours</label>
               <input
                 type="number"
+                min="1"
                 placeholder="120"
                 value={estimatedHours}
                 onChange={e => setEstimatedHours(e.target.value)}
@@ -989,81 +1339,196 @@ export function CostingPricing() {
               >
                 {billableDepartments.map(dept => (
                   <option key={dept.id} value={dept.id} className="bg-slate-900 text-white">
-                    {dept.name} ({dept.costPerHour != null ? `${formatCurrency(dept.costPerHour, currency)}/hr` : 'Rate undefined'})
+                    {dept.name} ({dept.costPerHour != null ? `${formatCurrency(dept.costPerHour, currency, DEC2)}/hr` : 'Rate undefined'})
                   </option>
                 ))}
               </select>
             </div>
           </div>
 
-          {quoteAnalysis && (
+          {/* §14 Additional Costing Parameters */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div>
+              <label className="text-slate-300 font-medium mb-1.5 block text-xs">Direct Purchases ({currency})</label>
+              <input
+                type="number"
+                min="0"
+                value={directPurchasesAmt}
+                onChange={e => setDirectPurchasesAmt(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl text-white text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              />
+            </div>
+            <div>
+              <label className="text-slate-300 font-medium mb-1.5 block text-xs">Contingency (%)</label>
+              <input
+                type="number"
+                min="0"
+                max="100"
+                value={contingencyPct}
+                onChange={e => setContingencyPct(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl text-white text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              />
+            </div>
+            <div>
+              <label className="text-slate-300 font-medium mb-1.5 block text-xs">Target Margin (%)</label>
+              <input
+                type="number"
+                min="0"
+                max="99"
+                value={targetMarginPct}
+                onChange={e => setTargetMarginPct(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl text-white text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              />
+            </div>
+            <div>
+              <label className="text-slate-300 font-medium mb-1.5 block text-xs">Quote / Project Name (to save)</label>
+              <input
+                type="text"
+                placeholder="e.g. Mobile App Redesign"
+                value={quoteName}
+                onChange={e => setQuoteName(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl text-white text-sm"
+                style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+              />
+            </div>
+          </div>
+
+          {selectedDeptObj && selectedDeptObj.costPerHour == null && (
+            <div
+              className="p-4 rounded-xl flex items-start gap-3"
+              style={{ background: 'rgba(245, 158, 11, 0.1)', border: '1px solid rgba(245, 158, 11, 0.3)' }}
+            >
+              <AlertCircle className="size-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="text-sm text-amber-200">
+                <p className="font-semibold">Rate Undefined for {selectedDeptObj.name}</p>
+                <p className="text-xs text-amber-300/80 mt-0.5">
+                  This department has {selectedDeptObj.headcount === 0 ? '0 active staff (0h capacity)' : 'no recorded period costs'}.
+                  Assign active staff or select another department to simulate quote profitability.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {activeQuoteCalc && selectedDeptObj && (
             <motion.div
               initial={{ opacity: 0, scale: 0.98 }}
               animate={{ opacity: 1, scale: 1 }}
               className="p-6 rounded-2xl"
               style={{
-                background: quoteAnalysis.isProfitable
+                background: activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost
                   ? 'rgba(16, 185, 129, 0.1)'
                   : 'rgba(239, 68, 68, 0.1)',
-                border: quoteAnalysis.isProfitable
+                border: activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost
                   ? '2px solid rgba(16, 185, 129, 0.3)'
                   : '2px solid rgba(239, 68, 68, 0.3)',
               }}
             >
-              <div className="flex items-start gap-4 mb-4">
-                <div
-                  className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0"
-                  style={{
-                    background: quoteAnalysis.isProfitable ? AXIOM.iconBoxes.green : AXIOM.iconBoxes.red,
-                    boxShadow: quoteAnalysis.isProfitable ? AXIOM.shadows.iconGreen : AXIOM.shadows.iconRed,
-                  }}
-                >
-                  {quoteAnalysis.isProfitable ? (
-                    <TrendingUp className="size-6 text-white" />
-                  ) : (
-                    <AlertCircle className="size-6 text-white" />
-                  )}
-                </div>
-                <div className="flex-1">
-                  <h4
-                    className={`text-xl font-bold mb-1 ${
-                      quoteAnalysis.isProfitable ? 'text-emerald-400' : 'text-red-400'
-                    }`}
+              <div className="flex flex-wrap items-start justify-between gap-4 mb-4">
+                <div className="flex items-start gap-4">
+                  <div
+                    className="w-12 h-12 rounded-xl flex items-center justify-center shrink-0"
+                    style={{
+                      background: activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost ? AXIOM.iconBoxes.green : AXIOM.iconBoxes.red,
+                      boxShadow: activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost ? AXIOM.shadows.iconGreen : AXIOM.shadows.iconRed,
+                    }}
                   >
-                    {quoteAnalysis.isProfitable ? 'Profitable Quote' : 'Low Margin Warning'}
-                  </h4>
-                  <p className="text-sm text-slate-300">
-                    {quoteAnalysis.isProfitable
-                      ? `This quote yields a healthy ${quoteAnalysis.margin.toFixed(1)}% margin using ${quoteAnalysis.deptName}'s cost rate.`
-                      : `Produces ${quoteAnalysis.margin.toFixed(1)}% margin, below target operating threshold (20%).`}
-                  </p>
+                    {activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost ? (
+                      <TrendingUp className="size-6 text-white" />
+                    ) : (
+                      <AlertCircle className="size-6 text-white" />
+                    )}
+                  </div>
+                  <div>
+                    <h4
+                      className={`text-xl font-bold mb-1 ${
+                        activeQuoteCalc.meetsTargetMargin && !activeQuoteCalc.isBelowCost ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {activeQuoteCalc.isBelowCost
+                        ? 'Sell-Below-Cost Warning (Approval Required)'
+                        : activeQuoteCalc.meetsTargetMargin
+                          ? 'Profitable Quote'
+                          : 'Below Target Margin Warning'}
+                    </h4>
+                    <p className="text-sm text-slate-300">
+                      {activeQuoteCalc.marginPercent != null
+                        ? `Yields ${activeQuoteCalc.marginPercent.toFixed(1)}% margin (${activeQuoteCalc.markupPercent != null ? `${activeQuoteCalc.markupPercent.toFixed(1)}% markup` : 'N/A markup'}) using ${selectedDeptObj.name}'s loaded rate (${formatCurrency(selectedDeptObj.costPerHour || 0, currency, DEC2)}/hr).`
+                        : 'Proposed price must be greater than 0 to compute margin.'}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Client name"
+                    value={quoteClient}
+                    onChange={e => setQuoteClient(e.target.value)}
+                    className="px-3 py-2 rounded-xl text-white text-xs w-36"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  />
+                  <button
+                    onClick={handleSaveQuote}
+                    disabled={quoteSaving || !activeQuoteCalc.isTargetMarginValid}
+                    className="px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5"
+                    style={AXIOM.buttons.primary}
+                  >
+                    <Save className="size-3.5" />
+                    {quoteSaving ? 'Saving…' : editingQuoteId ? 'Save New Version' : 'Save Quote'}
+                  </button>
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                 <div className="p-4 rounded-xl" style={AXIOM.containers.item}>
-                  <p className="text-xs text-slate-400 mb-1">Quote Revenue</p>
-                  <p className="text-xl font-bold text-white">{formatCurrency(quoteAnalysis.revenue, currency)}</p>
+                  <p className="text-xs text-slate-400 mb-1">Quote Price</p>
+                  <p className="text-xl font-bold text-white">{formatCurrency(activeQuoteCalc.proposedPrice, currency, DEC2)}</p>
                 </div>
                 <div className="p-4 rounded-xl" style={AXIOM.containers.item}>
                   <p className="text-xs text-slate-400 mb-1">Estimated Cost ({estimatedHours}h)</p>
-                  <p className="text-xl font-bold text-amber-400">{formatCurrency(quoteAnalysis.cost, currency)}</p>
+                  <p className="text-xl font-bold text-amber-400">{formatCurrency(activeQuoteCalc.estimatedTotalCost, currency, DEC2)}</p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">
+                    Labor {formatCurrency(activeQuoteCalc.estimatedDirectLabor, currency)}
+                    {activeQuoteCalc.directPurchasesTotal > 0 ? ` + Purch ${formatCurrency(activeQuoteCalc.directPurchasesTotal, currency)}` : ''}
+                    {activeQuoteCalc.contingencyAmount > 0 ? ` + Cont ${formatCurrency(activeQuoteCalc.contingencyAmount, currency)}` : ''}
+                  </p>
                 </div>
                 <div className="p-4 rounded-xl" style={AXIOM.containers.item}>
                   <p className="text-xs text-slate-400 mb-1">Expected Profit</p>
-                  <p className={`text-xl font-bold ${quoteAnalysis.profit > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {formatCurrency(quoteAnalysis.profit, currency)}
+                  <p className={`text-xl font-bold ${activeQuoteCalc.profitAmount > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {formatCurrency(activeQuoteCalc.profitAmount, currency, DEC2)}
                   </p>
                 </div>
                 <div className="p-4 rounded-xl" style={AXIOM.containers.item}>
                   <p className="text-xs text-slate-400 mb-1">Projected Margin</p>
-                  <p className={`text-xl font-bold ${quoteAnalysis.isProfitable ? 'text-emerald-400' : 'text-red-400'}`}>
-                    {quoteAnalysis.margin.toFixed(1)}%
+                  <p className={`text-xl font-bold ${activeQuoteCalc.meetsTargetMargin ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {activeQuoteCalc.marginPercent != null ? `${activeQuoteCalc.marginPercent.toFixed(2)}%` : 'N/A'}
                   </p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">Profit ÷ Price</p>
+                </div>
+                <div className="p-4 rounded-xl" style={AXIOM.containers.item}>
+                  <p className="text-xs text-slate-400 mb-1">Projected Markup</p>
+                  <p className="text-xl font-bold text-cyan-300">
+                    {activeQuoteCalc.markupPercent != null ? `${activeQuoteCalc.markupPercent.toFixed(2)}%` : 'N/A'}
+                  </p>
+                  <p className="text-[10px] text-slate-400 mt-0.5">Profit ÷ Cost</p>
                 </div>
               </div>
 
-              {!quoteAnalysis.isProfitable && (
+              {!activeQuoteCalc.isTargetMarginValid && (
+                <div
+                  className="mt-4 p-3 rounded-xl"
+                  style={{ background: 'rgba(239, 68, 68, 0.12)', border: '1px solid rgba(239, 68, 68, 0.35)' }}
+                >
+                  <p className="text-sm text-red-300 font-medium">
+                    Invalid target margin ({targetMarginPct}%). Target margin must be between 0% and 99.99%.
+                  </p>
+                </div>
+              )}
+
+              {activeQuoteCalc.isTargetMarginValid && !activeQuoteCalc.meetsTargetMargin && activeQuoteCalc.requiredPriceForTargetMargin != null && (
                 <div
                   className="mt-4 p-3 rounded-xl"
                   style={{
@@ -1072,12 +1537,92 @@ export function CostingPricing() {
                   }}
                 >
                   <p className="text-sm text-amber-400 font-medium">
-                    Recommendation: consider increasing the quote to at least{' '}
-                    {formatCurrency(quoteAnalysis.cost / 0.75, currency)} to hit a healthy 25% target margin.
+                    Recommendation: increase quote to at least{' '}
+                    {formatCurrency(activeQuoteCalc.requiredPriceForTargetMargin, currency, DEC2)} to hit your{' '}
+                    {targetMarginPct}% target margin.
                   </p>
                 </div>
               )}
             </motion.div>
+          )}
+
+          {/* Saved Versioned Quotes List (§14) */}
+          {savedQuotes.length > 0 && (
+            <div className="pt-4 border-t border-slate-700/40">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-semibold text-white">Saved Quote Versions ({savedQuotes.length})</h4>
+                {editingQuoteId && (
+                  <button
+                    onClick={() => {
+                      setEditingQuoteId(null);
+                      setQuoteName('');
+                      setQuoteClient('');
+                    }}
+                    className="text-xs text-cyan-400 hover:text-cyan-300"
+                  >
+                    + Start New Quote
+                  </button>
+                )}
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                {savedQuotes.map(q => (
+                  <div
+                    key={q.id}
+                    className={`p-3.5 rounded-xl flex flex-col justify-between ${
+                      editingQuoteId === q.id ? 'ring-2 ring-cyan-400' : ''
+                    }`}
+                    style={AXIOM.containers.item}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <p className="text-sm font-semibold text-white truncate">{q.projectName}</p>
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300 border border-purple-400/30">
+                          {q.currentVersion}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 mb-2">{q.clientName}</p>
+                      <div className="grid grid-cols-2 gap-2 text-xs">
+                        <div>
+                          <span className="text-slate-500 block text-[10px]">Proposed</span>
+                          <span className="text-white font-semibold">{formatCurrency(q.proposedPrice, q.currency, DEC2)}</span>
+                        </div>
+                        <div>
+                          <span className="text-slate-500 block text-[10px]">Margin / Markup</span>
+                          <span className="text-emerald-400 font-semibold">
+                            {q.marginPercent != null ? `${q.marginPercent.toFixed(1)}%` : 'N/A'} /{' '}
+                            {q.markupPercent != null ? `${q.markupPercent.toFixed(1)}%` : 'N/A'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-3 pt-2 border-t border-slate-700/40 flex items-center justify-between text-xs">
+                      <button
+                        onClick={() => handleLoadQuote(q)}
+                        className="text-cyan-400 hover:text-cyan-300 font-medium"
+                      >
+                        Load / Revise
+                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleExportQuoteCsv(q)}
+                          className="text-slate-400 hover:text-white"
+                          title="Export Quote CSV"
+                        >
+                          <Download className="size-3.5" />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteQuote(q.id)}
+                          className="text-slate-400 hover:text-red-400"
+                          title="Delete Quote"
+                        >
+                          <Trash2 className="size-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
           )}
         </div>
       </motion.div>
@@ -1090,14 +1635,23 @@ export function CostingPricing() {
         className="p-6 rounded-2xl"
         style={AXIOM.containers.list}
       >
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <div>
             <h3 className="text-xl font-bold text-white mb-1">Overhead Allocation Settings</h3>
             <p className="text-sm text-slate-400">
-              Shared business costs distributed across departments for honest gross & net margins
+              Shared operating costs distributed across departments with cent-exact Hamilton-Hare conservation
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={handleFreezeAllocationRun}
+              disabled={freezingRun || operatingAllocations.length === 0}
+              className="px-3.5 py-2 rounded-xl text-sm font-medium flex items-center gap-1.5 transition-colors"
+              style={AXIOM.buttons.secondary}
+              title="Record an immutable frozen allocation run snapshot (§12.7)"
+            >
+              <Lock className="size-3.5" /> {freezingRun ? 'Freezing…' : 'Freeze Snapshot'}
+            </button>
             <button
               onClick={() => setShowMethodModal(true)}
               className="px-4 py-2 rounded-xl text-sm font-medium transition-colors"
@@ -1116,7 +1670,7 @@ export function CostingPricing() {
         </div>
 
         <div className="space-y-4">
-          <div className="flex items-center justify-between p-4 rounded-xl" style={AXIOM.containers.item}>
+          <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl" style={AXIOM.containers.item}>
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-lg bg-indigo-500/20 text-indigo-400">
                 <Layers className="size-5" />
@@ -1124,17 +1678,23 @@ export function CostingPricing() {
               <div>
                 <p className="text-sm text-white font-medium">Active Distribution Base</p>
                 <p className="text-xs text-slate-400 capitalize">
-                  Current: By {currentAllocationMethod.replace('_', ' ')}
+                  Current: {activeDistributionLabel}
+                  {allocations.length > operatingAllocations.length
+                    ? ` · ${allocations.length - operatingAllocations.length} non-operating excluded`
+                    : ''}
                 </p>
+                {latestFrozenRun && (
+                  <p className="text-[11px] text-emerald-400/90 mt-0.5">
+                    Last Frozen Run: {latestFrozenRun.periodStart} to {latestFrozenRun.periodEnd} (
+                    {formatCurrency(latestFrozenRun.allocatedAmount, latestFrozenRun.currency, DEC2)} conserved)
+                  </p>
+                )}
               </div>
             </div>
             <div className="text-right">
-              <span className="text-xs text-slate-400">Total Monthly Pools:</span>
+              <span className="text-xs text-slate-400">Total Monthly Operating Pools:</span>
               <p className="text-lg font-bold text-white">
-                {formatCurrency(
-                  allocations.reduce((sum, a) => sum + (Number(a.amount) || 0), 0),
-                  currency
-                )}
+                {formatCurrency(totalMonthlyOperatingPools, currency)}
               </p>
             </div>
           </div>
@@ -1172,12 +1732,14 @@ export function CostingPricing() {
                     {formatCurrency(alloc.amount || 0, currency)}
                   </p>
                   <p className="text-xs text-slate-400 capitalize">
-                    Basis: {alloc.allocationBase?.replace('_', ' ')}
+                    Basis: {(alloc.allocationBase || 'headcount').replace(/_/g, ' ')}
                   </p>
                 </div>
                 <div className="mt-3 pt-2 border-t border-slate-700/40 text-[11px] text-slate-400 flex justify-between">
                   <span>Monthly Pool</span>
-                  <span className="text-emerald-400">Active</span>
+                  <span className={alloc.isOperating !== false ? 'text-emerald-400' : 'text-amber-400'}>
+                    {alloc.isOperating !== false ? 'Operating (Active)' : 'Non-Operating (Excluded)'}
+                  </span>
                 </div>
               </div>
             ))}
@@ -1208,7 +1770,7 @@ export function CostingPricing() {
               <h3 className="text-xl font-bold text-white">Commission Calculator</h3>
             </div>
             <p className="text-sm text-slate-400">
-              Calculate Dubai splits & USA partner commission structures with live exchange rates
+              Calculate partner deal splits &amp; middleman cuts with tenant-scoped exchange rates
             </p>
           </div>
           <button
@@ -1222,8 +1784,17 @@ export function CostingPricing() {
 
         <div className="space-y-6">
           {/* Partner Structure Selection Pills */}
+          {commError && (
+            <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/30 text-xs text-red-300 flex items-center gap-2">
+              <AlertCircle className="size-4 shrink-0" />
+              <span>Failed to load commission structures: {commError}</span>
+            </div>
+          )}
           <div className="flex gap-2 flex-wrap items-center">
             <span className="text-xs text-slate-400 mr-1">Partner:</span>
+            {commissions.length === 0 && (
+              <span className="text-xs text-slate-500">No saved partner commission structures yet. Add one to calculate deal splits.</span>
+            )}
             {commissions.map(commission => (
               <button
                 key={commission.id}
@@ -1257,6 +1828,7 @@ export function CostingPricing() {
                     </span>
                     <input
                       type="number"
+                      min="0"
                       placeholder="10000"
                       value={dealAmount}
                       onChange={e => setDealAmount(e.target.value)}
@@ -1271,12 +1843,17 @@ export function CostingPricing() {
 
                 <div>
                   <label className="text-white font-medium mb-2 block text-sm">
-                    Exchange Rate to {currency} (Live: {activeFxRate})
+                    Exchange Rate to {currency} ({fxResolution.sourceLabel}: {activeFxRate})
                   </label>
                   <input
                     type="number"
+                    min="0"
+                    step="0.0001"
                     value={activeFxRate}
-                    onChange={e => setCustomFxRate(parseFloat(e.target.value) || 0)}
+                    onChange={e => {
+                      const val = parseFloat(e.target.value);
+                      setCustomFxRate(Number.isFinite(val) ? Math.max(0, val) : 0);
+                    }}
                     className="w-full px-4 py-3 rounded-xl text-white"
                     style={{
                       background: AXIOM.inputs.background,
@@ -1299,7 +1876,7 @@ export function CostingPricing() {
                   <p className="text-xl font-bold text-red-400">
                     {selectedCommission.middlemanPercentage}%
                   </p>
-                  <p className="text-xs text-slate-500 mt-1">% deducted from your share</p>
+                  <p className="text-xs text-slate-500 mt-1">% deducted from your gross share</p>
                 </div>
               </div>
 
@@ -1313,7 +1890,7 @@ export function CostingPricing() {
                   <h4 className="text-white font-semibold mb-4 text-base flex items-center justify-between">
                     <span>Financial Deal Breakdown</span>
                     <span className="text-xs text-cyan-400 font-normal">
-                      Effective Return: {commissionBreakdown.effectiveMarginPct.toFixed(1)}%
+                      Effective Return: {commissionBreakdown.effectiveMarginPct != null ? `${commissionBreakdown.effectiveMarginPct.toFixed(1)}%` : 'N/A'}
                     </span>
                   </h4>
 
@@ -1321,7 +1898,7 @@ export function CostingPricing() {
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400 text-sm">Total Deal Size</span>
                       <span className="text-white font-semibold">
-                        {commissionBreakdown.currency} {commissionBreakdown.dealAmount.toLocaleString()}
+                        {commissionBreakdown.currency} {commissionBreakdown.dealAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </span>
                     </div>
 
@@ -1330,16 +1907,16 @@ export function CostingPricing() {
                         Your {commissionBreakdown.yourSplitPct}% Split
                       </span>
                       <span className="text-cyan-400 font-semibold">
-                        {commissionBreakdown.currency} {commissionBreakdown.yourGrossShare.toLocaleString()}
+                        {commissionBreakdown.currency} {commissionBreakdown.yourGrossShare.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400 text-sm">
-                        Middleman Cut ({commissionBreakdown.middlemanPct}%)
+                        Middleman Cut ({commissionBreakdown.middlemanPct}% of your share)
                       </span>
                       <span className="text-red-400 font-semibold">
-                        -{commissionBreakdown.currency} {commissionBreakdown.middlemanCut.toLocaleString()}
+                        -{commissionBreakdown.currency} {commissionBreakdown.middlemanCut.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </span>
                     </div>
 
@@ -1348,16 +1925,16 @@ export function CostingPricing() {
                     <div className="flex items-center justify-between">
                       <span className="text-white font-medium">Your Final Net Takehome</span>
                       <span className="text-emerald-400 font-bold text-lg">
-                        {commissionBreakdown.currency} {commissionBreakdown.yourNetShare.toLocaleString()}
+                        {commissionBreakdown.currency} {commissionBreakdown.yourNetShare.toLocaleString(undefined, { maximumFractionDigits: 2 })}
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between">
                       <span className="text-slate-400 text-sm">
-                        Equivalent in {currency} (@ {activeFxRate})
+                        Equivalent in {currency} (@ {activeFxRate} · {fxResolution.sourceLabel})
                       </span>
                       <span className="text-emerald-300 font-bold text-lg">
-                        {formatCurrency(commissionBreakdown.inBaseCurrency, currency)}
+                        {formatCurrency(commissionBreakdown.inBaseCurrency, currency, DEC2)}
                       </span>
                     </div>
                   </div>
@@ -1435,7 +2012,7 @@ export function CostingPricing() {
         </div>
       </motion.div>
 
-      {/* ── Modal: Change Allocation Method ───────────────────────────────── */}
+      {/* ── Modal: Change Allocation Method (All 8 Org Drivers Supported) ──── */}
       <AnimatePresence>
         {showMethodModal && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
@@ -1443,45 +2020,35 @@ export function CostingPricing() {
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="w-full max-w-md p-6 rounded-2xl space-y-4"
+              className="w-full max-w-md max-h-[85vh] overflow-y-auto p-6 rounded-2xl space-y-4"
               style={AXIOM.containers.modal}
             >
               <h3 className="text-xl font-bold text-white">Change Overhead Allocation Method</h3>
               <p className="text-xs text-slate-400">
-                Determines how shared monthly overhead is divided across active departments
+                Applies the selected distribution driver across all organization overhead pools
               </p>
 
               <div className="space-y-2 pt-2">
-                {[
-                  {
-                    id: 'headcount',
-                    title: 'By Headcount',
-                    desc: 'Distribute based on number of active team members in each department',
-                  },
-                  {
-                    id: 'revenue',
-                    title: 'By Revenue',
-                    desc: 'Distribute based on client revenue credits generated by each department',
-                  },
-                  {
-                    id: 'direct_cost',
-                    title: 'By Direct Costs',
-                    desc: 'Distribute proportionally to direct expense debits of each department',
-                  },
-                  {
-                    id: 'equal',
-                    title: 'Equal Split',
-                    desc: 'Divide all overhead equally across all departments',
-                  },
-                ].map(opt => (
+                {(
+                  [
+                    { id: 'headcount', title: 'By Headcount', desc: 'Distribute proportionally to active FTE count in each department' },
+                    { id: 'revenue', title: 'By Revenue', desc: 'Distribute proportionally to period revenue attributed to each department' },
+                    { id: 'direct_cost', title: 'By Direct Costs', desc: 'Distribute proportionally to period direct costs of each department' },
+                    { id: 'square_footage', title: 'By Square Footage', desc: 'Distribute proportionally to assigned office square footage' },
+                    { id: 'time_utilization', title: 'By Time Utilization (Scheduled Hours)', desc: 'Distribute proportionally to scheduled 160h/mo project hours per department' },
+                    { id: 'manual_weight', title: 'Manual Weight', desc: 'Distribute using normalized per-department manual weights' },
+                    { id: 'department_ratio', title: 'Department Ratio', desc: 'Distribute using configured stable per-department ratios' },
+                    { id: 'equal', title: 'Equal Split', desc: 'Divide overhead equally across all departments' },
+                  ] as Array<{ id: OverheadAllocationBase; title: string; desc: string }>
+                ).map(opt => (
                   <button
                     key={opt.id}
-                    onClick={() => handleApplyMethod(opt.id as any)}
+                    onClick={() => handleApplyMethod(opt.id)}
                     className="w-full text-left p-3.5 rounded-xl border border-slate-700/60 hover:border-cyan-500/50 hover:bg-slate-800/60 transition-all flex items-start gap-3"
                   >
                     <CheckCircle2
                       className={`size-5 mt-0.5 shrink-0 ${
-                        currentAllocationMethod === opt.id ? 'text-cyan-400' : 'text-slate-600'
+                        uniqueBases.length === 1 && currentAllocationMethod === opt.id ? 'text-cyan-400' : 'text-slate-600'
                       }`}
                     />
                     <div>
@@ -1513,7 +2080,7 @@ export function CostingPricing() {
               initial={{ opacity: 0, scale: 0.95 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95 }}
-              className="w-full max-w-md p-6 rounded-2xl space-y-4"
+              className="w-full max-w-md max-h-[85vh] overflow-y-auto p-6 rounded-2xl space-y-4"
               style={AXIOM.containers.modal}
             >
               <h3 className="text-xl font-bold text-white">
@@ -1539,6 +2106,7 @@ export function CostingPricing() {
                   </label>
                   <input
                     type="number"
+                    min="0"
                     placeholder="35000"
                     value={allocForm.amount}
                     onChange={e => setAllocForm({ ...allocForm, amount: e.target.value })}
@@ -1548,12 +2116,10 @@ export function CostingPricing() {
                 </div>
 
                 <div>
-                  <label className="text-xs text-slate-300 font-medium block mb-1">
-                    Allocation Basis
-                  </label>
+                  <label className="text-xs text-slate-300 font-medium block mb-1">Allocation Basis</label>
                   <select
                     value={allocForm.allocationBase}
-                    onChange={e => setAllocForm({ ...allocForm, allocationBase: e.target.value as any })}
+                    onChange={e => setAllocForm({ ...allocForm, allocationBase: e.target.value as OverheadAllocationBase })}
                     className="w-full px-3.5 py-2.5 rounded-xl text-white text-sm"
                     style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
                   >
@@ -1561,12 +2127,55 @@ export function CostingPricing() {
                     <option value="revenue" className="bg-slate-900 text-white">By Revenue</option>
                     <option value="direct_cost" className="bg-slate-900 text-white">By Direct Cost</option>
                     <option value="square_footage" className="bg-slate-900 text-white">By Square Footage</option>
-                    <option value="time_utilization" className="bg-slate-900 text-white">By Time Utilization (Logged Hours)</option>
+                    <option value="time_utilization" className="bg-slate-900 text-white">By Time Utilization (Scheduled Hours)</option>
                     <option value="manual_weight" className="bg-slate-900 text-white">Manual Weight</option>
                     <option value="department_ratio" className="bg-slate-900 text-white">Department Ratio</option>
+                    <option value="custom" className="bg-slate-900 text-white">Custom Percentage Split (100%)</option>
                     <option value="equal" className="bg-slate-900 text-white">Equal Split</option>
                   </select>
                 </div>
+
+                {needsDepartmentWeights && billableDepartments.length > 0 && (
+                  <div className="p-3 rounded-xl bg-slate-900/70 border border-slate-700/60 space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-300 font-medium">
+                        {allocForm.allocationBase === 'custom' ? 'Department Percentages (must sum to 100%)' : 'Department Weights (auto-normalized)'}
+                      </span>
+                      <span className={allocForm.allocationBase === 'custom' && Math.abs(customWeightsTotal - 100) > 0.05 ? 'text-red-400 font-semibold' : 'text-cyan-400'}>
+                        Total: {customWeightsTotal.toFixed(1)}{allocForm.allocationBase === 'custom' ? '%' : ''}
+                      </span>
+                    </div>
+                    {billableDepartments.map(d => (
+                      <div key={d.id} className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-slate-300 truncate">{d.name}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          value={allocForm.deptWeights[d.id] ?? '0'}
+                          onChange={e =>
+                            setAllocForm({
+                              ...allocForm,
+                              deptWeights: { ...allocForm.deptWeights, [d.id]: e.target.value },
+                            })
+                          }
+                          className="w-24 px-2.5 py-1.5 rounded-lg text-white text-xs text-right"
+                          style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <label className="flex items-center gap-2 text-xs text-slate-300 pt-1 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={allocForm.isOperating}
+                    onChange={e => setAllocForm({ ...allocForm, isOperating: e.target.checked })}
+                    className="rounded border-slate-600"
+                  />
+                  Operating overhead pool (uncheck to exclude non-operating/capital costs per §12.3)
+                </label>
               </div>
 
               <div className="pt-4 flex items-center justify-end gap-2">
@@ -1605,7 +2214,7 @@ export function CostingPricing() {
                 {editingCommissionId ? 'Edit Partner Structure' : 'New Partner Commission Structure'}
               </h3>
               <p className="text-xs text-slate-400">
-                Configure partner percentage split and middleman cut. Splits cannot exceed 100%.
+                Configure your gross deal split (0–100%) and middleman cut deducted from your share (0–100%).
               </p>
 
               <div className="space-y-3 pt-2">
@@ -1681,11 +2290,17 @@ export function CostingPricing() {
                   </div>
                 </div>
 
-                {parseFloat(commissionForm.yourProfitPercentage) + parseFloat(commissionForm.middlemanPercentage) > 100 && (
-                  <p className="text-xs text-red-400 font-medium">
-                    ⚠️ Split validation error: Your split + Middleman cut cannot exceed 100%!
-                  </p>
-                )}
+                {Number.isFinite(parseFloat(commissionForm.yourProfitPercentage)) &&
+                  Number.isFinite(parseFloat(commissionForm.middlemanPercentage)) && (
+                    <p className="text-xs text-cyan-300/90">
+                      Effective Net Return:{' '}
+                      {(
+                        Math.min(100, Math.max(0, parseFloat(commissionForm.yourProfitPercentage))) *
+                        (1 - Math.min(100, Math.max(0, parseFloat(commissionForm.middlemanPercentage))) / 100)
+                      ).toFixed(2)}
+                      % of total deal value
+                    </p>
+                  )}
               </div>
 
               <div className="pt-4 flex items-center justify-end gap-2">

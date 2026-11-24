@@ -112,10 +112,13 @@ export function EnhancedLogicLearning() {
   const [ruleDialogOpen, setRuleDialogOpen] = useState(false);
   const [newRulePattern, setNewRulePattern] = useState('');
   const [newRuleCategoryId, setNewRuleCategoryId] = useState('');
+  const [newRuleWorld, setNewRuleWorld] = useState<'business' | 'personal'>('business');
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   const [expandedCorrectionTxnId, setExpandedCorrectionTxnId] = useState<string | null>(null);
   const [correctionCategoryId, setCorrectionCategoryId] = useState('');
   const [correctionDepartmentId, setCorrectionDepartmentId] = useState('');
+  const [correctionWorld, setCorrectionWorld] = useState<'business' | 'personal'>('business');
+  const [correctionScope, setCorrectionScope] = useState<'row' | 'batch' | 'future'>('future');
   const [reviewFilter, setReviewFilter] = useState<'all' | 'auto' | 'needs-review' | 'confirmed'>('all');
   const [categoryTypeFilter, setCategoryTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
   const [categorySearch, setCategorySearch] = useState('');
@@ -154,7 +157,7 @@ export function EnhancedLogicLearning() {
   const transactions = txnResult?.items ?? [];
 
   const { data: rules, loading: rulesLoading, refetch: refetchRules } = useServiceArray(
-    () => svc.classification.getRules(),
+    () => svc.classification.getRules(true),
     [svc.orgId],
     ['classification-rules'],
   );
@@ -165,12 +168,30 @@ export function EnhancedLogicLearning() {
     ['transactions', 'categories', 'classification-rules'],
   );
 
-  const classifyMut = useMutation((input: { narration: string; amount: number; type: 'debit' | 'credit' }) =>
-    svc.classification.classify(input.narration, input.amount, input.type),
+  const { data: performanceData } = useService(
+    () => svc.classification.getPerformance(),
+    [svc.orgId],
+    ['transactions', 'categories', 'classification-rules'],
   );
 
-  const learnMut = useMutation((input: { txnId: string; categoryId: string; departmentId?: string }) =>
-    svc.classification.learnFromCorrection(input.txnId, input.categoryId, input.departmentId),
+  const classifyMut = useMutation((input: { narration: string; amount: number; type: 'debit' | 'credit'; useAI?: boolean }) =>
+    svc.classification.classify(input.narration, input.amount, input.type, undefined, undefined, input.useAI),
+  );
+
+  const learnMut = useMutation((input: {
+    txnId: string;
+    categoryId: string;
+    departmentId?: string;
+    world?: 'business' | 'personal';
+    scope?: 'row' | 'batch' | 'future';
+  }) =>
+    svc.classification.recordHumanOverride({
+      transactionId: input.txnId,
+      correctCategoryId: input.categoryId,
+      departmentId: input.departmentId,
+      world: input.world,
+      scope: input.scope ?? 'future',
+    }),
   );
 
   const addRuleMut = useMutation((rule: Omit<ClassificationRule, 'id'>) => svc.classification.addRule(rule));
@@ -388,6 +409,8 @@ export function EnhancedLogicLearning() {
     }
     const chosenCatId = correctionCategoryId;
     const chosenDeptId = correctionDepartmentId || undefined;
+    const chosenWorld = correctionWorld;
+    const chosenScope = correctionScope;
 
     // Optimistically update the transaction in local state for instant real-time feedback
     if (txnResult) {
@@ -399,6 +422,7 @@ export function EnhancedLogicLearning() {
                 ...t,
                 categoryId: chosenCatId,
                 departmentId: chosenDeptId || t.departmentId,
+                worldScope: chosenWorld,
                 status: 'classified',
                 classifiedBy: 'user',
                 confidence: 100,
@@ -411,16 +435,25 @@ export function EnhancedLogicLearning() {
     setCorrectionCategoryId('');
     setCorrectionDepartmentId('');
 
-    const res = await learnMut.execute({ txnId, categoryId: chosenCatId, departmentId: chosenDeptId });
+    const res = await learnMut.execute({
+      txnId,
+      categoryId: chosenCatId,
+      departmentId: chosenDeptId,
+      world: chosenWorld,
+      scope: chosenScope,
+    });
     if (res.success) {
       const catName = categories.find((c) => c.id === chosenCatId)?.name || 'Category';
-      toast.success(res.message || `✓ Category corrected to "${catName}". Feedback saved and AI pattern learned!`);
+      toast.success(res.message || `✓ Category corrected to "${catName}" [${chosenWorld}].`);
+      if ((res.data as any)?.collisionWarning) {
+        toast.warning((res.data as any).collisionWarning);
+      }
       // Refresh all data to show updated stats and department numbers
       await Promise.all([
-        refetchTxns(), 
-        refetchRules(), 
+        refetchTxns(),
+        refetchRules(),
         refetchStats(),
-        svc.departments.getProfitability()
+        svc.departments.getProfitability(),
       ]);
     } else {
       toast.error(res.error || 'Could not update.');
@@ -479,11 +512,14 @@ export function EnhancedLogicLearning() {
     const loadingToast = toast.loading('Matching against learned patterns...');
     
     try {
-      // Use pattern matching (no AI, just rules)
+      // Deterministic pattern/rule matching only (useAI: false per §11)
       const classResult = await svc.classification.classify(
         txn.narration,
         Math.abs(txn.amount),
-        txn.type
+        txn.type,
+        undefined,
+        txn.id,
+        false
       );
 
       if (classResult.success && classResult.data) {
@@ -526,21 +562,23 @@ export function EnhancedLogicLearning() {
       return;
     }
     const res = editingRuleId
-      ? await updateRuleMut.execute({ id: editingRuleId, updates: { pattern, categoryId: newRuleCategoryId } })
+      ? await updateRuleMut.execute({ id: editingRuleId, updates: { pattern, categoryId: newRuleCategoryId, world: newRuleWorld } as any })
       : await addRuleMut.execute({
           pattern,
           categoryId: newRuleCategoryId,
           confidence: 100,
           matchCount: 0,
           createdFrom: 'user',
-        });
+          world: newRuleWorld,
+          scope: { world: newRuleWorld },
+        } as any);
     if (res.success) {
       toast.success(res.message || (editingRuleId ? 'Rule updated.' : 'Rule added.'));
       setRuleDialogOpen(false);
       setNewRulePattern('');
       setNewRuleCategoryId('');
+      setNewRuleWorld('business');
       setEditingRuleId(null);
-      // Refetch rules to update the UI
       await refetchRules();
     } else {
       toast.error(res.error || 'Could not save rule.');
@@ -551,17 +589,40 @@ export function EnhancedLogicLearning() {
     setEditingRuleId(rule.id);
     setNewRulePattern(rule.pattern);
     setNewRuleCategoryId(rule.categoryId);
+    setNewRuleWorld((rule.scope?.world || rule.prediction?.world) === 'personal' ? 'personal' : 'business');
     setRuleDialogOpen(true);
+  };
+
+  const handleToggleRuleStatus = async (rule: ClassificationRule) => {
+    const nextStatus = rule.status === 'disabled' ? 'active' : 'disabled';
+    const res = await svc.classification.setRuleStatus(rule.id, nextStatus);
+    if (res.success) {
+      toast.success(`Rule ${nextStatus === 'active' ? 'enabled' : 'disabled'}.`);
+      await refetchRules();
+    } else {
+      toast.error(res.error || 'Could not update rule status.');
+    }
+  };
+
+  const handleRevertRule = async (rule: ClassificationRule) => {
+    const currentVer = Number(rule.version || 1);
+    if (currentVer <= 1) return;
+    const res = await svc.classification.revertRuleVersion(rule.id, currentVer - 1, 'Reverted from Logic & Learning Center');
+    if (res.success) {
+      toast.success(res.message || `Rule reverted to v${currentVer - 1}.`);
+      await refetchRules();
+    } else {
+      toast.error(res.error || 'Could not revert rule version.');
+    }
   };
 
   const handleDeleteRule = async (ruleId: string) => {
     const res = await deleteRuleMut.execute(ruleId);
     if (res.success) {
-      toast.success(res.message || 'Rule removed.');
-      // Refetch rules to update the UI
+      toast.success(res.message || 'Rule archived (historical evidence preserved).');
       await refetchRules();
     } else {
-      toast.error(res.error || 'Could not delete rule.');
+      toast.error(res.error || 'Could not archive rule.');
     }
   };
 
@@ -842,8 +903,30 @@ export function EnhancedLogicLearning() {
               >
                 <div className="flex items-start justify-between mb-3">
                   <div>
-                    <div className="text-sm text-gray-400 mb-1">AI Classification Result</div>
-                    <div className="text-xl font-semibold text-white">{testResult.categoryName}</div>
+                    <div className="text-sm text-gray-400 mb-1">Classification Result</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xl font-semibold text-white">{testResult.categoryName}</span>
+                      {testResult.world && (
+                        <span className={cn(
+                          'px-2 py-0.5 rounded-full text-[11px] font-semibold uppercase border',
+                          testResult.world === 'personal'
+                            ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                            : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                        )}>
+                          {testResult.world}
+                        </span>
+                      )}
+                      {testResult.source && (
+                        <span className="px-2 py-0.5 rounded-full text-[11px] font-mono bg-[#1a1a2e] text-gray-300 border border-[#2a2a3e]">
+                          {testResult.source}
+                        </span>
+                      )}
+                      {testResult.proposedNewCategory?.name && (
+                        <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                          New Category Proposed
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="text-right">
                     <div className="text-sm text-gray-400 mb-1">Confidence</div>
@@ -857,7 +940,19 @@ export function EnhancedLogicLearning() {
                     </div>
                   </div>
                 </div>
-                <div className="text-sm text-gray-400 mb-3">{testResult.reasoning}</div>
+                <div className="text-sm text-gray-400 mb-2">{testResult.reasoning}</div>
+                {testResult.worldReason && (
+                  <div className="text-xs text-gray-500 mb-2">Scope rationale: {testResult.worldReason}</div>
+                )}
+                {testResult.riskFlags && testResult.riskFlags.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {testResult.riskFlags.map((flag) => (
+                      <span key={flag} className="px-2 py-0.5 rounded text-[11px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                        {flag.replace(/_/g, ' ')}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 
                 {testResult.alternativeSuggestions.length > 0 && (
                   <div>
@@ -1124,6 +1219,16 @@ export function EnhancedLogicLearning() {
                                   <AlertCircle className="w-2.5 h-2.5" /> Needs Review
                                 </span>
                               )}
+                              {((txn as any).worldScope === 'personal' || txn.tags?.includes('personal')) && (
+                                <span className="inline-flex px-2 py-0.5 rounded text-[10px] font-semibold uppercase bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                  Personal
+                                </span>
+                              )}
+                              {Array.isArray((txn as any).riskFlags) && (txn as any).riskFlags.map((rf: string) => (
+                                <span key={rf} className="inline-flex px-2 py-0.5 rounded text-[10px] font-mono bg-red-500/10 text-red-300 border border-red-500/20">
+                                  {rf.replace(/_/g, ' ')}
+                                </span>
+                              ))}
                               {txn.tags?.includes('recurring') && (
                                 <span className="inline-flex px-2 py-0.5 rounded text-[10px] font-medium bg-[#1a1a2e] text-gray-500 border border-[#2a2a3e]">
                                   Recurring
@@ -1210,13 +1315,36 @@ export function EnhancedLogicLearning() {
                                       ))}
                                     </select>
                                   </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <label className="text-xs text-gray-400">Scope:</label>
+                                    <select
+                                      value={correctionWorld}
+                                      onChange={(e) => setCorrectionWorld(e.target.value as 'business' | 'personal')}
+                                      className="rounded-lg border border-[#2a2a3e] bg-[#0a0a0f] px-2 py-1 text-xs text-white focus:border-cyan-500/50"
+                                    >
+                                      <option value="business">Business</option>
+                                      <option value="personal">Personal</option>
+                                    </select>
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <label className="text-xs text-gray-400">Apply:</label>
+                                    <select
+                                      value={correctionScope}
+                                      onChange={(e) => setCorrectionScope(e.target.value as 'row' | 'batch' | 'future')}
+                                      className="rounded-lg border border-[#2a2a3e] bg-[#0a0a0f] px-2 py-1 text-xs text-white focus:border-cyan-500/50"
+                                    >
+                                      <option value="row">This row only</option>
+                                      <option value="batch">Matching pending</option>
+                                      <option value="future">Learn rule (future)</option>
+                                    </select>
+                                  </div>
                                   <Button
                                     size="sm"
                                     className="h-7 text-xs bg-cyan-600 hover:bg-cyan-500 text-white font-medium"
                                     disabled={learnMut.loading}
                                     onClick={() => applyCorrection(txn.id)}
                                   >
-                                    {learnMut.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : 'Save & Learn'}
+                                    {learnMut.loading ? <Loader2 className="w-3 h-3 animate-spin" /> : (correctionScope === 'row' ? 'Save Row' : 'Save & Learn')}
                                   </Button>
                                   <Button
                                     size="sm"
@@ -1290,6 +1418,8 @@ export function EnhancedLogicLearning() {
                                 onClick={() => {
                                   setExpandedCorrectionTxnId(txn.id);
                                   setCorrectionCategoryId(txn.categoryId || '');
+                                  setCorrectionWorld((txn as any).worldScope === 'personal' || txn.tags?.includes('personal') ? 'personal' : 'business');
+                                  setCorrectionScope('future');
                                 }}
                                 className="p-2 hover:bg-red-500/10 rounded-lg transition-colors group disabled:opacity-50"
                                 title="Wrong category — pick the right one"
@@ -1316,28 +1446,37 @@ export function EnhancedLogicLearning() {
             animate={{ opacity: 1, y: 0 }}
             className="bg-gradient-to-br from-[#0a0a0f] to-[#1a1a2e] rounded-2xl p-6 border border-cyan-500/20"
           >
-            <h3 className="text-lg font-semibold text-white mb-6">Classification Accuracy Trend</h3>
+            <h3 className="text-lg font-semibold text-white mb-1">Classification Accuracy Trend</h3>
+            <p className="text-xs text-gray-400 mb-6">
+              Live monthly acceptance rate from confirmed &amp; corrected feedback ({performanceData?.totalFeedback ?? 0} total reviews)
+            </p>
             <div className="space-y-4">
-              {['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'].map((month, idx) => {
-                const base = statsResult?.accuracyRate ?? 88;
-                const accuracy = Math.min(99, base - 4 + idx * 0.8);
-                return (
-                  <div key={month}>
+              {(performanceData?.monthlyTrend || []).length === 0 ? (
+                <p className="text-sm text-gray-500 py-6 text-center">
+                  No review feedback recorded yet. Confirm or correct classifications to build live accuracy history.
+                </p>
+              ) : (
+                (performanceData?.monthlyTrend || []).map((row, idx) => (
+                  <div key={row.month}>
                     <div className="flex items-center justify-between mb-2">
-                      <span className="text-sm text-gray-400">{month} 2026</span>
-                      <span className="text-sm text-cyan-400 font-medium">{accuracy.toFixed(1)}%</span>
+                      <span className="text-sm text-gray-400">
+                        {row.label} <span className="text-xs text-gray-500">({row.total} reviews)</span>
+                      </span>
+                      <span className="text-sm text-cyan-400 font-medium">
+                        {row.accuracy != null ? `${row.accuracy.toFixed(1)}%` : 'No data'}
+                      </span>
                     </div>
                     <div className="h-2 bg-[#0a0a0f] rounded-full overflow-hidden">
                       <motion.div
                         initial={{ width: 0 }}
-                        animate={{ width: `${accuracy}%` }}
-                        transition={{ duration: 1, delay: idx * 0.1 }}
+                        animate={{ width: `${row.accuracy ?? 0}%` }}
+                        transition={{ duration: 0.6, delay: idx * 0.06 }}
                         className="h-full bg-gradient-to-r from-cyan-500 to-blue-500"
                       />
                     </div>
                   </div>
-                );
-              })}
+                ))
+              )}
             </div>
           </motion.div>
 
@@ -1347,31 +1486,43 @@ export function EnhancedLogicLearning() {
             transition={{ delay: 0.1 }}
             className="bg-gradient-to-br from-[#0a0a0f] to-[#1a1a2e] rounded-2xl p-6 border border-purple-500/20"
           >
-            <h3 className="text-lg font-semibold text-white mb-6">Category Performance</h3>
+            <h3 className="text-lg font-semibold text-white mb-1">Category Performance</h3>
+            <p className="text-xs text-gray-400 mb-6">
+              Real per-category review accuracy and average confidence from Supabase
+            </p>
             <div className="space-y-4">
-              {categories.slice(0, 6).map((category, idx) => {
-                const hash = category.id.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
-                const accuracy = 85 + (hash % 12);
-                return (
-                  <div key={category.id}>
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-lg">{category.icon}</span>
-                        <span className="text-sm text-white">{category.name}</span>
+              {(performanceData?.categoryPerformance || []).length === 0 ? (
+                <p className="text-sm text-gray-500 py-6 text-center">
+                  No classified category history yet.
+                </p>
+              ) : (
+                (performanceData?.categoryPerformance || []).map((cat, idx) => {
+                  const IconComp = getCategoryIconComponent(cat.icon);
+                  const displayPct = cat.accuracy != null ? cat.accuracy : cat.avgConfidence;
+                  const metricLabel = cat.accuracy != null
+                    ? `${cat.accuracy.toFixed(1)}% (${cat.accepted}/${cat.accepted + cat.corrected})`
+                    : `${cat.avgConfidence}% avg conf (${cat.total} txns)`;
+                  return (
+                    <div key={cat.categoryId}>
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <IconComp className="w-4 h-4 shrink-0" style={{ color: cat.color || '#a855f7' }} />
+                          <span className="text-sm text-white truncate">{cat.categoryName}</span>
+                        </div>
+                        <span className="text-xs text-purple-400 font-medium shrink-0 ml-2">{metricLabel}</span>
                       </div>
-                      <span className="text-sm text-purple-400 font-medium">{accuracy}%</span>
+                      <div className="h-2 bg-[#0a0a0f] rounded-full overflow-hidden">
+                        <motion.div
+                          initial={{ width: 0 }}
+                          animate={{ width: `${displayPct}%` }}
+                          transition={{ duration: 0.6, delay: idx * 0.06 }}
+                          className="h-full bg-gradient-to-r from-purple-500 to-pink-500"
+                        />
+                      </div>
                     </div>
-                    <div className="h-2 bg-[#0a0a0f] rounded-full overflow-hidden">
-                      <motion.div
-                        initial={{ width: 0 }}
-                        animate={{ width: `${accuracy}%` }}
-                        transition={{ duration: 1, delay: idx * 0.1 }}
-                        className="h-full bg-gradient-to-r from-purple-500 to-pink-500"
-                      />
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           </motion.div>
         </div>
@@ -1433,6 +1584,26 @@ export function EnhancedLogicLearning() {
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="text-xs text-gray-500 mb-1 block">World Scope (Business vs. Personal)</label>
+                  <div className="flex gap-2">
+                    {(['business', 'personal'] as const).map((w) => (
+                      <button
+                        key={w}
+                        type="button"
+                        onClick={() => setNewRuleWorld(w)}
+                        className={cn(
+                          'flex-1 px-3 py-2 rounded-lg text-xs font-semibold uppercase border transition-all',
+                          newRuleWorld === w
+                            ? (w === 'personal' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40')
+                            : 'bg-[#1a1a2e] text-gray-400 border-[#2a2a3e] hover:text-white'
+                        )}
+                      >
+                        {w}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
               <DialogFooter>
                 <Button variant="ghost" onClick={() => setRuleDialogOpen(false)} className="text-gray-400">
@@ -1475,8 +1646,28 @@ export function EnhancedLogicLearning() {
                         <Zap className="w-5 h-5 text-cyan-400" />
                       </div>
                       <div className="min-w-0">
-                        <div className="text-white font-medium truncate">
-                          If contains: <span className="text-cyan-400 font-mono">{rule.pattern}</span>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-white font-medium truncate">
+                            If contains: <span className="text-cyan-400 font-mono">{rule.pattern}</span>
+                          </span>
+                          <span className={cn(
+                            'px-2 py-0.5 rounded text-[10px] font-semibold uppercase border',
+                            (rule.scope?.world || rule.prediction?.world) === 'personal'
+                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                              : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                          )}>
+                            {(rule.scope?.world || rule.prediction?.world) === 'personal' ? 'personal' : 'business'}
+                          </span>
+                          {rule.version && rule.version > 1 && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-[#0a0a0f] text-gray-400 border border-[#2a2a3e]">
+                              v{rule.version}
+                            </span>
+                          )}
+                          {rule.status === 'disabled' && (
+                            <span className="px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase bg-red-500/15 text-red-300 border border-red-500/30">
+                              disabled
+                            </span>
+                          )}
                         </div>
                         <div className="text-sm text-gray-400 truncate">
                           Then classify as: {categoryName(rule.categoryId)}
@@ -1487,6 +1678,24 @@ export function EnhancedLogicLearning() {
                       <span className="px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-xs text-green-400">
                         {rule.confidence}% confidence
                       </span>
+                      {(rule.version || 1) > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => handleRevertRule(rule)}
+                          className="px-2.5 py-1 rounded-lg text-xs border border-amber-500/30 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 transition-colors"
+                          title={`Revert to previous version v${(rule.version || 1) - 1}`}
+                        >
+                          Revert v{(rule.version || 1) - 1}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleToggleRuleStatus(rule)}
+                        className="px-2.5 py-1 rounded-lg text-xs border border-[#2a2a3e] bg-[#0a0a0f] text-gray-300 hover:text-white transition-colors"
+                        title={rule.status === 'disabled' ? 'Re-enable rule' : 'Disable rule without deleting history'}
+                      >
+                        {rule.status === 'disabled' ? 'Enable' : 'Disable'}
+                      </button>
                       <button
                         type="button"
                         className="p-2 hover:bg-blue-500/10 rounded-lg transition-colors"
@@ -1500,7 +1709,7 @@ export function EnhancedLogicLearning() {
                         disabled={deleteRuleMut.loading}
                         onClick={() => handleDeleteRule(rule.id)}
                         className="p-2 hover:bg-red-500/10 rounded-lg transition-colors disabled:opacity-50"
-                        title="Delete rule"
+                        title="Archive rule (preserves historical audit trail)"
                       >
                         <Trash2 className="w-4 h-4 text-red-400" />
                       </button>

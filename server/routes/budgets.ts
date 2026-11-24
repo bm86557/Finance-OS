@@ -15,6 +15,29 @@ import type { Budget } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
+
+async function isPersonalWorldEnabled(
+  sb: NonNullable<ReturnType<typeof getSupabaseAdminClient>>,
+  orgId: string,
+): Promise<boolean> {
+  try {
+    const { data: orgRow } = await sb
+      .from('organizations')
+      .select('personal_world_enabled, settings')
+      .eq('id', orgId)
+      .maybeSingle();
+    if (!orgRow) return false;
+    return Boolean(
+      (orgRow as any).personal_world_enabled ||
+      (orgRow as any).settings?.personal_world_enabled ||
+      (orgRow as any).settings?.enablePersonalFinance,
+    );
+  } catch {
+    return false;
+  }
+}
 
 // ── Validation ──────────────────────────────────────────────────────────────
 
@@ -190,6 +213,7 @@ export async function ensureFreshSpend(sb: ReturnType<typeof getSupabaseAdminCli
 
     if (budgets && txns) {
       for (const b of budgets) {
+        if (b.is_current === false) continue;
         const bCurrency = b.currency || 'USD';
         const spent = txns.filter(t => {
           if (['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())) return false;
@@ -206,7 +230,8 @@ export async function ensureFreshSpend(sb: ReturnType<typeof getSupabaseAdminCli
             if (effectiveDept !== b.department_id) return false;
           }
           if (b.project_id && t.project_id !== b.project_id) return false;
-          const tScope = (t as any).scope || (tags.includes('personal') ? 'personal' : tags.includes('business') ? 'business' : undefined);
+          if (b.client_id && t.client_id !== b.client_id) return false;
+          const tScope = (t as any).world_scope || (t as any).scope || (tags.includes('personal') ? 'personal' : tags.includes('business') ? 'business' : undefined);
           if (b.scope && tScope && tScope !== b.scope) return false;
           return true;
         }).reduce((sum, t) => {
@@ -260,7 +285,7 @@ export function createBudgetsRouter(): Router {
       await ensureFreshSpend(sb, orgId);
 
       const [{ data: budgets, error }, { data: categories }] = await Promise.all([
-        sb.from('budgets').select('*').eq('organization_id', orgId),
+        sb.from('budgets').select('*').eq('organization_id', orgId).eq('is_current', true),
         sb.from('categories').select('id, name').eq('organization_id', orgId),
       ]);
 
@@ -418,7 +443,7 @@ export function createBudgetsRouter(): Router {
       await ensureFreshSpend(sb, orgId);
 
       const [{ data: rows, error }, { data: categories }] = await Promise.all([
-        sb.from('budgets').select('budgeted_amount, spent_amount, status, category_id, alert_threshold').eq('organization_id', orgId),
+        sb.from('budgets').select('budgeted_amount, spent_amount, status, category_id, alert_threshold').eq('organization_id', orgId).eq('is_current', true),
         sb.from('categories').select('id, name').eq('organization_id', orgId),
       ]);
 
@@ -565,13 +590,12 @@ export function createBudgetsRouter(): Router {
   });
 
   // ── POST /:id/approve — approve budget ──────────────────────────────────
-  r.post('/:id/approve', async (req: Request, res: Response) => {
+  r.post('/:id/approve', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
-    const user = (req as any).user;
-    const approverName = user?.name || user?.email || 'admin';
+    const approverName = req.authUser?.name || req.authUser?.email || 'admin';
 
     const { data, error } = await sb
       .from('budgets')
@@ -587,11 +611,19 @@ export function createBudgetsRouter(): Router {
 
     if (error) return fail(res, 500, error.message);
     if (!data) return notFound(res, 'Budget');
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'approve_budget',
+      entityType: 'budget',
+      entityId: String(req.params.id),
+      description: `Approved budget ${data.name} (v${data.version ?? 1})`,
+      afterState: data,
+    }).catch(() => {});
     return ok(res, mapDbToDomain(data), 'Budget approved');
   });
 
   // ── POST /:id/lock — lock budget ────────────────────────────────────────
-  r.post('/:id/lock', async (req: Request, res: Response) => {
+  r.post('/:id/lock', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -606,11 +638,19 @@ export function createBudgetsRouter(): Router {
 
     if (error) return fail(res, 500, error.message);
     if (!data) return notFound(res, 'Budget');
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'lock_budget',
+      entityType: 'budget',
+      entityId: String(req.params.id),
+      description: `Locked budget ${data.name} (v${data.version ?? 1})`,
+      afterState: data,
+    }).catch(() => {});
     return ok(res, mapDbToDomain(data), 'Budget locked');
   });
 
   // ── POST / — create budget ──────────────────────────────────────────────
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body as Record<string, unknown>;
 
@@ -618,6 +658,13 @@ export function createBudgetsRouter(): Router {
     if (validationErr) return fail(res, 400, validationErr);
 
     const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Supabase client is unconfigured');
+
+    // Handoff §5 Invariant #4: Block personal-world budget writes when disabled for org
+    const requestedScope = (body.scope as Budget['scope']) || 'business';
+    if (requestedScope === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal world budgets are disabled for this organization.');
+    }
 
     // Enforce department budget limits
     const targetDeptId = (body.departmentId as string) || (body.department_id as string);
@@ -672,10 +719,15 @@ export function createBudgetsRouter(): Router {
           categoryId: (body.categoryId as string) || undefined,
           departmentId: (body.departmentId as string) || undefined,
           projectId: (body.projectId as string) || undefined,
+          clientId: (body.clientId as string) || undefined,
           budgetedAmount: Number(body.budgetedAmount),
           spentAmount: 0,
           currency: (body.currency as string) || 'USD',
           status: 'active',
+          lifecycleStatus: 'draft',
+          version: 1,
+          isCurrent: true,
+          scope: requestedScope,
           alertThreshold: Number(body.alertThreshold ?? 80),
         },
         orgId,
@@ -702,16 +754,26 @@ export function createBudgetsRouter(): Router {
         .eq('id', budgetId)
         .single();
 
-      return created(res, mapDbToDomain(refreshed || data), 'Budget created');
+      const createdBudget = mapDbToDomain(refreshed || data);
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'create_budget',
+        entityType: 'budget',
+        entityId: budgetId,
+        description: `Created budget ${createdBudget.name} (${createdBudget.budgetedAmount} ${createdBudget.currency})`,
+        afterState: refreshed || data,
+      }).catch(() => {});
+
+      return created(res, createdBudget, 'Budget created');
     }
 
     return fail(res, 503, 'Supabase client is unconfigured');
   });
 
   // ── POST /from-template — bulk-create budgets from template ─────────────
-  r.post('/from-template', async (req: Request, res: Response) => {
+  r.post('/from-template', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
-    const { templateName, totalAmount, categories, period, startDate, endDate, currency } = req.body as {
+    const { templateName, totalAmount, categories, period, startDate, endDate, currency, scope } = req.body as {
       templateName: string;
       totalAmount: number;
       categories: { category: string; percentage: number }[];
@@ -719,6 +781,7 @@ export function createBudgetsRouter(): Router {
       startDate?: string;
       endDate?: string;
       currency?: string;
+      scope?: Budget['scope'];
     };
 
     if (!templateName || !totalAmount || !Array.isArray(categories) || categories.length === 0) {
@@ -735,6 +798,10 @@ export function createBudgetsRouter(): Router {
     }
 
     const sb = getSupabaseAdminClient();
+    const resolvedScope: Budget['scope'] = scope === 'personal' ? 'personal' : 'business';
+    if (sb && resolvedScope === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal world budgets are disabled for this organization.');
+    }
     const today = new Date();
     const defaultStart = startDate || today.toISOString().split('T')[0];
     const budgetPeriod = (period as Budget['period']) || 'monthly';
@@ -746,16 +813,14 @@ export function createBudgetsRouter(): Router {
       return d.toISOString().split('T')[0];
     })();
 
-    // Resolve org currency, category IDs, and default expense account
+    // Resolve org currency and existing expense categories ONLY (never mutate AI classification categories)
     let resolvedCurrency = currency || 'USD';
     const categoryLookup = new Map<string, string>(); // lowercase name -> id
-    let defaultExpenseAccountId: string | null = null;
 
     if (sb) {
-      const [{ data: orgRow }, { data: catRows }, { data: accRows }] = await Promise.all([
+      const [{ data: orgRow }, { data: catRows }] = await Promise.all([
         sb.from('organizations').select('currency').eq('id', orgId).single(),
-        sb.from('categories').select('id, name').eq('organization_id', orgId),
-        sb.from('accounts').select('id').eq('organization_id', orgId).eq('type', 'expense').limit(1),
+        sb.from('categories').select('id, name, type').eq('organization_id', orgId).eq('type', 'expense'),
       ]);
       if (orgRow?.currency && !currency) {
         resolvedCurrency = orgRow.currency;
@@ -767,43 +832,13 @@ export function createBudgetsRouter(): Router {
           }
         }
       }
-      if (accRows && accRows.length > 0) {
-        defaultExpenseAccountId = accRows[0].id;
-      }
     }
 
-    // Intelligent category matcher with aliases
+    // Match ONLY against existing organization expense categories (exact name match only).
+    // Handoff §15 / §29 X-13: Never auto-create or alias-pollute AI Classification categories from budget templates.
     function findMatchingCategoryId(templateCatName: string): string | null {
       const target = templateCatName.toLowerCase().trim();
-      if (categoryLookup.has(target)) return categoryLookup.get(target)!;
-
-      for (const [name, id] of categoryLookup.entries()) {
-        if (name.includes(target) || target.includes(name)) return id;
-      }
-
-      const aliases: Record<string, string[]> = {
-        payroll: ['salaries', 'wages', 'people', 'team'],
-        people: ['payroll', 'salaries', 'wages'],
-        facilities: ['maintenance', 'office maintenance', 'rent', 'utilities'],
-        infrastructure: ['office maintenance', 'maintenance', 'hosting', 'tools'],
-        software: ['tools', 'software & tools', 'subscriptions'],
-        tools: ['software', 'software & tools', 'subscriptions'],
-        operations: ['office supplies', 'operating', 'supplies', 'maintenance'],
-        admin: ['office supplies', 'administration', 'general'],
-        delivery: ['direct costs', 'contractor', 'cogs'],
-        sales: ['revenue', 'sales', 'marketing'],
-        growth: ['marketing', 'sales', 'advertising'],
-        buffer: ['general', 'miscellaneous', 'operating'],
-      };
-
-      const syns = aliases[target] || [];
-      for (const syn of syns) {
-        for (const [name, id] of categoryLookup.entries()) {
-          if (name.includes(syn) || syn.includes(name)) return id;
-        }
-      }
-
-      return null;
+      return categoryLookup.get(target) ?? null;
     }
 
     const createdBudgets: Budget[] = [];
@@ -811,31 +846,7 @@ export function createBudgetsRouter(): Router {
     for (const cat of categories) {
       const budgetId = `budget-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
       const amount = Math.round((totalAmount * cat.percentage) / 100 * 100) / 100;
-      let matchedCatId = findMatchingCategoryId(cat.category);
-
-      // Auto-create category if missing so foreign key is always satisfied
-      if (!matchedCatId && defaultExpenseAccountId && sb) {
-        try {
-          const newCatId = `cat-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-          const { data: newCat } = await sb.from('categories').insert({
-            id: newCatId,
-            organization_id: orgId,
-            name: cat.category,
-            type: 'expense',
-            account_id: defaultExpenseAccountId,
-            color: '#06b6d4',
-            icon: 'folder',
-          }).select().single();
-
-          if (newCat && newCat.id) {
-            const newId = String(newCat.id);
-            matchedCatId = newId;
-            categoryLookup.set(cat.category.toLowerCase().trim(), newId);
-          }
-        } catch {
-          // If creation fails, proceed with null
-        }
-      }
+      const matchedCatId = findMatchingCategoryId(cat.category);
 
       if (sb) {
         const dbPayload = {
@@ -850,6 +861,10 @@ export function createBudgetsRouter(): Router {
           spent_amount: 0,
           currency: resolvedCurrency,
           status: 'active',
+          lifecycle_status: 'draft',
+          version: 1,
+          is_current: true,
+          scope: resolvedScope,
           alert_threshold: 80,
         };
 
@@ -868,16 +883,21 @@ export function createBudgetsRouter(): Router {
       }
     }
 
-
-
-    // Recompute spent amounts
     if (sb) {
       await ensureFreshSpend(sb, orgId);
-      // Fetch fresh created items
       const { data: freshList } = await sb
         .from('budgets')
         .select('*')
         .in('id', createdBudgets.map(b => b.id));
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'create_budgets_from_template',
+        entityType: 'budget',
+        entityId: createdBudgets[0]?.id || templateName,
+        description: `Applied budget template "${templateName}" (${createdBudgets.length} budgets, total ${totalAmount} ${resolvedCurrency})`,
+        afterState: { templateName, totalAmount, count: createdBudgets.length },
+      }).catch(() => {});
 
       if (freshList && freshList.length > 0) {
         return ok(res, freshList.map(mapDbToDomain), `${createdBudgets.length} budgets created from ${templateName} template`);
@@ -888,7 +908,7 @@ export function createBudgetsRouter(): Router {
   });
 
   // ── POST /:id/roll-forward — roll budget forward to next period ──────────
-  r.post('/:id/roll-forward', async (req: Request, res: Response) => {
+  r.post('/:id/roll-forward', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
 
@@ -941,10 +961,16 @@ export function createBudgetsRouter(): Router {
         category_id: existing.categoryId || null,
         department_id: existing.departmentId || null,
         project_id: existing.projectId || null,
+        client_id: existing.clientId || null,
         budgeted_amount: existing.budgetedAmount,
         spent_amount: 0,
         currency: existing.currency,
         status: 'active',
+        lifecycle_status: 'draft',
+        version: 1,
+        is_current: true,
+        scope: existing.scope || 'business',
+        rolled_from_id: existing.id,
         alert_threshold: existing.alertThreshold ?? 80,
       };
 
@@ -964,6 +990,15 @@ export function createBudgetsRouter(): Router {
         .eq('id', newBudgetId)
         .single();
 
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'roll_forward_budget',
+        entityType: 'budget',
+        entityId: newBudgetId,
+        description: `Rolled forward budget "${existing.name}" from ${existing.id} to ${nextStartStr}..${nextEndStr}`,
+        afterState: refreshed || createdRow,
+      }).catch(() => {});
+
       return created(res, mapDbToDomain(refreshed || createdRow), 'Budget rolled forward successfully');
     }
 
@@ -971,7 +1006,7 @@ export function createBudgetsRouter(): Router {
   });
 
   // ── PATCH /:id — update budget ──────────────────────────────────────────
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body as Record<string, unknown>;
 
@@ -979,6 +1014,9 @@ export function createBudgetsRouter(): Router {
     if (validationErr) return fail(res, 400, validationErr);
 
     const sb = getSupabaseAdminClient();
+    if (sb && body.scope === 'personal' && !(await isPersonalWorldEnabled(sb, orgId))) {
+      return fail(res, 400, 'WORLD_DISABLED: Personal world budgets are disabled for this organization.');
+    }
 
     if (sb) {
       const { data: existing, error: fetchErr } = await sb
@@ -1075,6 +1113,15 @@ export function createBudgetsRouter(): Router {
 
         await ensureFreshSpend(sb, orgId);
         const { data: refreshed } = await sb.from('budgets').select('*').eq('id', newVersionId).single();
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'version_budget',
+          entityType: 'budget',
+          entityId: newVersionId,
+          description: `Created budget version v${newVersionNum} from ${existing.id}`,
+          beforeState: existing,
+          afterState: refreshed || createdRow,
+        }).catch(() => {});
         return created(res, mapDbToDomain(refreshed || createdRow), `Created new budget version (v${newVersionNum})`);
       }
 
@@ -1100,6 +1147,16 @@ export function createBudgetsRouter(): Router {
         .eq('id', req.params.id)
         .single();
 
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'update_budget',
+        entityType: 'budget',
+        entityId: String(req.params.id),
+        description: `Updated budget ${existing.name}`,
+        beforeState: existing,
+        afterState: refreshed || data,
+      }).catch(() => {});
+
       return ok(res, mapDbToDomain(refreshed || data));
     }
 
@@ -1109,20 +1166,23 @@ export function createBudgetsRouter(): Router {
   });
 
   // ── DELETE /:id — delete budget ─────────────────────────────────────────
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
 
     if (sb) {
       const { data: existing, error: fetchErr } = await sb
         .from('budgets')
-        .select('id')
+        .select('*')
         .eq('id', req.params.id)
         .eq('organization_id', orgId)
         .maybeSingle();
 
       if (fetchErr) return fail(res, 500, fetchErr.message);
       if (!existing) return notFound(res, 'Budget');
+      if (existing.lifecycle_status === 'locked') {
+        return fail(res, 400, 'Cannot delete a locked budget. Create a new version instead.');
+      }
 
       const { error } = await sb
         .from('budgets')
@@ -1134,6 +1194,15 @@ export function createBudgetsRouter(): Router {
         console.error('[budgets] delete error:', error);
         return fail(res, 500, error.message);
       }
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'delete_budget',
+        entityType: 'budget',
+        entityId: String(req.params.id),
+        description: `Deleted budget ${existing.name}`,
+        beforeState: existing,
+      }).catch(() => {});
 
       return ok(res, null, 'Budget deleted');
     }

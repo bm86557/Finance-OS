@@ -786,3 +786,621 @@ export function computeCashFlowSnapshot(params: {
     };
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Upcoming Payments & Expenses Engine (Handoff v1.2 §§1, 5, 6, 7, 8, 13, 29, 33)
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type UpcomingSourceType = 'recurring' | 'loan' | 'payroll' | 'invoice' | 'reimbursement';
+
+export interface UpcomingItem {
+  id: string;
+  date: string;
+  isoDate: string;
+  title: string;
+  amount: number;
+  rawAmount: number;
+  currency: string;
+  originalCurrency: string;
+  type: 'credit' | 'debit';
+  sourceType: UpcomingSourceType;
+  sourceId: string;
+  isOverdue: boolean;
+  daysOverdue?: number;
+  subtitle?: string;
+}
+
+export interface UpcomingObligationsSnapshot {
+  upcomingPayments: UpcomingItem[];
+  upcomingExpenses: UpcomingItem[];
+  overduePayments: UpcomingItem[];
+  overdueExpenses: UpcomingItem[];
+  totalUpcomingPayments: number;
+  totalUpcomingExpenses: number;
+  totalOverduePayments: number;
+  totalOverdueExpenses: number;
+  remainingMonthlyPayroll: number;
+  windowStart: string;
+  windowEnd: string;
+  basis: 'cash_scheduled';
+  currency: string;
+  worldScope: WorldFilter;
+}
+
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
+const LONG_MONTHS = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+] as const;
+
+/**
+ * Strict active membership predicate.
+ * Prevents `status: 'pending' | 'inactive' | 'terminated'` members from being
+ * counted simply because `is_active` is undefined on `organization_members`.
+ */
+export function isActiveOrgMember(member: Record<string, any> | null | undefined): boolean {
+  if (!member) return false;
+  const st = String(member.status ?? '').toLowerCase().trim();
+  if (st.length > 0) {
+    return st === 'active';
+  }
+  return member.is_active !== false;
+}
+
+function toIsoDateUtc(input: unknown): string | null {
+  if (!input) return null;
+  if (input instanceof Date) {
+    if (isNaN(input.getTime())) return null;
+    const y = input.getUTCFullYear();
+    const m = String(input.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(input.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(input).trim();
+  const isoMatch = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (isoMatch) {
+    const y = Number(isoMatch[1]);
+    const m = Number(isoMatch[2]);
+    const d = Number(isoMatch[3]);
+    const probe = new Date(Date.UTC(y, m - 1, d));
+    if (probe.getUTCFullYear() === y && probe.getUTCMonth() === m - 1 && probe.getUTCDate() === d) {
+      return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+    }
+    return null;
+  }
+  const parsed = new Date(s);
+  if (isNaN(parsed.getTime())) return null;
+  return `${parsed.getUTCFullYear()}-${String(parsed.getUTCMonth() + 1).padStart(2, '0')}-${String(parsed.getUTCDate()).padStart(2, '0')}`;
+}
+
+function parseIsoUtcParts(iso: string): { year: number; month0: number; day: number; ms: number } {
+  const [y, m, d] = iso.split('-').map(Number);
+  return { year: y, month0: m - 1, day: d, ms: Date.UTC(y, m - 1, d) };
+}
+
+function formatIsoFromParts(year: number, month0: number, day: number): string {
+  const dt = new Date(Date.UTC(year, month0, day));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+function addDaysUtc(iso: string, days: number): string {
+  const { year, month0, day } = parseIsoUtcParts(iso);
+  return formatIsoFromParts(year, month0, day + days);
+}
+
+function addMonthsClampedUtc(iso: string, monthsToAdd: number): string {
+  const { year, month0, day } = parseIsoUtcParts(iso);
+  const targetFirst = new Date(Date.UTC(year, month0 + monthsToAdd, 1));
+  const lastDayOfTarget = new Date(Date.UTC(targetFirst.getUTCFullYear(), targetFirst.getUTCMonth() + 1, 0)).getUTCDate();
+  return formatIsoFromParts(targetFirst.getUTCFullYear(), targetFirst.getUTCMonth(), Math.min(day, lastDayOfTarget));
+}
+
+function advanceIsoByFrequency(iso: string, frequency?: string): string {
+  const f = String(frequency || 'monthly').toLowerCase().trim();
+  if (f === 'daily') return addDaysUtc(iso, 1);
+  if (f === 'weekly') return addDaysUtc(iso, 7);
+  if (f === 'biweekly' || f === 'bi-weekly') return addDaysUtc(iso, 14);
+  if (f === 'quarterly') return addMonthsClampedUtc(iso, 3);
+  if (f === 'yearly' || f === 'annual' || f === 'annually') return addMonthsClampedUtc(iso, 12);
+  return addMonthsClampedUtc(iso, 1);
+}
+
+function diffDaysUtc(fromIso: string, toIso: string): number {
+  return Math.round((parseIsoUtcParts(toIso).ms - parseIsoUtcParts(fromIso).ms) / 86_400_000);
+}
+
+function formatDisplayDateUtc(iso: string): string {
+  const { month0, day } = parseIsoUtcParts(iso);
+  return `${SHORT_MONTHS[month0]} ${day}`;
+}
+
+function endOfMonthIsoUtc(year: number, month0: number): string {
+  const dt = new Date(Date.UTC(year, month0 + 1, 0));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+function payslipMatchesMonth(ps: Record<string, any>, year: number, month0: number): boolean {
+  const ym = `${year}-${String(month0 + 1).padStart(2, '0')}`;
+  const periodRaw = String(ps.period || '').toLowerCase().trim();
+  if (periodRaw) {
+    if (periodRaw.includes(ym)) return true;
+    const longMonth = LONG_MONTHS[month0];
+    const shortMonth = SHORT_MONTHS[month0].toLowerCase();
+    const hasYear = periodRaw.includes(String(year));
+    const hasMonth = periodRaw.includes(longMonth) || new RegExp(`\\b${shortMonth}\\b`).test(periodRaw);
+    if (hasYear && hasMonth) return true;
+    // Handle MM/YYYY or MM-YYYY
+    const mm = String(month0 + 1).padStart(2, '0');
+    if (periodRaw === `${mm}/${year}` || periodRaw === `${mm}-${year}`) return true;
+    return false;
+  }
+  const issueIso = toIsoDateUtc(ps.issue_date || ps.paid_date);
+  return Boolean(issueIso && issueIso.startsWith(ym));
+}
+
+function sortUpcomingItems(items: UpcomingItem[]): UpcomingItem[] {
+  return items.sort((a, b) => {
+    if (a.isoDate !== b.isoDate) return a.isoDate.localeCompare(b.isoDate);
+    if (b.amount !== a.amount) return b.amount - a.amount;
+    return a.title.localeCompare(b.title);
+  });
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/**
+ * Authoritative 30-day Upcoming Payments & Expenses Engine.
+ *
+ * Strictly enforces Handoff v1.2 invariants:
+ *  - Zero mock data; 100% real org Supabase rows.
+ *  - World isolation (`business` vs `personal` vs `all`) across recurring schedules, loans, payroll, invoices, and reimbursements.
+ *  - Calendar-date cutoffs (`today` .. `today + horizonDays`) with explicit overdue separation (`isoDate < today`).
+ *  - Recurring expiration (`end_date`, `generated_occurrence_count >= total_occurrences_expected`) and multi-occurrence expansion (weekly/daily).
+ *  - Loan double-payment prevention (`loan_payments` + `last_payment_month`), null-date rejection, and remaining-obligation cap.
+ *  - Customer invoices (`issued`, `sent`, `partially_paid`, `overdue` with `amount_due > 0`).
+ *  - Remaining unpaid Team Payroll (`organization_members` strictly `status === 'active'` minus already-paid/issued `employee_payslips` for the current month), RBAC-masked for non-privileged roles, deduplicated against recurring payroll templates.
+ *  - Approved unreimbursed `employee_expenses` (`status === 'approved'`, no `settlement_transaction_id`, not already bundled into a non-voided payslip).
+ *  - Deterministic chronological sorting and base-currency normalization.
+ */
+export function computeUpcomingObligations(params: {
+  orgCurrency: string;
+  worldFilter: WorldFilter;
+  includePayrollConfidential: boolean;
+  allOrgBanks: Record<string, any>[];
+  bankWorldMap: Map<string, 'business' | 'personal'>;
+  recurringRows: Record<string, any>[];
+  loanRows: Record<string, any>[];
+  loanPaymentRows?: Record<string, any>[];
+  memberRows: Record<string, any>[];
+  payslipRows?: Record<string, any>[];
+  employeeExpenseRows?: Record<string, any>[];
+  invoiceRows?: Record<string, any>[];
+  asOfDate?: Date | string;
+  horizonDays?: number;
+}): UpcomingObligationsSnapshot {
+  const {
+    orgCurrency,
+    worldFilter,
+    includePayrollConfidential,
+    allOrgBanks,
+    bankWorldMap,
+    recurringRows,
+    loanRows,
+    loanPaymentRows = [],
+    memberRows,
+    payslipRows = [],
+    employeeExpenseRows = [],
+    invoiceRows = [],
+    asOfDate = new Date(),
+    horizonDays = 30,
+  } = params;
+
+  const baseCurr = String(orgCurrency || 'USD').toUpperCase().trim();
+  // Use local calendar date when given a live Date so the user's day matches their cockpit,
+  // or exact ISO date when passed as string (for deterministic golden tests).
+  const todayStr =
+    typeof asOfDate === 'string'
+      ? (toIsoDateUtc(asOfDate) || toIsoDateUtc(new Date())!)
+      : `${asOfDate.getFullYear()}-${String(asOfDate.getMonth() + 1).padStart(2, '0')}-${String(asOfDate.getDate()).padStart(2, '0')}`;
+  const horizonEndStr = addDaysUtc(todayStr, Math.max(1, horizonDays));
+
+  const upcomingPayments: UpcomingItem[] = [];
+  const upcomingExpenses: UpcomingItem[] = [];
+  const overduePayments: UpcomingItem[] = [];
+  const overdueExpenses: UpcomingItem[] = [];
+
+  const allBankIds = new Set((allOrgBanks || []).map((b) => String(b.id)));
+
+  // ── 1. Recurring Transactions ────────────────────────────────────────────
+  for (const rec of recurringRows || []) {
+    if (rec.is_active === false || rec.isActive === false) continue;
+
+    const rawAmt = Math.abs(Number(rec.amount || 0));
+    if (!Number.isFinite(rawAmt) || rawAmt <= 0) continue;
+
+    // World isolation via linked bank account or explicit world_scope/usage
+    const bankId = rec.bank_account_id ? String(rec.bank_account_id) : '';
+    const bankWorld = bankId ? bankWorldMap.get(bankId) : undefined;
+    if (bankId && !bankWorld && allBankIds.has(bankId)) {
+      // Linked to another user's private personal bank account
+      continue;
+    }
+    const recWorld: 'business' | 'personal' =
+      bankWorld || (rec.world_scope === 'personal' || rec.usage === 'personal' ? 'personal' : 'business');
+    if (worldFilter !== 'all' && recWorld !== worldFilter) continue;
+
+    const nextIso = toIsoDateUtc(rec.next_occurrence || rec.nextOccurrence || rec.start_date || rec.startDate);
+    if (!nextIso) continue;
+
+    const endDateIso = toIsoDateUtc(rec.end_date || rec.endDate);
+    const genCount = Number(rec.generated_occurrence_count ?? rec.generatedOccurrenceCount ?? 0);
+    const expectedRaw = rec.total_occurrences_expected ?? rec.totalOccurrencesExpected;
+    const expectedCount = expectedRaw != null && expectedRaw !== '' ? Number(expectedRaw) : null;
+
+    // Strict expiration & completion checks
+    if (expectedCount != null && Number.isFinite(expectedCount) && genCount >= expectedCount) {
+      continue;
+    }
+    if (endDateIso && nextIso > endDateIso) {
+      continue;
+    }
+
+    const origCurr = String(rec.currency || baseCurr).toUpperCase().trim();
+    const convAmt = round2(convertCurrency(rawAmt, origCurr, baseCurr));
+    const direction: 'credit' | 'debit' = rec.type === 'credit' ? 'credit' : 'debit';
+    const freq = String(rec.frequency || 'monthly').toLowerCase().trim();
+    const title = String(rec.description || 'Recurring Transaction').trim() || 'Recurring Transaction';
+
+    const maxRemainingRuns =
+      expectedCount != null && Number.isFinite(expectedCount)
+        ? Math.max(0, expectedCount - genCount)
+        : 120;
+
+    let curIso = nextIso;
+    let runIndex = 0;
+    let overdueEmitted = false;
+
+    while (curIso <= horizonEndStr && runIndex < maxRemainingRuns && runIndex < 120) {
+      if (endDateIso && curIso > endDateIso) break;
+
+      if (curIso < todayStr) {
+        // Emit the overdue occurrence once (matches recurring_generate_due semantics)
+        if (!overdueEmitted) {
+          overdueEmitted = true;
+          const item: UpcomingItem = {
+            id: `rec-overdue-${rec.id}-${curIso}`,
+            date: formatDisplayDateUtc(curIso),
+            isoDate: curIso,
+            title,
+            amount: convAmt,
+            rawAmount: round2(rawAmt),
+            currency: baseCurr,
+            originalCurrency: origCurr,
+            type: direction,
+            sourceType: 'recurring',
+            sourceId: String(rec.id),
+            isOverdue: true,
+            daysOverdue: diffDaysUtc(curIso, todayStr),
+          };
+          if (direction === 'credit') overduePayments.push(item);
+          else overdueExpenses.push(item);
+        }
+      } else {
+        const item: UpcomingItem = {
+          id: `rec-${rec.id}-${curIso}`,
+          date: formatDisplayDateUtc(curIso),
+          isoDate: curIso,
+          title,
+          amount: convAmt,
+          rawAmount: round2(rawAmt),
+          currency: baseCurr,
+          originalCurrency: origCurr,
+          type: direction,
+          sourceType: 'recurring',
+          sourceId: String(rec.id),
+          isOverdue: false,
+        };
+        if (direction === 'credit') upcomingPayments.push(item);
+        else upcomingExpenses.push(item);
+      }
+
+      runIndex++;
+      const nextStep = advanceIsoByFrequency(curIso, freq);
+      if (nextStep <= curIso) break; // safety guard
+      curIso = nextStep;
+    }
+  }
+
+  // ── 2. Active Loan Installments (business / all world) ───────────────────
+  if (worldFilter !== 'personal') {
+    const paidLoanMonths = new Set<string>();
+    for (const lp of loanPaymentRows || []) {
+      if (lp.loan_id && lp.payment_month) {
+        paidLoanMonths.add(`${String(lp.loan_id)}:${String(lp.payment_month).slice(0, 7)}`);
+      }
+    }
+
+    for (const loan of loanRows || []) {
+      const status = String(loan.status || 'active').toLowerCase().trim();
+      if (['paid', 'defaulted', 'cancelled'].includes(status)) continue;
+
+      const principal = Number(loan.principal ?? loan.amount ?? 0);
+      const paid = Number(loan.amount_paid ?? 0);
+      const remaining = Number(loan.remaining_balance ?? Math.max(0, principal - paid));
+      if (!Number.isFinite(remaining) || remaining <= 0) continue;
+
+      const declaredInst = Number(loan.installment_amount ?? 0);
+      if (!Number.isFinite(declaredInst) || declaredInst <= 0) continue;
+
+      // Require a valid date — never fabricate an undated "Upcoming" row
+      let nextIso = toIsoDateUtc(loan.next_payment_date || loan.due_date);
+      if (!nextIso) continue;
+
+      if (loan.last_payment_month) {
+        paidLoanMonths.add(`${String(loan.id)}:${String(loan.last_payment_month).slice(0, 7)}`);
+      }
+
+      // Guard against showing an installment whose month was already paid
+      const loanFreq = String(loan.frequency || 'monthly').toLowerCase().trim();
+      let advanceGuard = 0;
+      while (paidLoanMonths.has(`${String(loan.id)}:${nextIso.slice(0, 7)}`) && advanceGuard < 12) {
+        nextIso = advanceIsoByFrequency(nextIso, loanFreq);
+        advanceGuard++;
+      }
+
+      if (nextIso > horizonEndStr) continue;
+
+      // Cap final installment to remaining balance + accrued interest
+      const accruedInterest = Math.max(0, Number(loan.accrued_interest || 0));
+      const effectiveInst = Math.min(declaredInst, remaining + accruedInterest);
+      if (effectiveInst <= 0) continue;
+
+      const origCurr = String(loan.currency || baseCurr).toUpperCase().trim();
+      const convAmt = round2(convertCurrency(effectiveInst, origCurr, baseCurr));
+      const isReceivable = loan.type === 'to_receive';
+      const direction: 'credit' | 'debit' = isReceivable ? 'credit' : 'debit';
+      const title =
+        String(loan.description || '').trim() ||
+        (isReceivable ? `Loan Collection · ${loan.party || ''}`.trim() : `Loan Repayment · ${loan.party || ''}`.trim());
+
+      const isOverdue = nextIso < todayStr;
+      const item: UpcomingItem = {
+        id: `loan-${loan.id}-${nextIso}`,
+        date: formatDisplayDateUtc(nextIso),
+        isoDate: nextIso,
+        title,
+        amount: convAmt,
+        rawAmount: round2(effectiveInst),
+        currency: baseCurr,
+        originalCurrency: origCurr,
+        type: direction,
+        sourceType: 'loan',
+        sourceId: String(loan.id),
+        isOverdue,
+        ...(isOverdue ? { daysOverdue: diffDaysUtc(nextIso, todayStr) } : {}),
+      };
+
+      if (isOverdue) {
+        if (isReceivable) overduePayments.push(item);
+        else overdueExpenses.push(item);
+      } else {
+        if (isReceivable) upcomingPayments.push(item);
+        else upcomingExpenses.push(item);
+      }
+    }
+  }
+
+  // ── 3. Open Issued Customer Invoices (Receivables — §29 X-12) ────────────
+  if (worldFilter !== 'personal') {
+    const collectibleStatuses = new Set(['issued', 'sent', 'partially_paid', 'overdue']);
+    for (const inv of invoiceRows || []) {
+      const status = String(inv.status || '').toLowerCase().trim();
+      if (!collectibleStatuses.has(status)) continue;
+
+      const amountDue = Number(inv.amount_due ?? Math.max(0, Number(inv.total_amount || 0) - Number(inv.amount_paid || 0)));
+      if (!Number.isFinite(amountDue) || amountDue <= 0) continue;
+
+      const dueIso = toIsoDateUtc(inv.due_date);
+      if (!dueIso || dueIso > horizonEndStr) continue;
+
+      const origCurr = String(inv.currency || baseCurr).toUpperCase().trim();
+      const convAmt = round2(convertCurrency(amountDue, origCurr, baseCurr));
+      const invNum = String(inv.invoice_number || '').trim();
+      const clientName = String(inv.client_name || '').trim();
+      const title = clientName && invNum
+        ? `${invNum} · ${clientName}`
+        : (clientName || invNum || 'Customer Invoice');
+
+      const isOverdue = dueIso < todayStr;
+      const item: UpcomingItem = {
+        id: `inv-${inv.id}-${dueIso}`,
+        date: formatDisplayDateUtc(dueIso),
+        isoDate: dueIso,
+        title,
+        amount: convAmt,
+        rawAmount: round2(amountDue),
+        currency: baseCurr,
+        originalCurrency: origCurr,
+        type: 'credit',
+        sourceType: 'invoice',
+        sourceId: String(inv.id),
+        isOverdue,
+        ...(isOverdue ? { daysOverdue: diffDaysUtc(dueIso, todayStr) } : {}),
+      };
+
+      if (isOverdue) overduePayments.push(item);
+      else upcomingPayments.push(item);
+    }
+  }
+
+  // ── 4. Remaining Unpaid Team Payroll (§5, §20, §29 X-07, §33 #1/#3/#11) ──
+  let remainingMonthlyPayroll = 0;
+  if (worldFilter !== 'personal' && includePayrollConfidential) {
+    const hasRecurringPayrollInWindow = upcomingExpenses.some(
+      (e) => e.sourceType === 'recurring' && /\b(payroll|salaries|team\s+payroll)\b/i.test(e.title),
+    );
+
+    const { year: curYear, month0: curMonth0 } = parseIsoUtcParts(todayStr);
+    const activeMembers = (memberRows || []).filter(isActiveOrgMember);
+
+    // Map already-paid/issued salary per user_id for the current month (excluding voided/draft payslips)
+    const paidSalaryByUser = new Map<string, number>();
+    const settledStatuses = new Set(['paid', 'issued', 'processing']);
+    for (const ps of payslipRows || []) {
+      const psStatus = String(ps.status || '').toLowerCase().trim();
+      if (!settledStatuses.has(psStatus)) continue;
+      if (!payslipMatchesMonth(ps, curYear, curMonth0)) continue;
+
+      const uid = String(ps.user_id || '');
+      if (!uid) continue;
+
+      const explicitSal = Number(ps.salary_amount || 0);
+      const reimb = Number(ps.reimbursement_amount || 0);
+      const grossOrNet = Number(ps.gross ?? ps.net ?? 0);
+      const nativeSalPaid = explicitSal > 0 ? explicitSal : Math.max(0, grossOrNet - reimb);
+      if (nativeSalPaid <= 0) continue;
+
+      const psCurr = String(ps.currency || baseCurr).toUpperCase().trim();
+      const paidBase = convertCurrency(nativeSalPaid, psCurr, baseCurr);
+      paidSalaryByUser.set(uid, round2((paidSalaryByUser.get(uid) || 0) + paidBase));
+    }
+
+    let fullMonthlyPayroll = 0;
+    let totalSalariedHeadcount = 0;
+    let unpaidSalariedHeadcount = 0;
+
+    for (const m of activeMembers) {
+      const salNative = Number(m.fixed_salary || m.salary || 0);
+      if (!Number.isFinite(salNative) || salNative <= 0) continue;
+
+      const salCurr = String(m.salary_currency || m.currency || baseCurr).toUpperCase().trim();
+      const salBase = round2(convertCurrency(salNative, salCurr, baseCurr));
+      fullMonthlyPayroll = round2(fullMonthlyPayroll + salBase);
+      totalSalariedHeadcount++;
+
+      const uid = String(m.user_id || m.id || '');
+      const alreadyPaid = paidSalaryByUser.get(uid) || 0;
+      const remaining = Math.max(0, round2(salBase - alreadyPaid));
+      if (remaining > 0.01) {
+        remainingMonthlyPayroll = round2(remainingMonthlyPayroll + remaining);
+        unpaidSalariedHeadcount++;
+      }
+    }
+
+    if (!hasRecurringPayrollInWindow) {
+      const curMonthEndIso = endOfMonthIsoUtc(curYear, curMonth0);
+      if (remainingMonthlyPayroll > 0 && curMonthEndIso >= todayStr && curMonthEndIso <= horizonEndStr) {
+        upcomingExpenses.push({
+          id: `payroll-${curMonthEndIso}`,
+          date: formatDisplayDateUtc(curMonthEndIso),
+          isoDate: curMonthEndIso,
+          title: 'Team Payroll',
+          amount: remainingMonthlyPayroll,
+          rawAmount: remainingMonthlyPayroll,
+          currency: baseCurr,
+          originalCurrency: baseCurr,
+          type: 'debit',
+          sourceType: 'payroll',
+          sourceId: `payroll-${curMonthEndIso}`,
+          isOverdue: false,
+          ...(unpaidSalariedHeadcount < totalSalariedHeadcount
+            ? { subtitle: `${unpaidSalariedHeadcount} of ${totalSalariedHeadcount} remaining` }
+            : {}),
+        });
+      } else if (remainingMonthlyPayroll === 0 && fullMonthlyPayroll > 0) {
+        // Current month fully settled — project next month-end if it falls within the 30-day horizon
+        const nextMonthEndIso = endOfMonthIsoUtc(curYear, curMonth0 + 1);
+        if (nextMonthEndIso >= todayStr && nextMonthEndIso <= horizonEndStr) {
+          upcomingExpenses.push({
+            id: `payroll-${nextMonthEndIso}`,
+            date: formatDisplayDateUtc(nextMonthEndIso),
+            isoDate: nextMonthEndIso,
+            title: 'Team Payroll',
+            amount: fullMonthlyPayroll,
+            rawAmount: fullMonthlyPayroll,
+            currency: baseCurr,
+            originalCurrency: baseCurr,
+            type: 'debit',
+            sourceType: 'payroll',
+            sourceId: `payroll-${nextMonthEndIso}`,
+            isOverdue: false,
+          });
+        }
+      }
+    }
+  }
+
+  // ── 5. Approved Unreimbursed Employee Expenses (§29 X-05, §33 #3) ────────
+  if (worldFilter !== 'personal') {
+    const settledExpenseIds = new Set<string>();
+    for (const ps of payslipRows || []) {
+      const psStatus = String(ps.status || '').toLowerCase().trim();
+      if (psStatus === 'voided' || psStatus === 'draft') continue;
+      if (Array.isArray(ps.linked_expense_ids)) {
+        for (const eid of ps.linked_expense_ids) {
+          if (eid) settledExpenseIds.add(String(eid));
+        }
+      }
+    }
+
+    for (const exp of employeeExpenseRows || []) {
+      const status = String(exp.status || '').toLowerCase().trim();
+      // Only approved claims awaiting actual payout; exclude draft, submitted, rejected, reimbursed
+      if (status !== 'approved') continue;
+      if (exp.settlement_transaction_id || exp.reimbursed_at) continue;
+      if (settledExpenseIds.has(String(exp.id))) continue;
+
+      const rawAmt = Math.abs(Number(exp.amount || 0));
+      if (!Number.isFinite(rawAmt) || rawAmt <= 0) continue;
+
+      const origCurr = String(exp.currency || baseCurr).toUpperCase().trim();
+      const convAmt = round2(convertCurrency(rawAmt, origCurr, baseCurr));
+      const expDateIso = toIsoDateUtc(exp.date);
+      const dueIso = expDateIso && expDateIso > todayStr && expDateIso <= horizonEndStr ? expDateIso : todayStr;
+
+      upcomingExpenses.push({
+        id: `reimb-${exp.id}`,
+        date: formatDisplayDateUtc(dueIso),
+        isoDate: dueIso,
+        title: String(exp.description || 'Employee Reimbursement').trim() || 'Employee Reimbursement',
+        amount: convAmt,
+        rawAmount: round2(rawAmt),
+        currency: baseCurr,
+        originalCurrency: origCurr,
+        type: 'debit',
+        sourceType: 'reimbursement',
+        sourceId: String(exp.id),
+        isOverdue: false,
+      });
+    }
+  }
+
+  sortUpcomingItems(upcomingPayments);
+  sortUpcomingItems(upcomingExpenses);
+  sortUpcomingItems(overduePayments);
+  sortUpcomingItems(overdueExpenses);
+
+  const totalUpcomingPayments = round2(upcomingPayments.reduce((s, i) => s + i.amount, 0));
+  const totalUpcomingExpenses = round2(upcomingExpenses.reduce((s, i) => s + i.amount, 0));
+  const totalOverduePayments = round2(overduePayments.reduce((s, i) => s + i.amount, 0));
+  const totalOverdueExpenses = round2(overdueExpenses.reduce((s, i) => s + i.amount, 0));
+
+  return {
+    upcomingPayments,
+    upcomingExpenses,
+    overduePayments,
+    overdueExpenses,
+    totalUpcomingPayments,
+    totalUpcomingExpenses,
+    totalOverduePayments,
+    totalOverdueExpenses,
+    remainingMonthlyPayroll,
+    windowStart: todayStr,
+    windowEnd: horizonEndStr,
+    basis: 'cash_scheduled',
+    currency: baseCurr,
+    worldScope: worldFilter,
+  };
+}

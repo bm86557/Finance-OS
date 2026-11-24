@@ -12,6 +12,7 @@ import { organizationService } from '@/services/organizationService';
 import { employeeService } from '@/services/employeeService';
 import { projectService } from '@/services/projectService';
 import { formatDate } from '@/lib/formatters';
+import { computeProjectSchedulePreview } from '@/lib/projectScheduleHours';
 import type { Project, ProjectTask } from '@/services/types';
 
 type ProjectCardVM = {
@@ -129,27 +130,11 @@ export function MyProjects() {
     const todayIso = new Date().toISOString().split('T')[0];
 
     return assignedList.map(p => {
-      // Real hours logged on this project from timesheets
+      // Automatic Mon–Fri schedule hours (40h/wk, 160h/mo) + optional personal log visibility
       const myEntries = userTimesheets.filter(t => t.projectId === p.id);
       const myHours = myEntries.reduce((sum, t) => sum + Number(t.hours || 0), 0);
 
       const teamEntries = orgTimesheets.filter(t => t.projectId === p.id);
-      const totalTeamHours = teamEntries.reduce((sum, t) => sum + Number(t.hours || 0), 0);
-
-      const hoursLogged = myHours > 0 ? myHours : totalTeamHours;
-
-      // Project start date & timeline phase breakdown (Master Spec §13 & §12.4)
-      const isPreKickoff = Boolean(p.startDate && todayIso < p.startDate);
-      const preKickoffHours = myEntries
-        .filter(t => p.startDate && t.date < p.startDate)
-        .reduce((sum, t) => sum + Number(t.hours || 0), 0);
-      const deliveryHours = myEntries
-        .filter(t => !p.startDate || t.date >= p.startDate)
-        .reduce((sum, t) => sum + Number(t.hours || 0), 0);
-
-      // Realistic project capacity: standard 160h monthly capacity
-      const monthlyCapacity = 160;
-      const estimatedHours = p.quotedAmount ? Math.max(160, Math.round(Number(p.quotedAmount) / 75)) : 160;
 
       // Team members working on or assigned to this project
       const projectTeamMembers = members.filter(m => {
@@ -158,6 +143,36 @@ export function MyProjects() {
         const loggedTime = teamEntries.some(t => t.userId === m.userId);
         return isAssigned || loggedTime;
       });
+
+      const schedPreview = computeProjectSchedulePreview({
+        startDate: p.startDate,
+        endDate: p.endDate,
+        status: p.status,
+        completedAt: p.completedAt,
+        pausedAt: p.pausedAt,
+        pausedBusinessDays: p.pausedBusinessDays,
+        budgetedHours: p.budgetedHours,
+        memberCount: Math.max(1, projectTeamMembers.length || p.plannedTeamSize || 1),
+      });
+
+      const hoursLogged = schedPreview.elapsedHours > 0 ? schedPreview.elapsedHours : myHours;
+
+      // Project start date & timeline phase breakdown (Master Spec §13 & §12.4)
+      const isPreKickoff = Boolean(p.startDate && todayIso < p.startDate);
+      const preKickoffHours = myEntries
+        .filter(t => p.startDate && t.date < p.startDate)
+        .reduce((sum, t) => sum + Number(t.hours || 0), 0);
+      const deliveryHours = schedPreview.elapsedHours > 0
+        ? schedPreview.elapsedHours
+        : myEntries
+            .filter(t => !p.startDate || t.date >= p.startDate)
+            .reduce((sum, t) => sum + Number(t.hours || 0), 0);
+
+      // Realistic project capacity: standard 160h monthly capacity
+      const monthlyCapacity = 160;
+      const estimatedHours = schedPreview.plannedHours > 0
+        ? schedPreview.plannedHours
+        : (p.quotedAmount ? Math.max(160, Math.round(Number(p.quotedAmount) / 75)) : 160);
 
       // Realistic progress calculation:
       let progress = 0;

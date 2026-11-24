@@ -21,6 +21,21 @@ import {
   refreshSupabaseAccessToken,
 } from '@/lib/supabaseClient';
 import { getApiBaseUrl } from '@/lib/apiClient';
+import { dataStore } from './dataStore';
+
+const REPORT_CACHE_INVALIDATING_COLLECTIONS = [
+  'transactions',
+  'bankAccounts',
+  'accounts',
+  'budgets',
+  'recurringTransactions',
+  'loans',
+  'expenses',
+  'payslips',
+  'invoices',
+  'organizationMembers',
+  'organizations',
+] as const;
 
 export interface DateRange {
   from?: string;
@@ -34,6 +49,12 @@ export class ReportService {
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, '');
+    // Automatically invalidate cached dashboard/report summaries whenever underlying data mutates
+    for (const col of REPORT_CACHE_INVALIDATING_COLLECTIONS) {
+      dataStore.subscribe(col, () => {
+        this.invalidateCache();
+      });
+    }
   }
 
   /** Invalidate in-memory cache for an organization or all entries */

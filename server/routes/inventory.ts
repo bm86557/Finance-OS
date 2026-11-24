@@ -10,6 +10,27 @@ import { Router, type Request, type Response } from 'express';
 import type { InventoryItem, InventoryTransaction } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
+import { postBalancedJournalEntry, resolveGlAccountId, resolveOrgCurrency } from '../lib/ledgerService.js';
+
+const VALID_NEGATIVE_STOCK_POLICIES = new Set(['disallow', 'warn', 'allow_with_backorder']);
+
+function computeItemValuation(
+  item: { id: string; costingMethod?: string; costing_method?: string; currentStock?: number; current_stock?: number; averageCost?: number; average_cost?: number },
+  layersByItem: Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>,
+): number {
+  const method = item.costingMethod ?? item.costing_method ?? 'weighted_average';
+  const stock = Number(item.currentStock ?? item.current_stock ?? 0);
+  const avg = Number(item.averageCost ?? item.average_cost ?? 0);
+  if (method === 'fifo') {
+    const layers = layersByItem.get(item.id);
+    if (layers && layers.length > 0) {
+      return layers.reduce((s, l) => s + Number(l.quantity_remaining || 0) * Number(l.unit_cost || 0), 0);
+    }
+  }
+  return stock * avg;
+}
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -84,21 +105,28 @@ export function createInventoryRouter(): Router {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
-    const { data, error } = await sb
-      .from('inventory_items')
-      .select('*')
-      .eq('organization_id', orgId)
-      .eq('is_active', true);
+    const [{ data, error }, { data: layerRows }] = await Promise.all([
+      sb.from('inventory_items').select('*').eq('organization_id', orgId).eq('is_active', true),
+      sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
+    ]);
 
     if (error) return fail(res, 500, error.message);
+    const layersByItem = new Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>();
+    for (const l of layerRows || []) {
+      const key = String((l as any).inventory_item_id);
+      const arr = layersByItem.get(key) || [];
+      arr.push({ quantity_remaining: Number((l as any).quantity_remaining || 0), unit_cost: Number((l as any).unit_cost || 0) });
+      layersByItem.set(key, arr);
+    }
+
     const items = (data || []).map(mapDbToDomainItem);
     const byMethod = new Map<string, { count: number; value: number }>();
     let totalValue = 0;
     for (const item of items) {
-      const value = item.currentStock * item.averageCost;
+      const value = computeItemValuation(item, layersByItem);
       totalValue += value;
       const cur = byMethod.get(item.costingMethod) ?? { count: 0, value: 0 };
-      byMethod.set(item.costingMethod, { count: cur.count + 1, value: cur.value + value });
+      byMethod.set(item.costingMethod, { count: cur.count + 1, value: Math.round((cur.value + value) * 100) / 100 });
     }
     return ok(res, {
       totalValue: Math.round(totalValue * 100) / 100,
@@ -113,15 +141,24 @@ export function createInventoryRouter(): Router {
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
-    const [{ data: items, error: iErr }, { data: accounts, error: aErr }] = await Promise.all([
+    const [{ data: items, error: iErr }, { data: accounts }, { data: layerRows }] = await Promise.all([
       sb.from('inventory_items').select('*').eq('organization_id', orgId).eq('is_active', true),
       sb.from('accounts').select('*').eq('organization_id', orgId).eq('type', 'asset'),
+      sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
     ]);
 
     if (iErr) return fail(res, 500, iErr.message);
 
+    const layersByItem = new Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>();
+    for (const l of layerRows || []) {
+      const key = String((l as any).inventory_item_id);
+      const arr = layersByItem.get(key) || [];
+      arr.push({ quantity_remaining: Number((l as any).quantity_remaining || 0), unit_cost: Number((l as any).unit_cost || 0) });
+      layersByItem.set(key, arr);
+    }
+
     const physicalValuation = (items || []).reduce((sum: number, it: any) => {
-      return sum + (Number(it.current_stock || 0) * Number(it.average_cost || 0));
+      return sum + computeItemValuation(it, layersByItem);
     }, 0);
 
     const roundedValuation = Math.round(physicalValuation * 100) / 100;
@@ -215,7 +252,7 @@ export function createInventoryRouter(): Router {
     }
   });
 
-  r.post('/transactions', async (req: Request, res: Response) => {
+  r.post('/transactions', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<InventoryTransaction, 'id' | 'organizationId'> & { bankAccountId?: string };
     const supabase = getSupabaseAdminClient();
@@ -307,12 +344,13 @@ export function createInventoryRouter(): Router {
           }
         } else if (data.type === 'sale') {
           if (item.costing_method === 'fifo') {
-            // Deplete FIFO layers
+            // Deplete FIFO layers (strictly org-scoped)
             let fifoCost = 0;
             let qtyToDeplete = Math.abs(data.quantity);
             const { data: layers } = await supabase
               .from('inventory_layers')
               .select('*')
+              .eq('organization_id', orgId)
               .eq('inventory_item_id', data.inventoryItemId)
               .gt('quantity_remaining', 0)
               .order('purchase_date', { ascending: true });
@@ -327,7 +365,8 @@ export function createInventoryRouter(): Router {
                 await supabase
                   .from('inventory_layers')
                   .update({ quantity_remaining: available - take })
-                  .eq('id', layer.id);
+                  .eq('id', layer.id)
+                  .eq('organization_id', orgId);
               }
             }
             totalCost = fifoCost > 0 ? Math.round(fifoCost * 100) / 100 : Math.abs(data.quantity) * Number(item.average_cost || 0);
@@ -337,11 +376,41 @@ export function createInventoryRouter(): Router {
             totalCost = Math.abs(data.quantity) * unitCost;
           }
         } else if (data.type === 'write_off') {
-          unitCost = item.average_cost;
-          totalCost = Math.abs(data.quantity) * unitCost;
+          if (item.costing_method === 'fifo') {
+            let fifoCost = 0;
+            let qtyToDeplete = Math.abs(data.quantity);
+            const { data: layers } = await supabase
+              .from('inventory_layers')
+              .select('*')
+              .eq('organization_id', orgId)
+              .eq('inventory_item_id', data.inventoryItemId)
+              .gt('quantity_remaining', 0)
+              .order('purchase_date', { ascending: true });
 
-          // Post non-cash write-off expense transaction into ledger
+            if (layers && layers.length > 0) {
+              for (const layer of layers) {
+                if (qtyToDeplete <= 0) break;
+                const available = Number(layer.quantity_remaining);
+                const take = Math.min(qtyToDeplete, available);
+                fifoCost += take * Number(layer.unit_cost);
+                qtyToDeplete -= take;
+                await supabase
+                  .from('inventory_layers')
+                  .update({ quantity_remaining: available - take })
+                  .eq('id', layer.id)
+                  .eq('organization_id', orgId);
+              }
+            }
+            totalCost = fifoCost > 0 ? Math.round(fifoCost * 100) / 100 : Math.abs(data.quantity) * Number(item.average_cost || 0);
+            unitCost = Math.abs(data.quantity) > 0 ? Math.round((totalCost / Math.abs(data.quantity)) * 100) / 100 : item.average_cost;
+          } else {
+            unitCost = item.average_cost;
+            totalCost = Math.abs(data.quantity) * unitCost;
+          }
+
+          // Post non-cash write-off expense transaction into ledger using org currency (§8, §15)
           try {
+            const orgCurrency = await resolveOrgCurrency(supabase, orgId);
             const writeOffTxnId = `txn-writeoff-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
             await supabase.from('transactions').insert([{
               id: writeOffTxnId,
@@ -350,7 +419,7 @@ export function createInventoryRouter(): Router {
               description: `Inventory Write-Off - ${item.name}`,
               narration: `Inventory write-off of ${Math.abs(data.quantity)} ${item.unit} (${item.name}). Reason: ${data.notes || 'Spoilage/Damage/Loss'}. Recognized COGS/loss: ${totalCost.toFixed(2)}`,
               amount: totalCost,
-              currency: 'USD',
+              currency: orgCurrency,
               type: 'debit',
               status: 'reconciled',
               tags: ['inventory-write-off', 'cogs', 'non-cash-expense', `inv-item:${item.id}`, 'business'],
@@ -409,14 +478,70 @@ export function createInventoryRouter(): Router {
             average_cost: newAverageCost,
             last_cost: newLastCost,
           })
-          .eq('id', data.inventoryItemId);
+          .eq('id', data.inventoryItemId)
+          .eq('organization_id', orgId);
 
         if (updateError) {
           console.error('[inventory] Failed to update inventory item:', updateError);
-          return fail(res, 'Failed to update inventory item: ' + updateError.message, 500);
+          return fail(res, 500, 'Failed to update inventory item: ' + updateError.message);
         }
 
-        // ── Create corresponding financial transaction in Supabase ──
+        // ── Post balanced double-entry GL journal for inventory movement (§8, §15) ──
+        // Note: Inventory movement is NOT automatically the same as cash payment.
+        // Without a bankAccountId, purchase credits Accounts Payable rather than Bank/Cash.
+        try {
+          const orgCurrency = await resolveOrgCurrency(supabase, orgId);
+          const invAssetGlId = item.asset_account_id || (await resolveGlAccountId(supabase, orgId, 'asset', ['inventory', 'stock']));
+          const cogsGlId = item.cogs_account_id || (await resolveGlAccountId(supabase, orgId, 'expense', ['cogs', 'cost of goods', 'inventory']));
+
+          if (data.type === 'purchase' && totalCost > 0) {
+            let creditGlId: string;
+            if (data.bankAccountId) {
+              const { data: ba } = await supabase
+                .from('bank_accounts')
+                .select('account_id')
+                .eq('id', data.bankAccountId)
+                .eq('organization_id', orgId)
+                .maybeSingle();
+              creditGlId = ba?.account_id || (await resolveGlAccountId(supabase, orgId, 'asset', ['bank_account', 'cash']));
+            } else {
+              creditGlId = await resolveGlAccountId(supabase, orgId, 'liability', ['payable', 'accounts_payable']);
+            }
+            await postBalancedJournalEntry(supabase, {
+              organizationId: orgId,
+              entryDate: data.date,
+              description: `Inventory Purchase - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
+              sourceType: 'inventory_purchase',
+              sourceId: String(newTxn.id),
+              currency: orgCurrency,
+              actorUserId: req.authUser?.id || null,
+              entryPrefix: 'INVP',
+              lines: [
+                { accountId: invAssetGlId, debit: totalCost, credit: 0, description: `Inventory received - ${item.name}` },
+                { accountId: creditGlId, bankAccountId: data.bankAccountId || null, debit: 0, credit: totalCost, description: data.bankAccountId ? `Bank payment for ${item.name}` : `Accounts payable for ${item.name}` },
+              ],
+            });
+          } else if ((data.type === 'sale' || data.type === 'write_off') && totalCost > 0) {
+            await postBalancedJournalEntry(supabase, {
+              organizationId: orgId,
+              entryDate: data.date,
+              description: `${data.type === 'sale' ? 'Inventory COGS' : 'Inventory Write-Off'} - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
+              sourceType: data.type === 'sale' ? 'inventory_cogs' : 'inventory_write_off',
+              sourceId: String(newTxn.id),
+              currency: orgCurrency,
+              actorUserId: req.authUser?.id || null,
+              entryPrefix: data.type === 'sale' ? 'COGS' : 'INVW',
+              lines: [
+                { accountId: cogsGlId, debit: totalCost, credit: 0, description: `${data.type === 'sale' ? 'COGS recognized' : 'Write-off loss'} - ${item.name}` },
+                { accountId: invAssetGlId, debit: 0, credit: totalCost, description: `Inventory relieved - ${item.name}` },
+              ],
+            });
+          }
+        } catch (jeErr) {
+          console.warn('[inventory] Non-fatal journal posting warning:', jeErr);
+        }
+
+        // ── Create corresponding financial transaction in Supabase (only when paid/settled via bankAccountId) ──
         if (data.bankAccountId) {
           console.log('[inventory] 🔍 Attempting to create financial transaction for bankAccountId:', data.bankAccountId);
 
@@ -424,11 +549,12 @@ export function createInventoryRouter(): Router {
             .from('bank_accounts')
             .select('currency, balance')
             .eq('id', data.bankAccountId)
+            .eq('organization_id', orgId)
             .single();
 
           if (bankAcctError || !bankAccount) {
             console.error('[inventory] ❌ Bank account not found:', bankAcctError);
-            return fail(res, 'Bank account not found: ' + bankAcctError?.message, 400);
+            return fail(res, 400, 'Bank account not found: ' + bankAcctError?.message);
           }
 
           console.log('[inventory] ✅ Found bank account, balance:', bankAccount.balance);
@@ -457,7 +583,7 @@ export function createInventoryRouter(): Router {
 
           if (finTxnError) {
             console.error('[inventory] ❌ Failed to create financial transaction:', finTxnError);
-            return fail(res, 'Failed to create financial transaction: ' + finTxnError.message, 500);
+            return fail(res, 500, 'Failed to create financial transaction: ' + finTxnError.message);
           }
 
           console.log(`[inventory] ✅ Created financial transaction ${financialTxn.id} for inventory ${data.type}`);
@@ -467,17 +593,27 @@ export function createInventoryRouter(): Router {
           const { error: balanceError } = await supabase
             .from('bank_accounts')
             .update({ balance: newBalance, current_balance: newBalance })
-            .eq('id', data.bankAccountId);
+            .eq('id', data.bankAccountId)
+            .eq('organization_id', orgId);
 
           if (balanceError) {
             console.error('[inventory] ❌ Failed to update bank balance:', balanceError);
-            return fail(res, 'Failed to update bank balance: ' + balanceError.message, 500);
+            return fail(res, 500, 'Failed to update bank balance: ' + balanceError.message);
           }
 
           console.log(`[inventory] ✅ Updated bank account balance: ${bankAccount.balance} → ${newBalance}`);
         } else {
           console.log('[inventory] ⚠️  No bankAccountId provided, skipping financial transaction');
         }
+
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'record_inventory_movement',
+          entityType: 'inventory_transaction',
+          entityId: String(newTxn.id),
+          description: `Recorded inventory ${data.type} for ${item.name} (qty: ${data.quantity}, cost: ${totalCost})`,
+          afterState: newTxn,
+        }).catch(() => {});
 
         return created(res, newTxn, 'Transaction recorded');
 
@@ -563,28 +699,8 @@ export function createInventoryRouter(): Router {
 
         console.log('[inventory] GET /items - Supabase returned:', data?.length, 'items');
 
-        // Transform snake_case to camelCase for frontend
-        const items = (data || []).map((item: any) => ({
-          id: item.id,
-          organizationId: item.organization_id,
-          sku: item.sku,
-          name: item.name,
-          description: item.description,
-          category: item.category,
-          unit: item.unit,
-          costingMethod: item.costing_method,
-          currentStock: item.current_stock,
-          reorderLevel: item.reorder_level,
-          reorderQuantity: item.reorder_quantity,
-          averageCost: item.average_cost,
-          lastCost: item.last_cost,
-          sellingPrice: item.selling_price,
-          assetAccountId: item.asset_account_id,
-          cogsAccountId: item.cogs_account_id,
-          isActive: item.is_active,
-        }));
-
-        console.log('[inventory] GET /items - Transformed:', items);
+        // Transform snake_case to camelCase for frontend (includes negativeStockPolicy)
+        const items = (data || []).map(mapDbToDomainItem);
 
         return ok(res, items);
       } else {
@@ -596,22 +712,26 @@ export function createInventoryRouter(): Router {
     }
   });
 
-  r.post('/items', async (req: Request, res: Response) => {
+  r.post('/items', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<InventoryItem, 'id' | 'organizationId'>;
     const supabase = getSupabaseAdminClient();
 
     // VALIDATION: Required fields
     if (!data.sku || !data.name) {
-      return fail(res, 'SKU and name are required', 400);
+      return fail(res, 400, 'SKU and name are required');
     }
 
     // VALIDATION: Support both weighted_average and fifo per Handoff §15.5
     if (data.costingMethod && !['weighted_average', 'fifo'].includes(data.costingMethod)) {
-      return fail(res,
+      return fail(
+        res,
+        400,
         `Costing method '${data.costingMethod}' is not supported. Supported methods are 'weighted_average' and 'fifo'.`,
-        400
       );
+    }
+    if (data.negativeStockPolicy && !VALID_NEGATIVE_STOCK_POLICIES.has(data.negativeStockPolicy)) {
+      return fail(res, 400, `Invalid negativeStockPolicy '${data.negativeStockPolicy}'`);
     }
 
     try {
@@ -626,7 +746,7 @@ export function createInventoryRouter(): Router {
           .single();
 
         if (existingItem) {
-          return fail(res, `Item with SKU '${data.sku}' already exists`, 409);
+          return fail(res, 409, `Item with SKU '${data.sku}' already exists`);
         }
 
         // Insert new item - Supabase will auto-generate id
@@ -640,6 +760,7 @@ export function createInventoryRouter(): Router {
             category: data.category || '',
             unit: data.unit || 'unit',
             costing_method: data.costingMethod || 'weighted_average',
+            negative_stock_policy: data.negativeStockPolicy || 'disallow',
             current_stock: data.currentStock || 0,
             reorder_level: data.reorderLevel || 0,
             reorder_quantity: data.reorderQuantity || 0,
@@ -655,19 +776,27 @@ export function createInventoryRouter(): Router {
 
         if (error) throw error;
 
-        console.log('[inventory] ✅ Created item in Supabase:', newItem.id);
-        return created(res, newItem, 'Inventory item created');
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'create_inventory_item',
+          entityType: 'inventory_item',
+          entityId: String(newItem.id),
+          description: `Created inventory item ${newItem.name} (SKU: ${newItem.sku})`,
+          afterState: newItem,
+        }).catch(() => {});
+
+        return created(res, mapDbToDomainItem(newItem), 'Inventory item created');
 
       } else {
         return fail(res, 503, 'Database unavailable');
       }
     } catch (error) {
       console.error('[inventory] Error in POST /items:', error);
-      return fail(res, 'Failed to create inventory item: ' + (error as Error).message, 500);
+      return fail(res, 500, 'Failed to create inventory item: ' + (error as Error).message);
     }
   });
 
-  r.patch('/items/:id', async (req: Request, res: Response) => {
+  r.patch('/items/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id ?? '');
     const sb = getSupabaseAdminClient();
@@ -675,7 +804,10 @@ export function createInventoryRouter(): Router {
 
     const b = (req.body || {}) as Partial<InventoryItem>;
     if (b.costingMethod && !['weighted_average', 'fifo'].includes(b.costingMethod)) {
-      return fail(res, `Costing method '${b.costingMethod}' is not supported. Supported methods are 'weighted_average' and 'fifo'.`, 400);
+      return fail(res, 400, `Costing method '${b.costingMethod}' is not supported. Supported methods are 'weighted_average' and 'fifo'.`);
+    }
+    if (b.negativeStockPolicy && !VALID_NEGATIVE_STOCK_POLICIES.has(b.negativeStockPolicy)) {
+      return fail(res, 400, `Invalid negativeStockPolicy '${b.negativeStockPolicy}'`);
     }
 
     const update: Record<string, unknown> = {};
@@ -685,6 +817,7 @@ export function createInventoryRouter(): Router {
     if (b.category !== undefined) update.category = b.category;
     if (b.unit !== undefined) update.unit = b.unit;
     if (b.costingMethod !== undefined) update.costing_method = b.costingMethod;
+    if (b.negativeStockPolicy !== undefined) update.negative_stock_policy = b.negativeStockPolicy;
     if (b.reorderLevel !== undefined) update.reorder_level = b.reorderLevel;
     if (b.reorderQuantity !== undefined) update.reorder_quantity = b.reorderQuantity;
     if (b.sellingPrice !== undefined) update.selling_price = b.sellingPrice;
@@ -693,7 +826,7 @@ export function createInventoryRouter(): Router {
     if (b.isActive !== undefined) update.is_active = b.isActive;
     // Stock levels and costs change only through inventory transactions.
 
-    if (Object.keys(update).length === 0) return fail(res, 'No updatable fields provided', 400);
+    if (Object.keys(update).length === 0) return fail(res, 400, 'No updatable fields provided');
 
     // SECURITY: Filter by organization
     const { data, error } = await sb
@@ -705,11 +838,21 @@ export function createInventoryRouter(): Router {
       .maybeSingle();
     if (error) return fail(res, 500, error.message);
     if (!data) return notFound(res, 'Item not found in this organization');
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'update_inventory_item',
+      entityType: 'inventory_item',
+      entityId: id,
+      description: `Updated inventory item ${data.name} (SKU: ${data.sku})`,
+      afterState: data,
+    }).catch(() => {});
+
     return ok(res, mapDbToDomainItem(data));
   });
 
   // DELETE endpoint for soft delete
-  r.delete('/items/:id', async (req: Request, res: Response) => {
+  r.delete('/items/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = Array.isArray(req.params.id) ? req.params.id[0] : (req.params.id ?? '');
     const sb = getSupabaseAdminClient();
@@ -720,10 +863,19 @@ export function createInventoryRouter(): Router {
       .update({ is_active: false })
       .eq('id', id)
       .eq('organization_id', orgId)
-      .select('id')
+      .select('id, name, sku')
       .maybeSingle();
     if (error) return fail(res, 500, error.message);
     if (!data) return notFound(res, 'Item not found in this organization');
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'deactivate_inventory_item',
+      entityType: 'inventory_item',
+      entityId: id,
+      description: `Deactivated inventory item ${data.name} (SKU: ${data.sku})`,
+    }).catch(() => {});
+
     return ok(res, { id }, 'Item deactivated');
   });
 

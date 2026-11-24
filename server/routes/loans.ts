@@ -11,6 +11,9 @@ import type { Loan, LoanRecordStatus } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { recomputeServerBankBalance } from './transactions.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
+import { postBalancedJournalEntry, resolveGlAccountId } from '../lib/ledgerService.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -184,6 +187,16 @@ function mapSupabaseRowToLoan(row: any): Loan {
     nextPaymentDate = undefined;
   }
 
+  const todayStr = new Date().toISOString().split('T')[0];
+  let overdueAmount = 0;
+  if (remainingBalance > 0) {
+    if (row.due_date && String(row.due_date) < todayStr) {
+      overdueAmount = remainingBalance;
+    } else if (nextPaymentDate && String(nextPaymentDate) < todayStr && installmentAmount > 0) {
+      overdueAmount = Math.min(remainingBalance, installmentAmount);
+    }
+  }
+
   return {
     id: row.id,
     organizationId: row.organization_id,
@@ -210,7 +223,8 @@ function mapSupabaseRowToLoan(row: any): Loan {
     paymentsCompleted,
     rateType: (row.rate_type as Loan['rateType']) || 'fixed',
     accruedInterest: row.accrued_interest != null ? Number(row.accrued_interest) : 0,
-  };
+    ...(overdueAmount > 0 ? { overdueAmount } : { overdueAmount: 0 }),
+  } as Loan;
 }
 
 export function createLoansRouter(): Router {
@@ -271,7 +285,7 @@ export function createLoansRouter(): Router {
   });
 
   // POST / - Create a loan
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Partial<Loan>;
 
@@ -322,6 +336,8 @@ export function createLoansRouter(): Router {
           last_payment_month: newLoan.lastPaymentMonth || null,
           payments_count: newLoan.paymentsCount ?? 0,
           payments_completed: newLoan.paymentsCompleted ?? 0,
+          rate_type: data.rateType === 'variable' ? 'variable' : 'fixed',
+          accrued_interest: Number(data.accruedInterest ?? 0),
         };
 
         const { error } = await sb.from('loans').insert([row]);
@@ -330,17 +346,18 @@ export function createLoansRouter(): Router {
           return fail(res, 500, `Could not save loan in database: ${error.message}`);
         }
 
-        // Link with bank account if provided
+        // Link with bank account if provided + post balanced disbursement journal (§8, §15)
         const bankAccountId = (data as any).bankAccountId || (data as any).bank_account_id;
         if (bankAccountId) {
           try {
             const isCompanyBorrowing = newLoan.type === 'to_pay';
             const txnId = `txn-loan-init-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+            const entryDate = newLoan.startDate || new Date().toISOString().split('T')[0];
             await sb.from('transactions').insert([{
               id: txnId,
               organization_id: orgId,
               bank_account_id: bankAccountId,
-              date: newLoan.startDate || new Date().toISOString().split('T')[0],
+              date: entryDate,
               description: isCompanyBorrowing ? `Loan Received - ${newLoan.party}` : `Loan Issued - ${newLoan.party}`,
               narration: isCompanyBorrowing
                 ? `Principal disbursement received from ${newLoan.party} (${newLoan.description || 'Loan'})`
@@ -353,10 +370,50 @@ export function createLoansRouter(): Router {
               created_at: new Date().toISOString(),
             }]);
             await recomputeServerBankBalance(orgId, bankAccountId);
+
+            const { data: bankRow } = await sb
+              .from('bank_accounts')
+              .select('account_id')
+              .eq('id', bankAccountId)
+              .eq('organization_id', orgId)
+              .maybeSingle();
+            const bankGlId = bankRow?.account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']));
+            const loanGlId = isCompanyBorrowing
+              ? await resolveGlAccountId(sb, orgId, 'liability', ['loan', 'debt', 'payable'])
+              : await resolveGlAccountId(sb, orgId, 'asset', ['loan', 'receivable']);
+
+            await postBalancedJournalEntry(sb, {
+              organizationId: orgId,
+              entryDate,
+              description: isCompanyBorrowing ? `Loan Disbursement Received - ${newLoan.party}` : `Loan Disbursement Issued - ${newLoan.party}`,
+              sourceType: 'loan_disbursement',
+              sourceId: loanId,
+              currency: newLoan.currency || 'USD',
+              actorUserId: req.authUser?.id || null,
+              entryPrefix: 'LOAN',
+              lines: isCompanyBorrowing
+                ? [
+                    { accountId: bankGlId, bankAccountId, debit: newLoan.principal, credit: 0, description: `Loan proceeds from ${newLoan.party}` },
+                    { accountId: loanGlId, debit: 0, credit: newLoan.principal, description: `Loan liability to ${newLoan.party}` },
+                  ]
+                : [
+                    { accountId: loanGlId, debit: newLoan.principal, credit: 0, description: `Loan receivable from ${newLoan.party}` },
+                    { accountId: bankGlId, bankAccountId, debit: 0, credit: newLoan.principal, description: `Loan funds disbursed to ${newLoan.party}` },
+                  ],
+            });
           } catch (bankErr) {
             console.error('[loans] Error linking bank account on creation:', bankErr);
           }
         }
+
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'create_loan',
+          entityType: 'loan',
+          entityId: loanId,
+          description: `Created ${newLoan.type} loan with ${newLoan.party} for ${newLoan.principal} ${newLoan.currency}`,
+          afterState: row,
+        }).catch(() => {});
       } catch (err: any) {
         console.error('[loans] Supabase insert exception:', err);
         return fail(res, 500, err?.message || 'Database error creating loan');
@@ -487,7 +544,7 @@ export function createLoansRouter(): Router {
   });
 
   // POST /:id/payments - Record a monthly payment with double-payment prevention and split
-  r.post('/:id/payments', async (req: Request, res: Response) => {
+  r.post('/:id/payments', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const loanId = req.params.id;
     const {
@@ -557,8 +614,67 @@ export function createLoansRouter(): Router {
           ? Number(principalPart)
           : Math.min(remaining, Math.max(0, Math.round((paymentAmount - actualInterest - actualFees) * 100) / 100));
 
+        if (actualPrincipal < 0 || actualInterest < 0 || actualFees < 0) {
+          return fail(res, 400, 'Principal, interest, and fee portions must be non-negative.');
+        }
+        const splitTotal = Math.round((actualPrincipal + actualInterest + actualFees) * 100) / 100;
+        if (splitTotal <= 0) {
+          return fail(res, 400, 'Total payment split must be greater than zero.');
+        }
+
         const paymentId = `lp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-        const journalEntryId = `JRN-LOAN-${loanId}-${targetMonth}`;
+
+        // 3b. Post balanced double-entry journal for principal / interest / fees split (§8, §15)
+        const isPayable = currentLoan.type === 'to_pay';
+        let bankGlId = '';
+        if (bankAccountId) {
+          const { data: bankRow } = await sb
+            .from('bank_accounts')
+            .select('account_id')
+            .eq('id', bankAccountId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          bankGlId = bankRow?.account_id || '';
+        }
+        if (!bankGlId) {
+          bankGlId = await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']);
+        }
+        const loanGlId = isPayable
+          ? await resolveGlAccountId(sb, orgId, 'liability', ['loan', 'debt', 'payable'])
+          : await resolveGlAccountId(sb, orgId, 'asset', ['loan', 'receivable']);
+        const interestGlId = isPayable
+          ? await resolveGlAccountId(sb, orgId, 'expense', ['interest', 'finance'])
+          : await resolveGlAccountId(sb, orgId, 'income', ['interest', 'finance']);
+        const feeGlId = isPayable
+          ? await resolveGlAccountId(sb, orgId, 'expense', ['fee', 'bank', 'finance'])
+          : await resolveGlAccountId(sb, orgId, 'income', ['fee', 'other_income']);
+
+        const journalLines = isPayable
+          ? [
+              ...(actualPrincipal > 0 ? [{ accountId: loanGlId, debit: actualPrincipal, credit: 0, description: `Loan principal reduction - ${currentLoan.party}` }] : []),
+              ...(actualInterest > 0 ? [{ accountId: interestGlId, debit: actualInterest, credit: 0, description: `Loan interest expense - ${currentLoan.party}` }] : []),
+              ...(actualFees > 0 ? [{ accountId: feeGlId, debit: actualFees, credit: 0, description: `Loan service fee - ${currentLoan.party}` }] : []),
+              { accountId: bankGlId, bankAccountId: bankAccountId || null, debit: 0, credit: splitTotal, description: `Loan payment outflow - ${currentLoan.party}` },
+            ]
+          : [
+              { accountId: bankGlId, bankAccountId: bankAccountId || null, debit: splitTotal, credit: 0, description: `Loan repayment received - ${currentLoan.party}` },
+              ...(actualPrincipal > 0 ? [{ accountId: loanGlId, debit: 0, credit: actualPrincipal, description: `Loan principal collected - ${currentLoan.party}` }] : []),
+              ...(actualInterest > 0 ? [{ accountId: interestGlId, debit: 0, credit: actualInterest, description: `Loan interest income - ${currentLoan.party}` }] : []),
+              ...(actualFees > 0 ? [{ accountId: feeGlId, debit: 0, credit: actualFees, description: `Loan fee income - ${currentLoan.party}` }] : []),
+            ];
+
+        const jeResult = await postBalancedJournalEntry(sb, {
+          organizationId: orgId,
+          entryDate: paidOn,
+          description: `Loan Payment (${targetMonth}) - ${currentLoan.party}`,
+          sourceType: 'loan_payment',
+          sourceId: paymentId,
+          currency: currentLoan.currency || 'USD',
+          actorUserId: req.authUser?.id || null,
+          entryPrefix: 'LOANPAY',
+          lines: journalLines,
+        });
+        const journalEntryId = jeResult.journalEntryId || `JRN-LOAN-${loanId}-${targetMonth}`;
 
         // 4. Insert payment ledger record
         const paymentRow: any = {
@@ -699,7 +815,16 @@ export function createLoansRouter(): Router {
         }
 
         const finalLoan = updatedLoanRow ? mapSupabaseRowToLoan(updatedLoanRow) : currentLoan;
-        
+
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'record_loan_payment',
+          entityType: 'loan_payment',
+          entityId: paymentId,
+          description: `Recorded loan payment (${targetMonth}) for ${currentLoan.party}: principal=${actualPrincipal}, interest=${actualInterest}, fees=${actualFees}`,
+          afterState: { payment: paymentRow, remainingBalance: finalLoan.remainingBalance, journalEntryId },
+        }).catch(() => {});
+
         return created(res, { payment: paymentRow, loan: finalLoan }, `Payment for ${targetMonth} recorded successfully.`);
       } catch (err: any) {
         console.error('[loans] Payment exception:', err);
@@ -711,7 +836,7 @@ export function createLoansRouter(): Router {
   });
 
   // PATCH /:id - Update loan details or record payments
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = req.params.id;
     const updates = req.body as Partial<Loan>;
@@ -757,6 +882,8 @@ export function createLoansRouter(): Router {
         if (normalized.totalInterest !== undefined) dbUpdates.total_interest = normalized.totalInterest;
         if (normalized.installmentAmount !== undefined) dbUpdates.installment_amount = normalized.installmentAmount;
         if (normalized.status !== undefined) dbUpdates.status = normalized.status;
+        if (updates.rateType !== undefined) dbUpdates.rate_type = updates.rateType === 'variable' ? 'variable' : 'fixed';
+        if (updates.accruedInterest !== undefined) dbUpdates.accrued_interest = Number(updates.accruedInterest);
 
         const { data: updatedRow, error: updateErr } = await sb
           .from('loans')
@@ -772,6 +899,19 @@ export function createLoansRouter(): Router {
         }
 
         const updatedLoan = mapSupabaseRowToLoan(updatedRow);
+        const principalAdjusted = updates.principal !== undefined && Number(updates.principal) !== Number(existing.principal);
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: principalAdjusted ? 'adjust_loan_principal' : 'update_loan',
+          entityType: 'loan',
+          entityId: String(id),
+          description: principalAdjusted
+            ? `Adjusted loan principal for ${updatedLoan.party} from ${existing.principal} to ${updatedLoan.principal}`
+            : `Updated loan ${updatedLoan.party}`,
+          beforeState: existing,
+          afterState: updatedRow,
+        }).catch(() => {});
+
         return ok(res, updatedLoan);
       } catch (err: any) {
         console.error('[loans] Supabase update exception:', err);
@@ -782,14 +922,34 @@ export function createLoansRouter(): Router {
     return fail(res, 503, 'Database unavailable');
   });
 
-  // DELETE /:id - Remove loan
-  r.delete('/:id', async (req: Request, res: Response) => {
+  // DELETE /:id - Remove loan (guarded against deleting loans with posted payment history)
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = req.params.id;
     const sb = getSupabaseAdminClient();
 
     if (sb) {
       try {
+        const { data: existingLoan } = await sb
+          .from('loans')
+          .select('*')
+          .eq('id', id)
+          .eq('organization_id', orgId)
+          .maybeSingle();
+
+        if (!existingLoan) return notFound(res, 'Loan');
+
+        const { data: existingPayments } = await sb
+          .from('loan_payments')
+          .select('id')
+          .eq('loan_id', id)
+          .eq('organization_id', orgId)
+          .limit(1);
+
+        if (existingPayments && existingPayments.length > 0) {
+          return fail(res, 400, 'Cannot delete a loan with recorded payment history. Mark it settled or defaulted instead.');
+        }
+
         const { error } = await sb
           .from('loans')
           .delete()
@@ -800,6 +960,15 @@ export function createLoansRouter(): Router {
           console.error('[loans] Supabase delete error:', error.message);
           return fail(res, 500, error.message);
         }
+
+        void logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'delete_loan',
+          entityType: 'loan',
+          entityId: String(id),
+          description: `Deleted loan ${existingLoan.party}`,
+          beforeState: existingLoan,
+        }).catch(() => {});
       } catch (err: any) {
         console.error('[loans] Supabase delete exception:', err);
         return fail(res, 500, err?.message || 'Database error');

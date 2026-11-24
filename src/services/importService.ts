@@ -345,7 +345,7 @@ export const importService = {
             confirmAccountMismatch?: boolean;
           },
           ImportResult
-        >(`${IMP(organizationId)}/commit-parsed`, payload);
+        >(`${IMP(organizationId)}/commit-parsed`, payload, { timeoutMs: 90_000 });
 
         if (result.success) {
           dataStore.notify('transactions');

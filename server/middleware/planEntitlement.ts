@@ -4,8 +4,8 @@ import { fail } from '../lib/http.js';
 import { normalizeFeatureKey } from '../../src/config/planFeatures.js';
 import { resolveAuthoritativeOrgPlan } from '../services/planEntitlementService.js';
 
-export function requirePlanFeature(featureKey: string) {
-  const normalizedRequired = normalizeFeatureKey(featureKey);
+export function requireAnyPlanFeature(...featureKeys: string[]) {
+  const normalizedRequired = featureKeys.map(normalizeFeatureKey);
 
   return async (req: Request, res: Response, next: NextFunction) => {
     const orgId =
@@ -14,20 +14,18 @@ export function requirePlanFeature(featureKey: string) {
       (req.query as any).organizationId ||
       (req.body as any)?.organizationId;
 
-    // If no org ID in route params or query, permit or skip (global routes)
     if (!orgId) {
       return next();
     }
 
     const sb = getSupabaseAdminClient();
     if (!sb) {
-      return next(); // Fail-open in dev if DB is offline
+      return next();
     }
 
     try {
       const { plan, orgSettings } = await resolveAuthoritativeOrgPlan(sb, String(orgId));
 
-      // Prefer authoritative plan.features; fall back to orgSettings.planFeatures if present
       const grantedFeatures: string[] =
         Array.isArray(plan?.features) && plan.features.length > 0
           ? plan.features
@@ -37,11 +35,12 @@ export function requirePlanFeature(featureKey: string) {
 
       const normalizedGranted = grantedFeatures.map(normalizeFeatureKey);
 
-      if (!normalizedGranted.includes(normalizedRequired)) {
+      const allowed = normalizedRequired.some(reqKey => normalizedGranted.includes(reqKey));
+      if (!allowed) {
         return fail(
           res,
           403,
-          `PLAN_FEATURE_RESTRICTED: Access to ${featureKey} is restricted. Your organization's ${plan?.name || 'current'} plan does not include this feature. Upgrade in Settings → Billing to unlock it.`,
+          `PLAN_FEATURE_RESTRICTED: Access to ${featureKeys.join(' or ')} is restricted. Your organization's ${plan?.name || 'current'} plan does not include this feature. Upgrade in Settings → Billing to unlock it.`,
         );
       }
 
@@ -51,4 +50,8 @@ export function requirePlanFeature(featureKey: string) {
       return next();
     }
   };
+}
+
+export function requirePlanFeature(featureKey: string) {
+  return requireAnyPlanFeature(featureKey);
 }

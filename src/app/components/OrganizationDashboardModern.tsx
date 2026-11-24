@@ -98,7 +98,11 @@ export function OrganizationDashboard() {
 
   // ── Service wiring (ORG-P02: loading / error / empty-safe) ─────────────
   const { currentOrganization, userRole, accessRole } = useAuth();
-  const canViewPayroll = userRole === 'owner' || userRole === 'admin' || accessRole === 'org_admin';
+  const canViewPayroll =
+    userRole === 'owner' ||
+    userRole === 'admin' ||
+    userRole === 'accountant' ||
+    accessRole === 'org_admin';
   const orgCurrency = currentOrganization?.currency || 'USD';
   const svc = useOrgServices();
   const {
@@ -106,19 +110,41 @@ export function OrganizationDashboard() {
     loading: accountsLoading,
     error: accountsError,
     refetch: refetchAccounts,
-  } = useServiceArray(() => svc.accounts.getBankAccounts(), [svc.orgId]);
+  } = useServiceArray(
+    () => svc.accounts.getBankAccounts(),
+    [svc.orgId],
+    ['bankAccounts', 'transactions'],
+  );
   const {
     data: kpis,
     loading: kpisLoading,
     error: kpisError,
     refetch: refetchKpis,
-  } = useService(() => svc.reports.getDashboardSummary(), [svc.orgId]);
+  } = useService(
+    () => svc.reports.getDashboardSummary(),
+    [svc.orgId],
+    [
+      'bankAccounts',
+      'transactions',
+      'budgets',
+      'recurringTransactions',
+      'loans',
+      'expenses',
+      'payslips',
+      'invoices',
+      'organizationMembers',
+    ],
+  );
   const {
     data: txnResult,
     loading: txnLoading,
     error: txnError,
     refetch: refetchTxns,
-  } = useService(() => svc.transactions.getAll({ pageSize: 20 }), [svc.orgId]);
+  } = useService(
+    () => svc.transactions.getAll({ pageSize: 20 }),
+    [svc.orgId],
+    ['transactions'],
+  );
 
   const refreshDashboard = () => {
     void refetchAccounts();
@@ -180,28 +206,32 @@ export function OrganizationDashboard() {
 
   const upcomingPayments = useMemo(() => {
     const rawUpcoming = [
+      ...(kpis?.overduePayments || []),
+      ...(kpis?.overdueExpenses || []),
       ...(kpis?.upcomingPayments || []),
       ...(kpis?.upcomingExpenses || []),
-    ];
+    ].sort((a: any, b: any) => String(a.isoDate || '').localeCompare(String(b.isoDate || '')));
 
     if (rawUpcoming.length > 0) {
-      return rawUpcoming.map((p, idx) => {
+      return rawUpcoming.map((p: any, idx) => {
         const isPayroll =
+          p.sourceType === 'payroll' ||
           /payroll|salary|wage/i.test(p.title || '') ||
-          /payroll|salary|wage/i.test((p as any).category || '');
+          /payroll|salary|wage/i.test(p.category || '');
         const isMasked = isPayroll && !canViewPayroll;
+        const baseTitle = isMasked ? 'Team Payroll (Confidential)' : p.title;
         return {
-          id: `upcoming-${idx}`,
-          date: p.date,
-          title: isMasked ? 'Team Payroll (Confidential)' : p.title,
-          amount: isMasked ? 0 : convertCurrency(Number(p.amount || 0), (p as any).currency || orgCurrency, orgCurrency),
-          type: ((p as any).type === 'credit' ? 'income' : 'expense') as 'income' | 'expense',
+          id: p.id || `upcoming-${idx}`,
+          date: p.isOverdue ? `Overdue · ${p.date}` : p.date,
+          title: baseTitle,
+          amount: isMasked ? 0 : convertCurrency(Number(p.amount || 0), p.currency || orgCurrency, orgCurrency),
+          type: (p.type === 'credit' ? 'income' : 'expense') as 'income' | 'expense',
         };
       });
     }
     // Return empty list if no upcoming scheduled payments - do not display historical past txns as upcoming
     return [];
-  }, [kpis?.upcomingPayments, kpis?.upcomingExpenses, orgCurrency, canViewPayroll]);
+  }, [kpis?.upcomingPayments, kpis?.upcomingExpenses, kpis?.overduePayments, kpis?.overdueExpenses, orgCurrency, canViewPayroll]);
 
   // Live 7-point trailing balance sparkline from balanceHistory or calculated transaction points
   const get7PointSparkline = (account: any): { points: number[]; trend: 'up' | 'down' } => {

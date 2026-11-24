@@ -118,33 +118,41 @@ export function createCategoriesRouter(): Router {
     let accountId = data.accountId;
     if (!accountId || accountId === 'default') {
       try {
-        const accountType = data.type === 'income' ? 'revenue' : 'expense';
-        const { data: existingAccount } = await sb
+        const accountType = data.type === 'income' ? 'income' : 'expense';
+        const { data: existingAccounts } = await sb
           .from('accounts')
-          .select('id')
+          .select('id, subtype')
           .eq('organization_id', orgId)
-          .eq('type', accountType)
-          .limit(1)
-          .maybeSingle();
+          .in('type', data.type === 'income' ? ['income', 'revenue'] : ['expense'])
+          .order('code', { ascending: true })
+          .limit(10);
 
-        if (existingAccount) {
-          accountId = existingAccount.id;
+        if (Array.isArray(existingAccounts) && existingAccounts.length > 0) {
+          accountId = existingAccounts[0].id;
         } else {
           const defaultAccountId = 'acc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9);
+          const fallbackCode = `${data.type === 'income' ? '49' : '69'}${Math.floor(10 + Math.random() * 89)}`;
           const defaultAccount = {
             id: defaultAccountId,
             organization_id: orgId,
             name: data.type === 'income' ? 'Other Income' : 'Other Expenses',
-            code: data.type === 'income' ? '4999' : '5999',
+            code: fallbackCode,
             type: accountType,
+            subtype: data.type === 'income' ? 'other_income' : 'operating_expense',
+            currency: 'USD',
+            balance: 0,
             is_active: true,
+            created_at: new Date().toISOString(),
           };
-          const { data: newAccount } = await sb
+          const { data: newAccount, error: accErr } = await sb
             .from('accounts')
             .insert(defaultAccount)
             .select('id')
-            .single();
+            .maybeSingle();
 
+          if (accErr) {
+            console.error('[categories.post] Failed creating default GL account:', accErr.message);
+          }
           if (newAccount) {
             accountId = newAccount.id;
           }

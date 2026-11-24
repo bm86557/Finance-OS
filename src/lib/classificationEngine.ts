@@ -11,6 +11,9 @@ export interface ClassificationRule {
   categoryId: string;
   confidence: number;
   matchCount: number;
+  correctCount?: number;
+  wrongCount?: number;
+  falsePositiveCount?: number;
   createdFrom: 'user' | 'auto';
   lastUsed?: string;
   // §11 Versioned rule compatibility properties
@@ -18,6 +21,8 @@ export interface ClassificationRule {
   status?: 'active' | 'archived' | 'disabled';
   priority?: number;
   explanation?: string;
+  effectiveFrom?: string;
+  effectiveTo?: string | null;
   scope?: {
     world?: 'business' | 'personal';
     account_ids?: string[];
@@ -40,6 +45,38 @@ export interface ClassificationRule {
     client?: string;
     world?: 'business' | 'personal';
   };
+}
+
+/**
+ * Calibrates a rule's match score (0..1) using validated historical correction rates (§11).
+ * Prevents uncalibrated static confidence scores when a rule has accumulated false positives.
+ */
+export function calibrateRuleConfidence(baseScore: number, rule: ClassificationRule): number {
+  const clampedBase = Math.min(1.0, Math.max(0.1, baseScore));
+  const correct = Math.max(0, Number(rule.correctCount ?? 0));
+  const wrong = Math.max(0, Number(rule.wrongCount ?? 0)) + Math.max(0, Number(rule.falsePositiveCount ?? 0));
+  const totalFeedback = correct + wrong;
+
+  // Cap by explicit stored rule confidence if lower (supports both 0..1 and 0..100 scales)
+  const storedConf =
+    typeof rule.confidence === 'number' && Number.isFinite(rule.confidence) && rule.confidence > 0
+      ? (rule.confidence <= 1 ? rule.confidence : rule.confidence / 100)
+      : 1.0;
+
+  let calibrated = Math.min(clampedBase, Math.max(0.35, storedConf));
+
+  if (totalFeedback > 0) {
+    // Bayesian-smoothed empirical precision (prior: 2 pseudo-confirmations out of 2.15)
+    const empiricalPrecision = (correct + 2) / (totalFeedback + 2.15);
+    // If wrong predictions exist, demote confidence proportionally so noisy rules fall into review
+    if (wrong > 0) {
+      calibrated = Math.min(calibrated, Math.max(0.35, clampedBase * empiricalPrecision));
+    } else if (correct >= 3) {
+      calibrated = Math.min(0.99, Math.max(calibrated, clampedBase * 0.98));
+    }
+  }
+
+  return Math.round(calibrated * 1000) / 1000;
 }
 
 export type PlacementType = 'auto_approved' | 'bulk_review' | 'manual_review';
@@ -97,6 +134,16 @@ export interface TenantPolicy {
   policyVersion: number;
 }
 
+export interface ProposedNewCategory {
+  name: string;
+  type: 'expense' | 'income';
+  world?: 'business' | 'personal';
+  color: string;
+  icon: string;
+  reason: string;
+  patterns?: string[];
+}
+
 export interface ClassificationResult {
   categoryId: string;
   categoryName: string;
@@ -109,6 +156,11 @@ export interface ClassificationResult {
   }>;
   needsReview: boolean;
   source?: 'pattern' | 'rule' | 'ai' | 'fallback' | string;
+  // §5 / §11 World & New Category support
+  world?: 'business' | 'personal';
+  worldConfidence?: number;
+  worldReason?: string;
+  proposedNewCategory?: ProposedNewCategory | null;
   // §11 Extended properties
   confidenceBand?: ConfidenceBand;
   placement?: PlacementType;
@@ -488,7 +540,7 @@ function resolveCategoryArchetypes(categories: Category[]): Map<string, Financia
 
     for (const [archetypeKey, def] of Object.entries(TAXONOMY)) {
       const archetype = archetypeKey as FinancialArchetype;
-      
+
       // Type compatibility
       if (def.type !== 'both') {
         const isCompatibleType =
@@ -499,9 +551,9 @@ function resolveCategoryArchetypes(categories: Category[]): Map<string, Financia
 
       // Check name keywords
       const hasNameMatch = def.nameKeywords.some(kw => nameLower.includes(kw) || kw.includes(nameLower));
-      
+
       // Check pattern matches
-      const hasPatternMatch = patterns.some(pat => 
+      const hasPatternMatch = patterns.some(pat =>
         def.nameKeywords.some(kw => pat.includes(kw)) ||
         def.keywords.some(kw => pat.includes(kw)) ||
         def.vendors.some(v => pat.includes(v))
@@ -680,10 +732,214 @@ export function detectRiskFlags(
   return flags;
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 4.6. PERSONAL VS. BUSINESS WORLD INFERENCE & MISSING CATEGORY PROPOSALS (§5, §11)
+// ────────────────────────────────────────────────────────────────────────────
+
+const PERSONAL_SIGNAL_PATTERNS: Array<{ rx: RegExp; categoryName: string; icon: string; color: string; label: string }> = [
+  { rx: /\b(grocery|groceries|supermarket|hypermarket|walmart|costco|kroger|trader\s+joe|whole\s+foods|carrefour|imtiaz|metro\s+cash|alfatah|tesco|sainsbury|aldi|lidl)\b/i, categoryName: 'Personal Groceries', icon: 'shopping-cart', color: '#f59e0b', label: 'grocery / supermarket spend' },
+  { rx: /\b(gym|fitness|planet\s+fitness|equinox|crossfit|yoga|pilates|health\s+club|sports\s+club)\b/i, categoryName: 'Personal Fitness & Wellness', icon: 'shield', color: '#10b981', label: 'gym / fitness membership' },
+  { rx: /\b(pharmacy|drugstore|cvs|walgreens|boots\s+pharmacy|clinic|hospital|doctor|dentist|dental|lab\s+test|medical\s+bill|chughtai|agha\s+khan)\b/i, categoryName: 'Personal Healthcare', icon: 'shield', color: '#ef4444', label: 'personal medical / pharmacy spend' },
+  { rx: /\b(cinema|movie|theater|theatre|amc|regal|netflix|spotify|disney\+|hulu|apple\s+music|playstation|xbox|steam\s+games|concert|amusement)\b/i, categoryName: 'Personal Entertainment', icon: 'tag', color: '#a855f7', label: 'personal streaming / entertainment' },
+  { rx: /\b(salon|barber|spa|massage|beauty|cosmetics|sephora|skincare)\b/i, categoryName: 'Personal Care', icon: 'tag', color: '#ec4899', label: 'personal care / salon' },
+  { rx: /\b(school\s+fee|tuition|daycare|nursery|kids|toys|baby|pediatric|family\s+transfer|allowance\s+to\s+family)\b/i, categoryName: 'Family & Education', icon: 'users', color: '#6366f1', label: 'family / education spend' },
+  { rx: /\b(personal\s+draw|owner\s+draw|owner\s+withdrawal|personal\s+expense|personal\s+transfer|home\s+rent|house\s+rent|apartment\s+rent|domestic\s+help|maid\s+salary)\b/i, categoryName: 'Personal Drawings', icon: 'user', color: '#f97316', label: 'explicit personal / owner draw' },
+  { rx: /\b(zara|h&m|nike|adidas|uniqlo|nordstrom|macy|clothing|apparel|fashion|footwear|jewelry)\b/i, categoryName: 'Personal Shopping', icon: 'shopping-cart', color: '#ec4899', label: 'personal apparel / retail' },
+];
+
+const BUSINESS_SIGNAL_PATTERNS: RegExp[] = [
+  /\b(aws|amazon\s+web\s+services|google\s+cloud|gcp|azure|github|gitlab|vercel|netlify|supabase|digitalocean|cloudflare|heroku|datadog|sentry|openai|anthropic|slack|zoom|figma|notion|adobe|hubspot|salesforce|zendesk|atlassian|jira|stripe|quickbooks|xero|docusign|gusto|rippling|deel)\b/i,
+  /\b(payroll|salary|wages|contractor|freelancer|upwork|fiverr|toptal|client\s+retainer|client\s+invoice|invoice\s+#|invoice\s+payment|b2b|corporate|office\s+rent|office\s+supplies|coworking|wework|meta\s+ads|google\s+ads|linkedin\s+ads|advertising|marketing\s+campaign|seo|legal\s+fee|audit\s+fee|tax\s+filing|withholding\s+tax|corporate\s+tax)\b/i,
+];
+
+const ARCHETYPE_DEFAULT_CATEGORY_META: Record<FinancialArchetype, { name: string; type: 'expense' | 'income'; icon: string; color: string }> = {
+  SOFTWARE_SAAS: { name: 'Software & Subscriptions', type: 'expense', icon: 'laptop', color: '#06b6d4' },
+  MARKETING_ADS: { name: 'Marketing & Advertising', type: 'expense', icon: 'megaphone', color: '#ec4899' },
+  SALARIES_PAYROLL: { name: 'Payroll & Salaries', type: 'expense', icon: 'users', color: '#8b5cf6' },
+  RENT_FACILITIES: { name: 'Office Rent & Facilities', type: 'expense', icon: 'briefcase', color: '#f59e0b' },
+  UTILITIES_COMMUNICATION: { name: 'Utilities & Internet', type: 'expense', icon: 'zap', color: '#eab308' },
+  OFFICE_SUPPLIES_EQUIPMENT: { name: 'Office Supplies & Hardware', type: 'expense', icon: 'package', color: '#3b82f6' },
+  TRAVEL_TRANSPORTATION: { name: 'Travel & Transportation', type: 'expense', icon: 'plane', color: '#14b8a6' },
+  MEALS_ENTERTAINMENT: { name: 'Meals & Entertainment', type: 'expense', icon: 'utensils', color: '#f97316' },
+  PROFESSIONAL_LEGAL_CONSULTING: { name: 'Legal & Professional Services', type: 'expense', icon: 'briefcase', color: '#6366f1' },
+  BANK_FEES_FINANCE: { name: 'Bank & Finance Charges', type: 'expense', icon: 'credit-card', color: '#64748b' },
+  TAXES_LICENSES: { name: 'Taxes & Licenses', type: 'expense', icon: 'file-text', color: '#ef4444' },
+  INSURANCE: { name: 'Insurance', type: 'expense', icon: 'shield', color: '#10b981' },
+  CLIENT_REVENUE_INCOME: { name: 'Client Revenue', type: 'income', icon: 'dollar-sign', color: '#10b981' },
+  PRODUCT_SALES_INCOME: { name: 'Product Sales', type: 'income', icon: 'dollar-sign', color: '#22c55e' },
+  OTHER_INCOME: { name: 'Other Income', type: 'income', icon: 'plus-circle', color: '#34d399' },
+  GENERAL_OPERATING: { name: 'General Operating Expenses', type: 'expense', icon: 'layers', color: '#64748b' },
+};
+
+/**
+ * Deterministically infers whether a transaction is 'personal' or 'business' (§5, §11).
+ */
+export function inferWorldScope(
+  narration: string,
+  type: 'debit' | 'credit',
+  rules: ClassificationRule[] = [],
+  options?: { defaultWorld?: 'business' | 'personal'; personalWorldEnabled?: boolean }
+): { world: 'business' | 'personal'; confidence: number; reason: string; matchedPersonalHint?: typeof PERSONAL_SIGNAL_PATTERNS[number] } {
+  const personalEnabled = options?.personalWorldEnabled !== false;
+  const fallbackWorld = options?.defaultWorld || 'business';
+  if (!narration || !personalEnabled) {
+    return {
+      world: 'business',
+      confidence: 80,
+      reason: personalEnabled ? 'Default organization business scope' : 'Personal world disabled in organization settings',
+    };
+  }
+
+  const narrLower = narration.toLowerCase();
+  const { cleaned } = cleanNarration(narration);
+
+  // 1. Check active rules that explicitly carry a world scope
+  for (const rule of rules) {
+    if (rule.status && rule.status !== 'active') continue;
+    const ruleWorld = rule.prediction?.world || rule.scope?.world;
+    if (!ruleWorld) continue;
+    const pat = (rule.pattern || rule.match?.pattern || '').trim().toLowerCase();
+    if (pat && pat.length > 2 && (narrLower.includes(pat) || cleaned.includes(pat))) {
+      return {
+        world: ruleWorld,
+        confidence: 95,
+        reason: `Matched organization ${ruleWorld} rule "${pat}"`,
+      };
+    }
+  }
+
+  // 2. Strong business indicators win for clearly commercial B2B spend / client revenue
+  const hasBusinessSignal = BUSINESS_SIGNAL_PATTERNS.some(rx => rx.test(narration));
+  const personalHint = PERSONAL_SIGNAL_PATTERNS.find(p => p.rx.test(narration));
+
+  if (personalHint && !hasBusinessSignal) {
+    return {
+      world: 'personal',
+      confidence: 88,
+      reason: `Detected personal spending pattern (${personalHint.label})`,
+      matchedPersonalHint: personalHint,
+    };
+  }
+
+  if (personalHint && hasBusinessSignal) {
+    return {
+      world: fallbackWorld,
+      confidence: 55,
+      reason: `Mixed business & personal signals (${personalHint.label}) — requires review`,
+      matchedPersonalHint: personalHint,
+    };
+  }
+
+  if (hasBusinessSignal) {
+    return {
+      world: 'business',
+      confidence: 92,
+      reason: 'Recognized commercial / agency business vendor or narration',
+    };
+  }
+
+  if (type === 'credit' && /\b(family|friend|gift|personal\s+refund|pocket\s+money)\b/i.test(narration)) {
+    return {
+      world: 'personal',
+      confidence: 82,
+      reason: 'Personal credit / transfer indicator',
+    };
+  }
+
+  return {
+    world: fallbackWorld,
+    confidence: 70,
+    reason: `Defaulted to ${fallbackWorld} scope (no personal indicators detected)`,
+  };
+}
+
+/**
+ * Proposes a new category spec when the organization's Chart of Accounts lacks a matching category.
+ */
+export function suggestMissingCategorySpec(
+  narration: string,
+  type: 'debit' | 'credit',
+  world: 'business' | 'personal',
+  categories: Category[],
+  matchedArchetype?: FinancialArchetype
+): ProposedNewCategory | null {
+  const expectedType: 'expense' | 'income' = type === 'credit' ? 'income' : 'expense';
+  const { merchant, tokens } = cleanNarration(narration);
+  const seedPatterns = Array.from(new Set([merchant, ...tokens.slice(0, 2)].filter(p => p && p.length > 2)));
+
+  // 1. Personal hint category proposal when world is personal
+  if (world === 'personal' && expectedType === 'expense') {
+    const pHint = PERSONAL_SIGNAL_PATTERNS.find(p => p.rx.test(narration));
+    if (pHint) {
+      const exists = categories.some(
+        c => c.type === 'expense' && c.name.toLowerCase().includes(pHint.categoryName.toLowerCase().replace(/^personal\s+/i, ''))
+      );
+      if (!exists) {
+        return {
+          name: pHint.categoryName,
+          type: 'expense',
+          world: 'personal',
+          color: pHint.color,
+          icon: pHint.icon,
+          reason: `No existing personal category matched (${pHint.label})`,
+          patterns: seedPatterns,
+        };
+      }
+    }
+  }
+
+  // 2. Recognized universal archetype missing from org categories
+  if (matchedArchetype && matchedArchetype !== 'GENERAL_OPERATING') {
+    const meta = ARCHETYPE_DEFAULT_CATEGORY_META[matchedArchetype];
+    if (meta && meta.type === expectedType) {
+      const exists = categories.some(
+        c => c.type === expectedType && c.name.toLowerCase() === meta.name.toLowerCase()
+      );
+      if (!exists) {
+        return {
+          name: world === 'personal' && !meta.name.toLowerCase().startsWith('personal')
+            ? `Personal ${meta.name}`
+            : meta.name,
+          type: expectedType,
+          world,
+          color: meta.color,
+          icon: meta.icon,
+          reason: `Detected ${meta.name} spend/income, but this category does not exist in your Chart of Accounts`,
+          patterns: seedPatterns,
+        };
+      }
+    }
+  }
+
+  // 3. Unknown merchant with clear name
+  if (merchant && merchant.length >= 3) {
+    const title = merchant
+      .split(/\s+/)
+      .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ');
+    const proposedName = expectedType === 'income'
+      ? `${title} Income`
+      : (world === 'personal' ? `Personal - ${title}` : `${title} Expenses`);
+    return {
+      name: proposedName,
+      type: expectedType,
+      world,
+      color: world === 'personal' ? '#f59e0b' : (expectedType === 'income' ? '#10b981' : '#38bdf8'),
+      icon: world === 'personal' ? 'user' : (expectedType === 'income' ? 'dollar-sign' : 'tag'),
+      reason: `No existing category matched merchant "${title}"`,
+      patterns: seedPatterns,
+    };
+  }
+
+  return null;
+}
+
 export interface ExtendedClassificationOptions {
   organizationId?: string;
   world?: 'business' | 'personal';
+  personalWorldEnabled?: boolean;
   accountId?: string;
+  effectiveDate?: string;
   tenantPolicy?: Partial<TenantPolicy>;
   isTransfer?: boolean;
 }
@@ -720,6 +976,16 @@ export const classifyTransaction = (
   const { cleaned, merchant, tokens, phrases } = cleanNarration(narration);
   const narrLower = narration.toLowerCase();
   const expectedCategoryType = type === 'credit' ? 'income' : 'expense';
+
+  // Infer Personal vs. Business world (§5, §11)
+  const worldInference = inferWorldScope(narration, type, rules, {
+    defaultWorld: options?.world || 'business',
+    personalWorldEnabled: options?.personalWorldEnabled,
+  });
+  const effectiveWorld: 'business' | 'personal' = worldInference.world;
+
+  // Track if a universal archetype matched the narration even if the org lacks that category
+  let detectedUnmappedArchetype: FinancialArchetype | undefined;
 
   // Compatible categories matching the transaction direction
   const compatibleCategories = categories.filter(c => c.type === expectedCategoryType);
@@ -769,7 +1035,15 @@ export const classifyTransaction = (
 
     const existing = candidates.find(c => c.categoryId === catId);
     if (existing) {
-      if (score > existing.score || (score === existing.score && priority > existing.priority)) {
+      // Never let a lower-precedence tier (e.g., generic Tier 3 taxonomy) overwrite
+      // an authoritative org rule match (especially when calibrated down by wrong_count).
+      if (existing.ruleId && !extra?.ruleId) {
+        return;
+      }
+      if (
+        tier < existing.tier ||
+        (tier === existing.tier && (score > existing.score || (score === existing.score && priority > existing.priority)))
+      ) {
         existing.score = score;
         existing.tier = tier;
         existing.priority = priority;
@@ -800,15 +1074,35 @@ export const classifyTransaction = (
   // --------------------------------------------------------------------------
   // TIER 1 & TIER 2: VERSIONED USER RULES & HIGH-SPEC PATTERNS (§11 Cascaded Order)
   // --------------------------------------------------------------------------
+  const effectiveTs = options?.effectiveDate ? new Date(options.effectiveDate).getTime() : Date.now();
   if (rules && rules.length > 0) {
     for (const rule of rules) {
       // 1. Status gate: disabled or archived rules must not match
       if (rule.status && rule.status !== 'active') continue;
 
-      // 2. Scope validation: direction and world boundaries
+      // 1b. Effective date window check (§11 historical reproducibility)
+      if (rule.effectiveFrom) {
+        const fromTs = new Date(rule.effectiveFrom).getTime();
+        if (Number.isFinite(fromTs) && Number.isFinite(effectiveTs) && effectiveTs < fromTs) {
+          continue;
+        }
+      }
+      if (rule.effectiveTo) {
+        const toTs = new Date(rule.effectiveTo).getTime();
+        if (Number.isFinite(toTs) && Number.isFinite(effectiveTs) && effectiveTs > toTs) {
+          continue;
+        }
+      }
+
+      // 2. Scope validation: direction, account_ids, world, and amount band boundaries
       if (rule.scope) {
         if (rule.scope.directions && rule.scope.directions.length > 0 && !rule.scope.directions.includes(type)) {
           continue;
+        }
+        if (rule.scope.account_ids && rule.scope.account_ids.length > 0) {
+          if (!options?.accountId || !rule.scope.account_ids.includes(options.accountId)) {
+            continue;
+          }
         }
         if (rule.scope.world && options?.world && rule.scope.world !== options.world) {
           continue;
@@ -872,13 +1166,14 @@ export const classifyTransaction = (
       }
 
       if (ruleMatched) {
+        const calibratedScore = calibrateRuleConfidence(matchScore, rule);
         const targetCatId = rule.categoryId || rule.prediction?.category_id;
         const matchedCat = categories.find(c => c.id === targetCatId);
         if (matchedCat) {
           addCandidate(
             matchedCat.id,
             matchedCat.name,
-            matchScore,
+            calibratedScore,
             matchTier,
             priority,
             reason,
@@ -1008,16 +1303,26 @@ export const classifyTransaction = (
             ? `Identified merchant "${recognizedVendor}" -> categorized to ${matchedCategory.name}`
             : `Identified transaction context "${recognizedConcept}" -> categorized to ${matchedCategory.name}`
         );
+      } else if (!detectedUnmappedArchetype && archetype !== 'GENERAL_OPERATING') {
+        detectedUnmappedArchetype = archetype;
       }
     }
   }
 
   // --------------------------------------------------------------------------
-  // TIER 4: HISTORICAL TRANSACTIONS REPETITION (90-98% Confidence)
+  // TIER 4: HISTORICAL TRANSACTIONS REPETITION (Human-Verified Ground Truth Only — §11)
   // --------------------------------------------------------------------------
+  // Prevent self-reinforcing AI loops: unconfirmed AI/auto guesses are NOT independent ground truth.
   if (previousTransactions.length > 0) {
     const historicalMatches = previousTransactions.filter(prevTxn => {
       if (prevTxn.type !== type || !prevTxn.categoryId) return false;
+      const prevStatus = String(prevTxn.status || '');
+      const isHumanVerified =
+        prevTxn.classifiedBy === 'user' ||
+        prevTxn.classifiedBy === 'bulk_review' ||
+        prevStatus === 'posted' ||
+        prevStatus === 'reconciled';
+      if (!isHumanVerified) return false;
       const prevNarr = prevTxn.narration || prevTxn.description || '';
       const { cleaned: prevCleaned, merchant: prevMerchant } = cleanNarration(prevNarr);
 
@@ -1123,7 +1428,16 @@ export const classifyTransaction = (
 
   // If no match was found at all:
   if (!bestMatch) {
-    // Pick the most appropriate default category for the type
+    // Propose a clean new category if the org's Chart of Accounts lacks one for this merchant/archetype
+    const proposedNewCategory = suggestMissingCategorySpec(
+      narration,
+      type,
+      effectiveWorld,
+      categories,
+      detectedUnmappedArchetype
+    );
+
+    // Pick the most appropriate default fallback category for the type
     const defaultFallback = searchPool.find(c =>
       c.name.toLowerCase().includes('general') ||
       c.name.toLowerCase().includes('operating') ||
@@ -1132,18 +1446,25 @@ export const classifyTransaction = (
     ) || searchPool[0] || categories[0];
 
     return {
-      categoryId: defaultFallback?.id || '',
-      categoryName: defaultFallback?.name || 'Uncategorized',
-      confidence: 30,
+      categoryId: proposedNewCategory ? '' : (defaultFallback?.id || ''),
+      categoryName: proposedNewCategory ? proposedNewCategory.name : (defaultFallback?.name || 'Uncategorized'),
+      confidence: detectedUnmappedArchetype ? 62 : 30,
       confidenceBand: 'low',
       placement: 'manual_review',
-      reasoning: 'Ambiguous transaction description. Requires user review.',
-      alternativeSuggestions: searchPool.slice(1, 4).map(c => ({
+      reasoning: proposedNewCategory
+        ? `${proposedNewCategory.reason}. Proposed new category "${proposedNewCategory.name}".`
+        : 'Ambiguous transaction description. Requires user review.',
+      alternativeSuggestions: searchPool.slice(0, 3).map(c => ({
         categoryId: c.id,
         categoryName: c.name,
         confidence: 25,
       })),
       needsReview: true,
+      source: 'fallback',
+      world: effectiveWorld,
+      worldConfidence: worldInference.confidence,
+      worldReason: worldInference.reason,
+      proposedNewCategory,
       riskFlags,
       rawNarration: narration,
       normalizedTokens: tokens,
@@ -1205,7 +1526,11 @@ export const classifyTransaction = (
     reasoning: `${bestMatch.matchReason} (${finalConfidence}% confidence)${conflictSuffix}`,
     alternativeSuggestions: alternatives,
     needsReview,
-    source: bestMatch.tier <= 2 ? 'rule' : bestMatch.tier === 3 ? 'pattern' : 'fallback',
+    source: bestMatch.ruleId ? 'rule' : (bestMatch.tier <= 3 ? 'pattern' : 'fallback'),
+    world: effectiveWorld,
+    worldConfidence: worldInference.confidence,
+    worldReason: worldInference.reason,
+    proposedNewCategory: null,
     matchedRuleId: bestMatch.ruleId,
     matchedRuleVersion: bestMatch.ruleVersion,
     suggestedDepartmentId: bestMatch.departmentId,

@@ -213,6 +213,13 @@ export interface Department {
   customWeight?: number;
 }
 
+export interface ProjectMemberAssignment {
+  userId: string;
+  assignedFrom?: string;
+  assignedTo?: string;
+  allocationPct?: number | null;
+}
+
 export interface Project {
   id: string;
   organizationId: string;
@@ -223,6 +230,15 @@ export interface Project {
   status: 'quoted' | 'active' | 'on_hold' | 'completed' | 'cancelled';
   startDate: string;
   endDate?: string;
+  completedAt?: string;
+  pausedAt?: string;
+  pausedBusinessDays?: number;
+  plannedTeamSize?: number;
+  budgetedHours?: number | null;
+  hoursPerDay?: number;
+  monthlyCapacityHours?: number;
+  memberAssignments?: ProjectMemberAssignment[];
+  assignedMemberIds?: string[];
   quotedAmount: number;
   actualCost: number;
   currency: string;
@@ -325,6 +341,7 @@ export interface InventoryItem {
   assetAccountId: string;
   cogsAccountId: string;
   isActive: boolean;
+  negativeStockPolicy?: 'disallow' | 'warn' | 'allow_with_backorder';
 }
 
 export interface InventoryTransaction {
@@ -344,19 +361,144 @@ export interface InventoryTransaction {
   idempotencyKey?: string;
 }
 
+export type OverheadAllocationBase =
+  | 'revenue'
+  | 'headcount'
+  | 'direct_cost'
+  | 'equal'
+  | 'custom'
+  | 'manual_weight'
+  | 'department_ratio'
+  | 'square_footage'
+  | 'time_utilization';
+
 export interface OverheadAllocation {
   id: string;
   organizationId: string;
   name: string;
-  allocationBase: 'revenue' | 'headcount' | 'direct_cost' | 'equal' | 'custom';
+  allocationBase: OverheadAllocationBase;
   accountIds: string[]; // Overhead expense accounts to allocate
   departments: {
     departmentId: string;
     percentage: number;
+    weight?: number;
   }[];
   amount?: number; // Optional monthly pool amount
-  policyVersion?: number;
+  policyVersion?: string | number;
   isOperating?: boolean;
+}
+
+export interface AllocationRunLine {
+  poolId: string;
+  poolName: string;
+  departmentId: string;
+  departmentName: string;
+  driverBase: OverheadAllocationBase;
+  driverValue: number;
+  totalDriverValue: number;
+  driverSharePercent: number;
+  allocatedAmount: number;
+  usedFallbackEqual?: boolean;
+}
+
+export interface AllocationRun {
+  id: string;
+  organizationId: string;
+  periodStart: string;
+  periodEnd: string;
+  policyVersion: string;
+  currency: string;
+  totalPoolAmount: number;
+  allocatedAmount: number;
+  unallocatedRemainder: number;
+  status: 'frozen' | 'superseded';
+  lines?: AllocationRunLine[];
+  createdAt: string;
+}
+
+export interface QuoteRoleEstimate {
+  id: string;
+  roleName: string;
+  departmentId?: string;
+  estimatedHours: number;
+  costRate: number;
+  billingRate?: number;
+}
+
+export interface QuoteDirectPurchase {
+  id: string;
+  description: string;
+  category?: string;
+  amount: number;
+  currency?: string;
+}
+
+export interface QuoteVersion {
+  version: string;
+  createdAt: string;
+  notes: string;
+  proposedPrice: number;
+  estimatedTotalCost: number;
+  profitAmount: number;
+  marginPercent: number | null;
+  markupPercent: number | null;
+}
+
+export interface QuoteCalculationResult {
+  estimatedDirectLabor: number;
+  directPurchasesTotal: number;
+  overheadAmount: number;
+  contingencyAmount: number;
+  contingencyPercent: number;
+  estimatedTotalCost: number;
+  proposedPrice: number;
+  profitAmount: number;
+  marginPercent: number | null;
+  markupPercent: number | null;
+  requiredPriceForTargetMargin: number | null;
+  requiredPriceForTargetMarkup: number;
+  isTargetMarginValid: boolean;
+  isBelowCost: boolean;
+  meetsTargetMargin: boolean;
+  decimals?: Record<string, string | null>;
+  isRevenueRecognized: false;
+}
+
+export interface Quote {
+  id: string;
+  organizationId: string;
+  departmentId?: string | null;
+  clientName: string;
+  projectName: string;
+  serviceType: string;
+  billingModel: 'fixed_price' | 'time_and_materials' | 'retainer' | string;
+  deliveryHorizonMonths: number;
+  currency: string;
+  targetMarginPercent: number;
+  targetMarkupPercent: number;
+  roleEstimates: QuoteRoleEstimate[];
+  directPurchases: QuoteDirectPurchase[];
+  overheadAmount: number;
+  overheadMethod: OverheadAllocationBase | string;
+  contingencyPercent: number;
+  contingencyAmount: number;
+  estimatedDirectLabor: number;
+  directPurchasesTotal?: number;
+  estimatedTotalCost: number;
+  proposedPrice: number;
+  profitAmount: number;
+  marginPercent: number | null;
+  markupPercent: number | null;
+  requiredPriceForTargetMargin: number | null;
+  requiredPriceForTargetMarkup?: number;
+  isTargetMarginValid?: boolean;
+  isBelowCost?: boolean;
+  currentVersion: string;
+  versions: QuoteVersion[];
+  status: 'draft' | 'sent' | 'approved' | 'rejected' | 'archived';
+  isRevenueRecognized: false;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface CommissionStructure {
@@ -373,6 +515,7 @@ export interface CommissionStructure {
 
 export interface ExchangeRate {
   id?: string;
+  organizationId?: string | null;
   base: string;
   quote: string;
   rate: number;
@@ -402,6 +545,60 @@ export interface RecurringTransaction {
   totalOccurrencesExpected?: number;
   /** Whether this recurring transaction has been paid for the current period (month/week/etc) */
   isPaidForCurrentPeriod?: boolean;
+  /** Handoff v1.2 governance fields (§5, §7, §9) */
+  timezone?: string;
+  worldScope?: 'business' | 'personal';
+  autoGenerate?: boolean;
+  requiresApproval?: boolean;
+  approvalThreshold?: number;
+}
+
+export interface DetectedRecurringCandidate {
+  candidateKey: string;
+  suggestedTitle: string;
+  merchantKey: string;
+  direction: 'credit' | 'debit';
+  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+  suggestedAmount: number;
+  currency: string;
+  baseAmount: number;
+  baseCurrency: string;
+  amountType: 'fixed' | 'variable';
+  amountRange: { min: number; max: number };
+  occurrenceCount: number;
+  matchedDates: string[];
+  matchedTransactionIds: string[];
+  anchorDayOfMonth: number | null;
+  medianIntervalDays: number;
+  lastSeenDate: string;
+  suggestedNextOccurrence: string;
+  bankAccountId: string;
+  categoryId: string | null;
+  departmentId: string | null;
+  projectId: string | null;
+  worldScope: 'business' | 'personal';
+  confidence: 'high' | 'medium';
+  confidenceScore: number;
+  explanation: string;
+}
+
+export interface RecurringOccurrenceItem {
+  id: string;
+  organizationId: string;
+  templateId: string;
+  templateDescription: string;
+  templateType: 'credit' | 'debit';
+  frequency: string;
+  scheduledPeriodKey: string;
+  scheduledDate: string;
+  amount: number;
+  currency: string;
+  status: 'preview' | 'pending_approval' | 'approved' | 'posted' | 'matched_import' | 'skipped' | 'rejected';
+  transactionId: string | null;
+  journalEntryId: string | null;
+  source: 'scheduler' | 'manual' | 'import_match';
+  notes: string | null;
+  createdAt: string;
 }
 
 export interface Budget {
@@ -419,7 +616,7 @@ export interface Budget {
   spentAmount: number;
   currency: string;
   status: 'active' | 'exceeded' | 'completed' | 'on-track' | 'warning';
-  lifecycleStatus?: 'draft' | 'active' | 'archived' | 'rolled_over' | 'versioned';
+  lifecycleStatus?: 'draft' | 'approved' | 'locked' | 'active' | 'archived' | 'rolled_over' | 'versioned';
   version?: number;
   isCurrent?: boolean;
   parentBudgetId?: string;
@@ -462,10 +659,29 @@ export interface Loan {
   paymentsCount?: number;
   paymentsCompleted?: number;
   termMonths?: number;
-  rateType?: 'fixed' | 'floating' | string;
+  rateType?: 'fixed' | 'variable' | 'floating' | string;
   lastPaymentDate?: string;
   lastPaymentMonth?: string;
   accruedInterest?: number;
+  overdueAmount?: number;
+}
+
+export interface LoanPayment {
+  id: string;
+  organizationId: string;
+  loanId: string;
+  amount: number;
+  paymentMonth: string;
+  paidOn: string;
+  principalPart?: number;
+  interestPart?: number;
+  feePart?: number;
+  journalEntryId?: string;
+  bankAccountId?: string;
+  method?: string;
+  reference?: string;
+  notes?: string;
+  createdAt?: string;
 }
 
 export interface CashFlowForecast {
@@ -771,18 +987,109 @@ export interface TransactionFilters extends PaginationParams, DateRangeFilter {
 }
 
 // Dashboard summary types
+export type UpcomingSourceType = 'recurring' | 'loan' | 'payroll' | 'invoice' | 'reimbursement';
+
+export interface UpcomingItem {
+  id: string;
+  date: string;
+  isoDate?: string;
+  title: string;
+  amount: number;
+  rawAmount?: number;
+  currency: string;
+  originalCurrency?: string;
+  type?: 'credit' | 'debit';
+  sourceType?: UpcomingSourceType;
+  sourceId?: string;
+  isOverdue?: boolean;
+  daysOverdue?: number;
+  subtitle?: string;
+}
+
 export interface DashboardSummary {
+  currency?: string;
+  worldScope?: 'business' | 'personal' | 'all';
   totalRevenue: number;
   totalExpenses: number;
   netProfit: number;
-  profitMargin: number;
+  monthlyRevenue?: number;
+  monthlyExpenses?: number;
+  monthlyProfit?: number;
+  monthlyProfitChange?: number | null;
+  weeklyRevenue?: number;
+  weeklyExpenses?: number;
+  weeklyProfit?: number;
+  weeklyProfitChange?: number | null;
+  yearlyRevenue?: number;
+  yearlyExpenses?: number;
+  yearlyProfit?: number;
+  yearlyProfitChange?: number | null;
+  profitMargin: number | null;
   cashOnHand: number;
+  cashOnHandChange?: number | null;
+  cashInBank?: number;
+  totalBankBalanceBase?: number;
+  totalBalanceChange?: number | null;
   accountsReceivable: number;
   accountsPayable: number;
+  totalAssets?: number;
+  totalLiabilities?: number;
+  netWorth?: number;
+  netWorthChange?: number | null;
+  liquidNetWorth?: number;
+  totalInventory?: number;
+  totalFixedAssets?: number;
+  monthlyPayroll?: number;
+  payrollConfidentialMasked?: boolean;
+  monthlyBurnRate?: number;
+  cashRunwayMonths?: number | null;
+  loansReceivable?: number;
+  loansPayable?: number;
   pendingTransactions: number;
-  revenueChange: number; // percentage
-  expenseChange: number;
-  profitChange: number;
+  pendingReviewAmount?: number;
+  revenueChange: number | null; // percentage
+  expenseChange: number | null;
+  profitChange: number | null;
+  monthlyGoals?: {
+    expenseBudget?: number | null;
+    expenseActual?: number;
+    expensePct?: number | null;
+    revenueTarget?: number | null;
+    revenueActual?: number;
+    revenuePct?: number | null;
+    savingsTarget?: number | null;
+    savingsActual?: number;
+    savingsPct?: number | null;
+    targetSource?: string;
+  };
+  upcomingPayments?: UpcomingItem[];
+  upcomingExpenses?: UpcomingItem[];
+  overduePayments?: UpcomingItem[];
+  overdueExpenses?: UpcomingItem[];
+  totalUpcomingPayments?: number;
+  totalUpcomingExpenses?: number;
+  totalOverduePayments?: number;
+  totalOverdueExpenses?: number;
+  meta?: {
+    basis?: string;
+    baseCurrency?: string;
+    worldScope?: string;
+    asOf?: string;
+    source?: string;
+    unapprovedCount?: number;
+    upcomingWindow?: {
+      start: string;
+      end: string;
+      basis: string;
+    };
+  };
+  chartData?: {
+    profitData?: Array<Record<string, any>>;
+    weeklyProfitData?: Array<Record<string, any>>;
+    departmentData?: Array<Record<string, any>>;
+    expenseCategoryData?: Array<{ name: string; value: number; color: string }>;
+    monthlyComparisonData?: Array<Record<string, any>>;
+  };
 }
 
 export interface CashFlowSummary {
@@ -862,6 +1169,7 @@ export interface DepartmentProfitability {
   includedPools?: Array<{ poolId: string; poolName: string; allocatedAmount: number }>;
   costMatrixMeta?: {
     period?: string;
+    periodMonths?: number;
     currency?: string;
     policyVersion?: string;
     calculationTimestamp?: string;
@@ -869,11 +1177,25 @@ export interface DepartmentProfitability {
     selectedCapacityHours?: number | null;
     selectedCapacityBasis?: string;
     includedPoolsCount?: number;
+    excludedNonOperatingPoolsCount?: number;
     totalPoolsAmount?: number;
+    unallocatedOverhead?: number;
+    laborCostSource?: 'posted_payroll' | 'accrued_salary_160h' | 'none';
+  };
+  decimals?: {
+    revenue: string;
+    directCosts: string;
+    allocatedOverhead: string;
+    fullDepartmentCost: string;
+    netProfit: string;
+    costPerHour: string | null;
+    costPerMinute: string | null;
+    directCostPerHour: string | null;
+    directCostPerMinute: string | null;
   };
   /** Monthly approved department budget */
   budget?: number;
-  /** Direct costs + allocated overhead spent against budget */
+  /** Direct costs spent against budget for period */
   budgetSpent?: number;
   /** Remaining available budget this period */
   budgetRemaining?: number;
@@ -893,7 +1215,8 @@ export interface ProjectProfitability {
   profit: number;
   operatingProfit?: number;
   projectContribution?: number;
-  profitMargin: number;
+  /** Strictly null (undefined) when recognized revenue <= 0 (§12.4 L666, §33 #9) */
+  profitMargin: number | null;
   status: string;
   budgetVariance: number; // percentage over/under
   directCost?: number;
@@ -919,6 +1242,93 @@ export interface ProjectProfitability {
     hours: number;
     approvedHours?: number;
     laborCost: number;
+    allocationSharePct?: number;
+    hourlyRate?: number;
+    overrunHours?: number;
+  }>;
+  // Schedule-driven automatic Mon–Fri hours & loss detection fields
+  startDate?: string;
+  endDate?: string;
+  completedAt?: string;
+  pausedAt?: string;
+  pausedBusinessDays?: number;
+  plannedTeamSize?: number;
+  budgetedHours?: number | null;
+  capacityBasis?: 'scheduled_mon_fri_40h_160h';
+  hoursPerDay?: number;
+  monthlyCapacityHours?: number;
+  plannedBusinessDays?: number;
+  elapsedBusinessDays?: number;
+  remainingBusinessDays?: number;
+  overdueBusinessDays?: number;
+  projectSchedulePlannedHours?: number;
+  projectScheduleElapsedHours?: number;
+  projectScheduleRemainingHours?: number;
+  projectScheduleOverrunHours?: number;
+  plannedHours?: number;
+  elapsedHours?: number;
+  remainingHours?: number;
+  overrunHours?: number;
+  weeklyScheduledHours?: number;
+  exactCompletionHours?: number | null;
+  scheduleProgressPct?: number;
+  isOverdue?: boolean;
+  isOpenEnded?: boolean;
+  overrunLaborCost?: number;
+  hourlyBurnRate?: number;
+  plannedDailyBudget?: number;
+  quoteProfit?: number;
+  quoteMarginPct?: number | null;
+  operatingMarginPct?: number | null;
+  maxProfitableHours?: number | null;
+  breakEvenDate?: string | null;
+  daysUntilLoss?: number | null;
+  healthStatus?:
+    | 'in_loss'
+    | 'overtime'
+    | 'at_risk'
+    | 'on_track'
+    | 'quoted'
+    | 'on_hold'
+    | 'completed_profit'
+    | 'completed_loss'
+    | 'cancelled';
+  lossAmount?: number;
+  alertMessage?: string | null;
+  isUsingDeptFallback?: boolean;
+  missingSalaryMembers?: string[];
+  teamAllocations?: Array<{
+    userId: string;
+    name: string;
+    email: string;
+    avatarUrl?: string | null;
+    departmentId?: string;
+    departmentName?: string;
+    role?: string;
+    assignedFrom: string;
+    assignedTo?: string;
+    allocationSharePct: number;
+    isCustomAllocation: boolean;
+    isOverAllocated: boolean;
+    salaryMissing: boolean;
+    hourlyRate: number;
+    ratePerMinute: number;
+    plannedHours: number;
+    elapsedHours: number;
+    overrunHours: number;
+    laborCost: number;
+    overrunLaborCost: number;
+  }>;
+  overheadBreakdown?: Array<{
+    departmentId: string;
+    departmentName: string;
+    headcount: number;
+    departmentOverheadPool: number;
+    departmentCapacityHours: number;
+    overheadRatePerHour: number;
+    scheduledHours: number;
+    allocatedOverhead: number;
+    absorptionPercent: number;
   }>;
 }
 

@@ -354,6 +354,7 @@ export function EnhancedStatementImport({
           narration: t.narration,
           amount: t.amount,
           type: t.type,
+          accountId: selectedAccount || undefined,
         }));
         
         console.log('[import] Batch payload:', batchPayload.length, 'transactions');
@@ -366,19 +367,25 @@ export function EnhancedStatementImport({
         console.log('[import] Batch classification result:', classRes.success ? 'success' : 'failed', classRes.error);
         
         if (classRes.success && classRes.data) {
-          console.log('[import] Batch classification succeeded, applying suggestions to all rows');
+          console.log('[import] Batch classification succeeded, applying suggestions & world scope to all rows');
           transactions.forEach((txn, i) => {
             const r = classRes.data!.get(i);
             if (r) {
               txn.confidence = r.confidence;
               txn.suggestedCategory = r.categoryName;
               txn.category = r.categoryName;
-              txn.classificationSource = r.source === 'ai' ? 'ai' : 'rules'; // Store the source
-              
-              // Always auto-apply category if available so no transaction remains uncategorized
+              txn.classificationSource = r.source === 'ai' ? 'ai' : 'rules';
+              txn.reasoning = r.reasoning;
+              txn.placement = r.placement;
+              txn.riskFlags = r.riskFlags || [];
+              txn.needsReview = r.needsReview;
+              txn.usage = r.world === 'personal' ? 'personal' : 'business';
+              txn.worldConfidence = r.worldConfidence;
+              txn.worldReason = r.worldReason;
+              txn.proposedNewCategory = r.proposedNewCategory || null;
+
               if (r.categoryId) {
                 txn.importCategoryId = r.categoryId;
-                console.log(`[import] Auto-applied category "${r.categoryName}" (${r.confidence}%) via ${r.source || 'ai'} to: ${txn.narration.substring(0, 50)}`);
               }
             }
           });
@@ -699,16 +706,20 @@ export function EnhancedStatementImport({
 
     for (const t of filteredTransactions) {
       const conf = t.confidence ?? (t.classificationSource === 'rules' ? 95 : t.classificationSource === 'ai' ? 85 : 0);
-      const hasAssignedCategory = Boolean(t.importCategoryId || t.suggestedCategory || t.category);
+      const hasAssignedCategory = Boolean(t.importCategoryId);
+      const hasRiskFlags = Array.isArray(t.riskFlags) && t.riskFlags.length > 0;
+      const hasProposedCategory = Boolean(!t.importCategoryId && t.proposedNewCategory?.name);
 
-      // Tier 1: High confidence auto-accepted (confidence >= 80)
-      if (conf >= 80 && hasAssignedCategory) {
+      // §11 Placement-aware partitioning: risky or new-category rows never slip silently into Tier 1
+      if (t.placement === 'auto_approved' && hasAssignedCategory && !hasRiskFlags && !hasProposedCategory) {
         t1.push(t);
-      } else if (conf >= 40 || t.suggestedCategory) {
-        // Tier 2: Grouped exceptions (common vendor tokens, medium confidence 40-79%)
+      } else if (!t.placement && conf >= 85 && hasAssignedCategory && !hasRiskFlags && !hasProposedCategory) {
+        t1.push(t);
+      } else if (hasProposedCategory || t.placement === 'bulk_review' || (conf >= 50 && !hasRiskFlags)) {
+        // Tier 2: Grouped exceptions (medium confidence or proposed new category groups)
         t2Candidates.push(t);
       } else {
-        // Tier 3: Low-confidence / manual review (< 40% or completely missing category)
+        // Tier 3: Low-confidence, cross-world ambiguity, conflicts, or risk-flagged manual review
         t3.push(t);
       }
     }
@@ -719,16 +730,10 @@ export function EnhancedStatementImport({
       if (!vendorMap[token]) {
         let catId = t.importCategoryId || '';
         let catName = t.suggestedCategory || t.category || '';
-        if (!catId && catName) {
+        if (!catId && !t.proposedNewCategory && catName) {
           const match = categories.find(c => c.name.toLowerCase() === catName.toLowerCase())
             || categories.find(c => c.name.toLowerCase().includes(catName.toLowerCase()));
           if (match) catId = match.id;
-        }
-        if (!catId && categories.length > 0) {
-          const expectedType = t.type === 'credit' ? 'income' : 'expense';
-          const match = categories.find(c => c.type === expectedType) || categories[0];
-          catId = match.id;
-          catName = match.name;
         }
 
         vendorMap[token] = {
@@ -736,7 +741,7 @@ export function EnhancedStatementImport({
           vendorToken: token,
           transactions: [],
           suggestedCategoryId: catId,
-          suggestedCategoryName: catName,
+          suggestedCategoryName: catName || t.proposedNewCategory?.name || '',
           confidence: t.confidence ?? 65,
         };
       }
@@ -838,73 +843,94 @@ export function EnhancedStatementImport({
     try {
       const decisions: Array<{
         transactionId: string;
+        narration: string;
+        pattern?: string;
+        type: 'debit' | 'credit';
+        world: 'business' | 'personal';
+        usage: 'business' | 'personal';
         action: 'accept' | 'override';
         categoryId: string;
+        proposedNewCategory?: ImportedTransaction['proposedNewCategory'];
         createRule: boolean;
       }> = [];
 
       // 1. Tier 1 decisions
       for (const t of tier1List) {
+        const world = t.usage === 'personal' ? 'personal' : 'business';
         decisions.push({
           transactionId: t.id,
+          narration: t.narration,
+          type: t.type,
+          world,
+          usage: world,
           action: 'accept',
           categoryId: t.importCategoryId || '',
+          proposedNewCategory: t.proposedNewCategory || null,
           createRule: false,
         });
       }
 
-      // 2. Tier 2 decisions and rule creation
+      // 2. Tier 2 decisions (creates missing categories + versioned rules server-side)
       for (const group of tier2Groups) {
         const state = groupOverrides[group.vendorToken];
-        const categoryId = state?.selectedCategoryId || group.suggestedCategoryId;
+        const categoryId = state?.selectedCategoryId || group.suggestedCategoryId || '';
         const createRule = state?.createRule ?? true;
-        const isOverride = categoryId !== group.suggestedCategoryId;
+        const isOverride = Boolean(state?.selectedCategoryId && state.selectedCategoryId !== group.suggestedCategoryId);
 
         for (const t of group.transactions) {
+          const world = t.usage === 'personal' ? 'personal' : 'business';
           decisions.push({
             transactionId: t.id,
+            narration: t.narration,
+            pattern: group.vendorToken.toLowerCase(),
+            type: t.type,
+            world,
+            usage: world,
             action: isOverride ? 'override' : 'accept',
             categoryId,
+            proposedNewCategory: categoryId ? null : (t.proposedNewCategory || null),
             createRule,
           });
         }
-
-        // If createRule is true, persist rule to organization classification rules
-        if (createRule && categoryId) {
-          try {
-            await svc.classification.addRule({
-              pattern: group.vendorToken,
-              categoryId,
-              confidence: 95,
-              matchCount: group.transactions.length,
-              createdFrom: 'user',
-              lastUsed: new Date().toISOString(),
-            });
-          } catch (ruleErr) {
-            console.warn('[bulk-review] Failed to create rule for token:', group.vendorToken, ruleErr);
-          }
-        }
       }
 
-      // 3. Tier 3 decisions
+      // 3. Tier 3 decisions (learns rules when user assigned a category or accepted a new category)
       for (const t of tier3List) {
+        const world = t.usage === 'personal' ? 'personal' : 'business';
+        const hasManualOrProposed = Boolean(t.importCategoryId || t.proposedNewCategory?.name);
         decisions.push({
           transactionId: t.id,
+          narration: t.narration,
+          type: t.type,
+          world,
+          usage: world,
           action: 'override',
-          categoryId: t.importCategoryId || categories[0]?.id || '',
-          createRule: false,
+          categoryId: t.importCategoryId || '',
+          proposedNewCategory: t.importCategoryId ? null : (t.proposedNewCategory || null),
+          createRule: hasManualOrProposed,
         });
       }
 
       // 4. Submit to POST /api/v1/organizations/:organizationId/classification/bulk-review
+      let createdCategoryMap = new Map<string, { id: string; name: string }>();
+      let summaryMsg = '';
       if (svc.orgId) {
         try {
-          const res = await apiPostJson<{ decisions: typeof decisions }, { processedCount: number; rulesCreated: number }>(
+          const res = await apiPostJson<
+            { decisions: typeof decisions },
+            { processedCount: number; rulesCreated: number; categoriesCreated?: number; createdCategories?: Array<{ key: string; id: string; name: string }> }
+          >(
             `/organizations/${encodeURIComponent(svc.orgId)}/classification/bulk-review`,
             { decisions }
           );
-          if (res.success) {
-            console.log('[bulk-review] Server bulk-review succeeded:', res.data);
+          if (res.success && res.data) {
+            for (const c of res.data.createdCategories || []) {
+              createdCategoryMap.set(c.key, { id: c.id, name: c.name });
+            }
+            const parts: string[] = [];
+            if (res.data.categoriesCreated) parts.push(`${res.data.categoriesCreated} new categor${res.data.categoriesCreated === 1 ? 'y' : 'ies'} created`);
+            if (res.data.rulesCreated) parts.push(`${res.data.rulesCreated} rule${res.data.rulesCreated === 1 ? '' : 's'} learned`);
+            if (parts.length > 0) summaryMsg = ` (${parts.join(', ')})`;
           } else {
             console.warn('[bulk-review] Server bulk-review route response:', res.error);
           }
@@ -913,7 +939,7 @@ export function EnhancedStatementImport({
         }
       }
 
-      // Ensure all group decisions are applied to parsedTransactions
+      // Apply group decisions and any newly created category IDs back to parsedTransactions
       setParsedTransactions(prev =>
         prev.map(t => {
           const token = extractVendorToken(t.narration);
@@ -922,7 +948,21 @@ export function EnhancedStatementImport({
             return {
               ...t,
               importCategoryId: state.selectedCategoryId,
+              needsReview: false,
             };
+          }
+          if (!t.importCategoryId && t.proposedNewCategory?.name) {
+            const key = `${t.proposedNewCategory.type}:${t.proposedNewCategory.name.toLowerCase()}`;
+            const createdCat = createdCategoryMap.get(key);
+            if (createdCat) {
+              return {
+                ...t,
+                importCategoryId: createdCat.id,
+                category: createdCat.name,
+                suggestedCategory: createdCat.name,
+                needsReview: false,
+              };
+            }
           }
           return t;
         })
@@ -930,7 +970,7 @@ export function EnhancedStatementImport({
 
       setReviewCompleted(true);
       if (notify) {
-        toast.success(`Reviewed ${decisions.length} transactions across 3 tiers. Ready to commit.`);
+        toast.success(`Reviewed ${decisions.length} transactions across 3 tiers${summaryMsg}. Ready to commit.`);
       }
     } catch (e: any) {
       console.error('[bulk-review] Error submitting bulk review:', e);
@@ -940,7 +980,7 @@ export function EnhancedStatementImport({
     } finally {
       setReviewSubmitting(false);
     }
-  }, [reviewSubmitting, tier1List, tier2Groups, tier3List, groupOverrides, svc.orgId, svc.classification, categories]);
+  }, [reviewSubmitting, tier1List, tier2Groups, tier3List, groupOverrides, svc.orgId]);
 
   const stepIndex = ['upload', 'mapping', 'review', 'complete'].indexOf(currentStep);
 
@@ -2112,6 +2152,33 @@ export function EnhancedStatementImport({
                                     <span className="text-[11px] px-2 py-0.5 rounded font-mono bg-slate-800 text-slate-400">
                                       {group.confidence}% confidence
                                     </span>
+                                    {(() => {
+                                      const grpWorld = group.transactions[0]?.usage === 'personal' ? 'personal' : 'business';
+                                      return (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            const nextWorld = grpWorld === 'personal' ? 'business' : 'personal';
+                                            setParsedTransactions(prev =>
+                                              prev.map(t => (extractVendorToken(t.narration) === group.vendorToken ? { ...t, usage: nextWorld } : t))
+                                            );
+                                          }}
+                                          title="Click to toggle Business / Personal scope for this group"
+                                          className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded border cursor-pointer ${
+                                            grpWorld === 'personal'
+                                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                                              : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
+                                          }`}
+                                        >
+                                          {grpWorld}
+                                        </button>
+                                      );
+                                    })()}
+                                    {!selectedCatId && group.transactions[0]?.proposedNewCategory?.name && (
+                                      <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/40">
+                                        + New Category: {group.transactions[0].proposedNewCategory.name}
+                                      </span>
+                                    )}
                                   </div>
                                   <p className="text-xs text-slate-400 truncate max-w-xl">
                                     Sample: "{group.transactions[0]?.narration}"
@@ -2239,7 +2306,25 @@ export function EnhancedStatementImport({
                             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                               <div>
                                 <p className="text-sm font-semibold text-white">{txn.narration}</p>
-                                <p className="text-xs text-slate-400 mt-0.5 font-mono">{txn.date}</p>
+                                <div className="flex flex-wrap items-center gap-1.5 mt-1">
+                                  <p className="text-xs text-slate-400 font-mono">{txn.date}</p>
+                                  {!txn.importCategoryId && txn.proposedNewCategory?.name && (
+                                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/40">
+                                      + Will create: {txn.proposedNewCategory.name}
+                                    </span>
+                                  )}
+                                  {(txn.riskFlags || []).map((flag) => (
+                                    <span
+                                      key={flag}
+                                      className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                                    >
+                                      {flag.replace(/_/g, ' ')}
+                                    </span>
+                                  ))}
+                                </div>
+                                {txn.worldReason && (
+                                  <p className="text-[11px] text-slate-400 mt-1">{txn.worldReason}</p>
+                                )}
                               </div>
                               <div className="text-right">
                                 <p
@@ -2361,6 +2446,18 @@ export function EnhancedStatementImport({
                               <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-500/30 shrink-0">
                                 {txn.suggestedCategory || txn.category || 'Classified'}
                               </span>
+                              <button
+                                type="button"
+                                onClick={() => patchTransaction(txn.id, { usage: txn.usage === 'personal' ? 'business' : 'personal' })}
+                                title="Click to toggle Business / Personal scope"
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase border shrink-0 cursor-pointer ${
+                                  txn.usage === 'personal'
+                                    ? 'bg-amber-500/15 text-amber-300 border-amber-500/40'
+                                    : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/40'
+                                }`}
+                              >
+                                {txn.usage === 'personal' ? 'personal' : 'business'}
+                              </button>
                             </div>
                             <div className="flex items-center gap-3 shrink-0 ml-3">
                               <span className="text-[10px] font-mono text-slate-400">

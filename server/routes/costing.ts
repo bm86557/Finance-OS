@@ -1,46 +1,27 @@
 /**
- * Costing & Pricing Intelligence Router
- * =====================================
+ * Costing & Pricing Intelligence Router (§12, §14, §8, §16, §33)
+ * ==============================================================
  * Handles:
- *  - Overhead Allocations CRUD (with 100% sum validation)
- *  - Commission Structures CRUD (with <= 100% split validation)
- *  - Exchange Rates & FX Conversion
+ *  - Commission Structures CRUD (multiplicative split validation + RBAC + audit)
+ *  - Tenant-Scoped Exchange Rates & FX Conversion (single source of truth)
+ *  - §14 Quote Simulator, Pricing & Versioning Engine (normalized tables + zero-cache cross-instance safety)
  *
- * Backed by Supabase DB with resilient SQLite store fallback.
+ * NOTE: Overhead Allocations are owned exclusively by `server/routes/overheadAllocations.ts`
+ * mounted at `/organizations/:organizationId/overhead-allocations` to eliminate Express route shadowing.
  */
 
 import { Router, type Request, type Response } from 'express';
-import type { OverheadAllocation, CommissionStructure, ExchangeRate } from '../../src/services/types.js';
+import type { CommissionStructure, ExchangeRate, Quote } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
+import { DEFAULT_RATES_TO_USD, getEstimatedFxRate } from '../lib/fxConverter.js';
+import { calculateQuoteFormulas } from '../services/costingEngine.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
   return Array.isArray(p) ? p[0] : (p ?? '');
-}
-
-function mapDbToDomainAllocation(row: Record<string, any>): OverheadAllocation {
-  return {
-    id: String(row.id),
-    organizationId: String(row.organization_id),
-    name: String(row.name ?? ''),
-    allocationBase: row.allocation_base || 'headcount',
-    accountIds: Array.isArray(row.account_ids) ? row.account_ids : [],
-    departments: Array.isArray(row.departments) ? row.departments : [],
-    amount: row.amount != null ? Number(row.amount) : undefined,
-  };
-}
-
-function mapDomainToDbAllocation(alloc: OverheadAllocation, safeBase = false): Record<string, unknown> {
-  return {
-    id: alloc.id,
-    organization_id: alloc.organizationId,
-    name: alloc.name,
-    allocation_base: safeBase && alloc.allocationBase === 'custom' ? 'headcount' : (alloc.allocationBase || 'headcount'),
-    account_ids: alloc.accountIds || [],
-    departments: alloc.departments || [],
-    amount: alloc.amount != null ? alloc.amount : 0,
-  };
 }
 
 function mapDbToDomainCommission(row: Record<string, any>): CommissionStructure {
@@ -68,216 +49,261 @@ function mapDomainToDbCommission(comm: CommissionStructure): Record<string, unkn
   };
 }
 
-export function createCostingRouter(): Router {
+function mapDbRowToQuote(row: Record<string, any>, versions: any[] = []): Quote {
+  return {
+    id: String(row.id),
+    organizationId: String(row.organization_id),
+    departmentId: row.department_id ? String(row.department_id) : null,
+    clientName: String(row.client_name || 'Client'),
+    projectName: String(row.project_name || ''),
+    serviceType: String(row.service_type || 'Custom Project'),
+    billingModel: String(row.billing_model || 'fixed_price'),
+    deliveryHorizonMonths: Number(row.delivery_horizon_months ?? 1),
+    currency: String(row.currency || 'USD'),
+    targetMarginPercent: Number(row.target_margin_percent ?? 25),
+    targetMarkupPercent: Number(row.target_markup_percent ?? 33.33),
+    roleEstimates: Array.isArray(row.role_estimates) ? row.role_estimates : [],
+    directPurchases: Array.isArray(row.direct_purchases) ? row.direct_purchases : [],
+    overheadAmount: Number(row.overhead_amount ?? 0),
+    overheadMethod: String(row.overhead_method || 'headcount'),
+    contingencyPercent: Number(row.contingency_percent ?? 0),
+    contingencyAmount: Number(row.contingency_amount ?? 0),
+    estimatedDirectLabor: Number(row.estimated_direct_labor ?? 0),
+    directPurchasesTotal: Number(row.direct_purchases_total ?? 0),
+    estimatedTotalCost: Number(row.estimated_total_cost ?? 0),
+    proposedPrice: Number(row.proposed_price ?? 0),
+    profitAmount: Number(row.profit_amount ?? 0),
+    marginPercent: row.margin_percent != null ? Number(row.margin_percent) : null,
+    markupPercent: row.markup_percent != null ? Number(row.markup_percent) : null,
+    requiredPriceForTargetMargin: row.required_price_for_target_margin != null ? Number(row.required_price_for_target_margin) : null,
+    requiredPriceForTargetMarkup: Number(row.required_price_for_target_markup ?? 0),
+    isTargetMarginValid: Number(row.target_margin_percent ?? 25) >= 0 && Number(row.target_margin_percent ?? 25) < 100,
+    isBelowCost: Number(row.proposed_price ?? 0) > 0 && Number(row.proposed_price ?? 0) < Number(row.estimated_total_cost ?? 0),
+    currentVersion: String(row.current_version || 'v1.0'),
+    versions: versions.map(v => ({
+      version: String(v.version),
+      createdAt: String(v.created_at || v.createdAt || new Date().toISOString()),
+      notes: String(v.notes || ''),
+      proposedPrice: Number(v.proposed_price ?? v.proposedPrice ?? 0),
+      estimatedTotalCost: Number(v.estimated_total_cost ?? v.estimatedTotalCost ?? 0),
+      profitAmount: Number(v.profit_amount ?? v.profitAmount ?? 0),
+      marginPercent: (v.margin_percent ?? v.marginPercent) != null ? Number(v.margin_percent ?? v.marginPercent) : null,
+      markupPercent: (v.markup_percent ?? v.markupPercent) != null ? Number(v.markup_percent ?? v.markupPercent) : null,
+    })),
+    status: (row.status || 'draft') as Quote['status'],
+    isRevenueRecognized: false,
+    createdAt: String(row.created_at || new Date().toISOString()),
+    updatedAt: String(row.updated_at || new Date().toISOString()),
+  };
+}
+
+function isMissingRelationOrColumn(err: any): boolean {
+  const code = String(err?.code || '');
+  const msg = String(err?.message || '').toLowerCase();
+  return code === '42P01' || code === '42703' || code === 'PGRST204' || msg.includes('does not exist') || msg.includes('schema cache');
+}
+
+/**
+ * Builds canonical fallback baseline FX list derived strictly from `fxConverter.ts`
+ * so every module in Finance OS shares ONE consistent FX source (§8, §33 #6).
+ */
+function buildCanonicalBaselineRates(): ExchangeRate[] {
+  const asOf = new Date().toISOString().slice(0, 10);
+  const pairs: Array<[string, string]> = [
+    ['USD', 'PKR'],
+    ['USD', 'EUR'],
+    ['USD', 'GBP'],
+    ['USD', 'AED'],
+    ['USD', 'SAR'],
+    ['AED', 'USD'],
+    ['EUR', 'USD'],
+    ['GBP', 'USD'],
+    ['PKR', 'USD'],
+    ['AED', 'PKR'],
+  ];
+  return pairs.map(([base, quote]) => {
+    const rate = Math.round(getEstimatedFxRate(base, quote) * 10000) / 10000;
+    return {
+      id: `fx-base-${base}-${quote}`.toLowerCase(),
+      organizationId: null,
+      base,
+      quote,
+      rate,
+      asOf,
+      source: 'system_baseline',
+    };
+  });
+}
+
+export function createExchangeRatesReadRouter(): Router {
+  const r = Router({ mergeParams: true });
+
+  // ── GET /exchange-rates — Org overrides merged cleanly over global baselines ─
+  r.get('/', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      let rows: any[] | null = null;
+      const orgQuery = await sb
+        .from('exchange_rates')
+        .select('*')
+        .or(`organization_id.eq.${orgId},organization_id.is.null`)
+        .order('as_of', { ascending: false });
+
+      if (!orgQuery.error && orgQuery.data) {
+        rows = orgQuery.data;
+      } else if (orgQuery.error && isMissingRelationOrColumn(orgQuery.error)) {
+        // Pre-migration 0047 fallback: table exists without organization_id
+        const legacyQuery = await sb
+          .from('exchange_rates')
+          .select('*')
+          .order('as_of', { ascending: false });
+        if (!legacyQuery.error && legacyQuery.data) {
+          rows = legacyQuery.data;
+        }
+      } else if (orgQuery.error) {
+        return fail(res, 500, orgQuery.error.message);
+      }
+
+      if (rows && rows.length > 0) {
+        // Deduplicate by (base, quote), prioritizing org-scoped override > latest global rate
+        const byPair = new Map<string, any>();
+        for (const row of rows) {
+          const key = `${String(row.base).toUpperCase()}_${String(row.quote).toUpperCase()}`;
+          const existing = byPair.get(key);
+          const isOrgRow = row.organization_id === orgId;
+          const existingIsOrg = existing?.organization_id === orgId;
+          if (!existing || (isOrgRow && !existingIsOrg)) {
+            byPair.set(key, row);
+          }
+        }
+
+        const mapped: ExchangeRate[] = Array.from(byPair.values()).map(row => ({
+          id: String(row.id),
+          organizationId: row.organization_id ?? null,
+          base: String(row.base).toUpperCase(),
+          quote: String(row.quote).toUpperCase(),
+          rate: Number(row.rate),
+          asOf: String(row.as_of),
+          source: String(row.source || (row.organization_id ? 'org_manual' : 'system')),
+        }));
+        return ok(res, mapped);
+      }
+
+      return ok(res, buildCanonicalBaselineRates());
+    } catch (err: any) {
+      console.error('[costing.exchange-rates.get] Error:', err);
+      return fail(res, 500, err?.message || 'Failed to load exchange rates');
+    }
+  });
+
+  // ── GET /exchange-rates/convert — Org-scoped FX conversion with provenance ─
+  r.get('/convert', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const amount = Number(req.query.amount ?? 1);
+    const from = String(req.query.from ?? 'USD').toUpperCase().trim();
+    const to = String(req.query.to ?? 'USD').toUpperCase().trim();
+
+    if (!Number.isFinite(amount)) {
+      return fail(res, 400, 'Invalid amount');
+    }
+
+    if (from === to) {
+      return ok(res, {
+        amount,
+        from,
+        to,
+        rate: 1,
+        converted: Math.round(amount * 100) / 100,
+        source: 'identity',
+        asOf: new Date().toISOString().slice(0, 10),
+      });
+    }
+
+    const sb = getSupabaseAdminClient();
+    if (sb) {
+      try {
+        // 1. Check tenant-specific override first, then global DB rate
+        const orgRes = await sb
+          .from('exchange_rates')
+          .select('rate, as_of, source, organization_id')
+          .eq('base', from)
+          .eq('quote', to)
+          .or(`organization_id.eq.${orgId},organization_id.is.null`)
+          .order('as_of', { ascending: false })
+          .limit(5);
+
+        if (!orgRes.error && orgRes.data && orgRes.data.length > 0) {
+          const picked = orgRes.data.find((r: any) => r.organization_id === orgId) || orgRes.data[0];
+          const rate = Number(picked.rate);
+          if (rate > 0) {
+            const converted = Math.round(amount * rate * 100) / 100;
+            return ok(res, {
+              amount,
+              from,
+              to,
+              rate,
+              converted,
+              source: picked.organization_id ? 'org_override' : (picked.source || 'db_baseline'),
+              asOf: picked.as_of,
+            });
+          }
+        }
+      } catch {
+        /* fallback to canonical fxConverter */
+      }
+    }
+
+    const rate = Math.round(getEstimatedFxRate(from, to) * 10000) / 10000;
+    const converted = Math.round(amount * rate * 100) / 100;
+    return ok(res, {
+      amount,
+      from,
+      to,
+      rate,
+      converted,
+      source: DEFAULT_RATES_TO_USD[from] && DEFAULT_RATES_TO_USD[to] ? 'system_baseline' : 'fallback_identity',
+      asOf: new Date().toISOString().slice(0, 10),
+    });
+  });
+
+  return r;
+}
+
+export function createCommissionStructuresRouter(): Router {
   const r = Router({ mergeParams: true });
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 1. OVERHEAD ALLOCATIONS
+  // 1. COMMISSION STRUCTURES (Multiplicative Split Validation + RBAC + Audit)
   // ══════════════════════════════════════════════════════════════════════════
 
-  r.get(['/overhead-allocations', '/costing/overhead-allocations'], async (req: Request, res: Response) => {
+  r.get('/', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
 
-    if (sb) {
-      try {
-        const { data, error } = await sb
-          .from('overhead_allocations')
-          .select('*')
-          .eq('organization_id', orgId)
-          .order('name', { ascending: true });
+    try {
+      const { data, error } = await sb
+        .from('commission_structures')
+        .select('*')
+        .eq('organization_id', orgId)
+        .order('company_name', { ascending: true });
 
-        if (error) {
-          console.error('[costing.overhead-allocations.get] Supabase query error:', error);
-          return fail(res, 500, error.message);
-        }
-
-        return ok(res, (data || []).map(mapDbToDomainAllocation));
-      } catch (err) {
-        console.error('[costing.overhead-allocations.get] Supabase query error:', err);
+      if (error) {
+        console.error('[costing.commission-structures.get] Supabase query error:', error);
+        return fail(res, 500, error.message);
       }
-    }
 
-    return fail(res, 503, 'Database unavailable');
+      return ok(res, (data || []).map(mapDbToDomainCommission));
+    } catch (err: any) {
+      console.error('[costing.commission-structures.get] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to load commission structures');
+    }
   });
 
-  r.post(['/overhead-allocations', '/costing/overhead-allocations'], async (req: Request, res: Response) => {
-    const orgId = getOrgId(req);
-    const body = req.body as Partial<OverheadAllocation>;
-
-    if (!body.name || !body.name.trim()) {
-      return fail(res, 400, 'Allocation name is required');
-    }
-
-    const allocationBase = body.allocationBase || 'headcount';
-    const departments = Array.isArray(body.departments) ? body.departments : [];
-
-    // Validate 100% total percentage rule if custom percentage distribution is provided
-    if (departments.length > 0 && allocationBase === 'custom') {
-      const totalPct = departments.reduce((sum, d) => sum + Number(d.percentage || 0), 0);
-      if (Math.abs(totalPct - 100) > 0.05) {
-        return fail(res, 400, `Department percentages must total 100% (currently ${totalPct.toFixed(1)}%)`);
-      }
-    }
-
-    const newAlloc: OverheadAllocation = {
-      id: body.id || ('alloc-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9)),
-      organizationId: orgId,
-      name: body.name.trim(),
-      allocationBase,
-      accountIds: Array.isArray(body.accountIds) ? body.accountIds : [],
-      departments,
-      amount: body.amount != null ? Math.max(0, Number(body.amount)) : 0,
-    };
-
-    const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        let { data, error } = await sb
-          .from('overhead_allocations')
-          .insert(mapDomainToDbAllocation(newAlloc))
-          .select()
-          .single();
-
-        if (error && newAlloc.allocationBase === 'custom') {
-          const fallback = await sb
-            .from('overhead_allocations')
-            .insert(mapDomainToDbAllocation(newAlloc, true))
-            .select()
-            .single();
-          data = fallback.data;
-          error = fallback.error;
-        }
-
-        if (!error && data) {
-          const mapped = mapDbToDomainAllocation(data);
-          if (newAlloc.allocationBase === 'custom') mapped.allocationBase = 'custom';
-          return created(res, mapped, 'Overhead allocation created');
-        }
-        console.error('[costing.overhead-allocations.post] Supabase error:', error);
-      } catch (err) {
-        console.error('[costing.overhead-allocations.post] Exception:', err);
-      }
-    }
-
-    return fail(res, 503, 'Database unavailable');
-  });
-
-  r.put(['/overhead-allocations/:id', '/costing/overhead-allocations/:id'], async (req: Request, res: Response) => {
-    const orgId = getOrgId(req);
-    const id = req.params.id;
-    const updates = req.body as Partial<OverheadAllocation>;
-
-    if (updates.departments && updates.allocationBase === 'custom') {
-      const totalPct = updates.departments.reduce((sum, d) => sum + Number(d.percentage || 0), 0);
-      if (Math.abs(totalPct - 100) > 0.05) {
-        return fail(res, 400, `Department percentages must total 100% (currently ${totalPct.toFixed(1)}%)`);
-      }
-    }
-
-    const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        const dbUpdates: Record<string, unknown> = {};
-        if (updates.name !== undefined) dbUpdates.name = updates.name.trim();
-        if (updates.allocationBase !== undefined) dbUpdates.allocation_base = updates.allocationBase;
-        if (updates.accountIds !== undefined) dbUpdates.account_ids = updates.accountIds;
-        if (updates.departments !== undefined) dbUpdates.departments = updates.departments;
-        if (updates.amount !== undefined) dbUpdates.amount = Number(updates.amount);
-
-        let { data, error } = await sb
-          .from('overhead_allocations')
-          .update(dbUpdates)
-          .eq('id', id)
-          .eq('organization_id', orgId)
-          .select()
-          .single();
-
-        if (error && updates.allocationBase === 'custom') {
-          dbUpdates.allocation_base = 'headcount';
-          const fallback = await sb
-            .from('overhead_allocations')
-            .update(dbUpdates)
-            .eq('id', id)
-            .eq('organization_id', orgId)
-            .select()
-            .single();
-          data = fallback.data;
-          error = fallback.error;
-        }
-
-        if (!error && data) {
-          const mapped = mapDbToDomainAllocation(data);
-          if (updates.allocationBase === 'custom') mapped.allocationBase = 'custom';
-          return ok(res, mapped);
-        }
-      } catch (err) {
-        console.error('[costing.overhead-allocations.put] Supabase update exception:', err);
-      }
-    }
-
-    return fail(res, 503, 'Database unavailable');
-  });
-
-  const setMethodHandler = async (req: Request, res: Response) => {
-    const orgId = getOrgId(req);
-    const { method } = req.body as { method: OverheadAllocation['allocationBase'] };
-
-    if (!method || !['revenue', 'headcount', 'direct_cost', 'equal', 'custom'].includes(method)) {
-      return fail(res, 400, 'Invalid allocation method');
-    }
-
-    const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        await sb
-          .from('overhead_allocations')
-          .update({ allocation_base: method })
-          .eq('organization_id', orgId);
-      } catch (err) {
-        console.error('[costing.overhead-allocations.method] Supabase error:', err);
-      }
-    }
-
-    
-
-    ok(res, { method }, `Overhead allocation method updated to ${method}`);
-  };
-
-  r.post(['/overhead-allocations/method', '/costing/overhead-allocations/method'], setMethodHandler);
-  r.put(['/overhead-allocations/method', '/costing/overhead-allocations/method'], setMethodHandler);
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // 2. COMMISSION STRUCTURES
-  // ══════════════════════════════════════════════════════════════════════════
-
-  r.get(['/commission-structures', '/costing/commission-structures'], async (req: Request, res: Response) => {
-    const orgId = getOrgId(req);
-    const sb = getSupabaseAdminClient();
-
-    if (sb) {
-      try {
-        const { data, error } = await sb
-          .from('commission_structures')
-          .select('*')
-          .eq('organization_id', orgId)
-          .order('company_name', { ascending: true });
-
-        if (error) {
-          console.error('[costing.commission-structures.get] Supabase query error:', error);
-          return fail(res, 500, error.message);
-        }
-
-        return ok(res, (data || []).map(mapDbToDomainCommission));
-      } catch (err) {
-        console.error('[costing.commission-structures.get] Supabase query error:', err);
-      }
-    }
-
-    return fail(res, 503, 'Database unavailable');
-  });
-
-  r.post(['/commission-structures', '/costing/commission-structures'], async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body as Partial<CommissionStructure>;
 
@@ -291,21 +317,17 @@ export function createCostingRouter(): Router {
     const yourSplit = Number(body.yourProfitPercentage ?? 50);
     const middleman = Number(body.middlemanPercentage ?? 0);
 
-    if (isNaN(yourSplit) || yourSplit < 0 || yourSplit > 100) {
+    // Multiplicative model: Net = Deal × (yourSplit/100) × (1 - middleman/100)
+    // Each percentage is independently valid in [0, 100].
+    if (!Number.isFinite(yourSplit) || yourSplit < 0 || yourSplit > 100) {
       return fail(res, 400, 'Your split percentage must be between 0 and 100');
     }
-    if (isNaN(middleman) || middleman < 0 || middleman > 100) {
+    if (!Number.isFinite(middleman) || middleman < 0 || middleman > 100) {
       return fail(res, 400, 'Middleman cut must be between 0 and 100');
     }
 
-    // CHECK validation: splits must not exceed 100%
-    if (yourSplit + middleman > 100) {
-      return fail(
-        res,
-        400,
-        `Commission splits cannot exceed 100% (Your split: ${yourSplit}%, Middleman cut: ${middleman}%, Sum: ${yourSplit + middleman}%)`
-      );
-    }
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
 
     const newComm: CommissionStructure = {
       id: body.id || ('comm-' + Date.now() + '-' + Math.random().toString(36).slice(2, 9)),
@@ -318,27 +340,35 @@ export function createCostingRouter(): Router {
       createdAt: new Date().toISOString(),
     };
 
-    const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        const { data, error } = await sb
-          .from('commission_structures')
-          .insert(mapDomainToDbCommission(newComm))
-          .select()
-          .single();
+    try {
+      const { data, error } = await sb
+        .from('commission_structures')
+        .insert(mapDomainToDbCommission(newComm))
+        .select()
+        .single();
 
-        if (!error && data) {
-          const mapped = mapDbToDomainCommission(data);
-          
-          return created(res, mapped, 'Commission structure saved');
-        }
+      if (error) {
         console.error('[costing.commission-structures.post] Supabase error:', error);
-      } catch (err) {
-        console.error('[costing.commission-structures.post] Exception:', err);
+        return fail(res, 400, error.message);
       }
-    }
 
-    return fail(res, 503, 'Database unavailable');
+      const mapped = mapDbToDomainCommission(data);
+      try {
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'commission_structure_created',
+          entityType: 'commission_structure',
+          entityId: mapped.id,
+          description: `Created commission structure "${mapped.companyName}" (${mapped.yourProfitPercentage}% split, ${mapped.middlemanPercentage}% middleman cut)`,
+          afterState: mapped as unknown as Record<string, unknown>,
+        });
+      } catch { /* non-blocking audit log */ }
+
+      return created(res, mapped, 'Commission structure saved');
+    } catch (err: any) {
+      console.error('[costing.commission-structures.post] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to save commission structure');
+    }
   });
 
   const updateCommissionHandler = async (req: Request, res: Response) => {
@@ -346,190 +376,133 @@ export function createCostingRouter(): Router {
     const id = req.params.id;
     const updates = req.body as Partial<CommissionStructure>;
 
-    let current: CommissionStructure | null = null;
-    {
-      const sbCur = getSupabaseAdminClient();
-      if (sbCur) {
-        const { data: curRow } = await sbCur
-          .from('commission_structures')
-          .select('*')
-          .eq('id', id)
-          .eq('organization_id', orgId)
-          .maybeSingle();
-        if (curRow) current = mapDbToDomainCommission(curRow);
-      }
-    }
-
-    const yourSplit = updates.yourProfitPercentage !== undefined ? Number(updates.yourProfitPercentage) : current?.yourProfitPercentage ?? 50;
-    const middleman = updates.middlemanPercentage !== undefined ? Number(updates.middlemanPercentage) : current?.middlemanPercentage ?? 0;
-
-    if (yourSplit + middleman > 100) {
-      return fail(
-        res,
-        400,
-        `Commission splits cannot exceed 100% (Your split: ${yourSplit}%, Middleman cut: ${middleman}%, Sum: ${yourSplit + middleman}%)`
-      );
-    }
-
     const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        const dbUpdates: Record<string, unknown> = {};
-        if (updates.companyName !== undefined) dbUpdates.company_name = updates.companyName.trim();
-        if (updates.country !== undefined) dbUpdates.country = updates.country?.trim() || null;
-        if (updates.currency !== undefined) dbUpdates.currency = updates.currency.trim().toUpperCase();
-        if (updates.yourProfitPercentage !== undefined) dbUpdates.your_profit_percentage = yourSplit;
-        if (updates.middlemanPercentage !== undefined) dbUpdates.middleman_percentage = middleman;
+    if (!sb) return fail(res, 503, 'Database unavailable');
 
-        const { data, error } = await sb
-          .from('commission_structures')
-          .update(dbUpdates)
-          .eq('id', id)
-          .eq('organization_id', orgId)
-          .select()
-          .single();
+    const { data: curRow, error: curErr } = await sb
+      .from('commission_structures')
+      .select('*')
+      .eq('id', id)
+      .eq('organization_id', orgId)
+      .maybeSingle();
 
-        if (!error && data) {
-          const mapped = mapDbToDomainCommission(data);
-          
-          return ok(res, mapped);
-        }
-      } catch (err) {
-        console.error('[costing.commission-structures.patch] Supabase error:', err);
-      }
+    if (curErr) return fail(res, 500, curErr.message);
+    if (!curRow) return notFound(res, 'Commission Structure');
+
+    const current = mapDbToDomainCommission(curRow);
+    const yourSplit = updates.yourProfitPercentage !== undefined ? Number(updates.yourProfitPercentage) : current.yourProfitPercentage;
+    const middleman = updates.middlemanPercentage !== undefined ? Number(updates.middlemanPercentage) : current.middlemanPercentage;
+
+    if (!Number.isFinite(yourSplit) || yourSplit < 0 || yourSplit > 100) {
+      return fail(res, 400, 'Your split percentage must be between 0 and 100');
+    }
+    if (!Number.isFinite(middleman) || middleman < 0 || middleman > 100) {
+      return fail(res, 400, 'Middleman cut must be between 0 and 100');
     }
 
-    return fail(res, 503, 'Database unavailable');
+    try {
+      const dbUpdates: Record<string, unknown> = {};
+      if (updates.companyName !== undefined) dbUpdates.company_name = updates.companyName.trim();
+      if (updates.country !== undefined) dbUpdates.country = updates.country?.trim() || null;
+      if (updates.currency !== undefined) dbUpdates.currency = updates.currency.trim().toUpperCase();
+      if (updates.yourProfitPercentage !== undefined) dbUpdates.your_profit_percentage = yourSplit;
+      if (updates.middlemanPercentage !== undefined) dbUpdates.middleman_percentage = middleman;
 
-    notFound(res, 'Commission Structure');
+      const { data, error } = await sb
+        .from('commission_structures')
+        .update(dbUpdates)
+        .eq('id', id)
+        .eq('organization_id', orgId)
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        console.error('[costing.commission-structures.patch] Supabase error:', error);
+        return fail(res, 400, error.message);
+      }
+      if (!data) return notFound(res, 'Commission Structure');
+
+      const mapped = mapDbToDomainCommission(data);
+      try {
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'commission_structure_updated',
+          entityType: 'commission_structure',
+          entityId: mapped.id,
+          description: `Updated commission structure "${mapped.companyName}"`,
+          beforeState: current as unknown as Record<string, unknown>,
+          afterState: mapped as unknown as Record<string, unknown>,
+        });
+      } catch { /* non-blocking audit log */ }
+
+      return ok(res, mapped);
+    } catch (err: any) {
+      console.error('[costing.commission-structures.patch] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to update commission structure');
+    }
   };
 
-  r.patch(['/commission-structures/:id', '/costing/commission-structures/:id'], updateCommissionHandler);
-  r.put(['/commission-structures/:id', '/costing/commission-structures/:id'], updateCommissionHandler);
+  r.patch('/:id', requirePermission('finance:write_transactions'), updateCommissionHandler);
+  r.put('/:id', requirePermission('finance:write_transactions'), updateCommissionHandler);
 
-  r.delete(['/commission-structures/:id', '/costing/commission-structures/:id'], async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const id = req.params.id;
     const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
 
-    if (sb) {
-      try {
-        const { error } = await sb
-          .from('commission_structures')
-          .delete()
-          .eq('id', id)
-          .eq('organization_id', orgId);
+    try {
+      const { data: beforeRow } = await sb
+        .from('commission_structures')
+        .select('*')
+        .eq('id', id)
+        .eq('organization_id', orgId)
+        .maybeSingle();
 
-        if (error) {
-          console.error('[costing.commission-structures.delete] Supabase error:', error);
-          return fail(res, 500, error.message);
-        }
+      const { error } = await sb
+        .from('commission_structures')
+        .delete()
+        .eq('id', id)
+        .eq('organization_id', orgId);
 
-        return ok(res, null, 'Commission structure deleted');
-      } catch (err: any) {
-        console.error('[costing.commission-structures.delete] Supabase error:', err);
-        return fail(res, 500, err?.message || 'Failed to delete commission structure');
+      if (error) {
+        console.error('[costing.commission-structures.delete] Supabase error:', error);
+        return fail(res, 500, error.message);
       }
-    }
 
-    return fail(res, 503, 'Database unavailable');
-  });
-
-  // ══════════════════════════════════════════════════════════════════════════
-  // 3. EXCHANGE RATES & CONVERSION
-  // ══════════════════════════════════════════════════════════════════════════
-
-  r.get(['/exchange-rates', '/costing/exchange-rates'], async (_req: Request, res: Response) => {
-    const sb = getSupabaseAdminClient();
-
-    if (sb) {
       try {
-        const { data, error } = await sb
-          .from('exchange_rates')
-          .select('*')
-          .order('as_of', { ascending: false });
-
-        if (!error && data) {
-          if (data.length > 0) {
-            return ok(res, data.map(r => ({
-              id: r.id,
-              base: r.base,
-              quote: r.quote,
-              rate: Number(r.rate),
-              asOf: r.as_of,
-              source: r.source,
-            })));
-          }
-
-          // Fallback initial baseline rates if table is empty
-          const asOf = new Date().toISOString().slice(0, 10);
-          const baseline = [
-            { id: 'fx-pkr', base: 'USD', quote: 'PKR', rate: 278.5, asOf, source: 'system' },
-            { id: 'fx-eur', base: 'USD', quote: 'EUR', rate: 0.92, asOf, source: 'system' },
-            { id: 'fx-gbp', base: 'USD', quote: 'GBP', rate: 0.79, asOf, source: 'system' },
-            { id: 'fx-aed', base: 'USD', quote: 'AED', rate: 3.67, asOf, source: 'system' },
-            { id: 'fx-sar', base: 'USD', quote: 'SAR', rate: 3.75, asOf, source: 'system' },
-          ];
-          return ok(res, baseline);
-        }
-      } catch (err) {
-        console.error('[costing.exchange-rates.get] Supabase error:', err);
-      }
-    }
-
-    return fail(res, 503, 'Database unavailable');
-  });
-
-  r.get(['/exchange-rates/convert', '/costing/exchange-rates/convert'], async (req: Request, res: Response) => {
-    const amount = Number(req.query.amount ?? 1);
-    const from = String(req.query.from ?? 'USD').toUpperCase();
-    const to = String(req.query.to ?? 'PKR').toUpperCase();
-
-    if (from === to) {
-      return ok(res, { amount, from, to, rate: 1, converted: amount });
-    }
-
-    const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        const { data: convData } = await sb.rpc('fx_convert', {
-          p_amount: amount,
-          p_from: from,
-          p_to: to,
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'commission_structure_deleted',
+          entityType: 'commission_structure',
+          entityId: String(id),
+          description: `Deleted commission structure "${beforeRow?.company_name || id}"`,
+          beforeState: beforeRow ? (mapDbToDomainCommission(beforeRow) as unknown as Record<string, unknown>) : null,
         });
+      } catch { /* non-blocking audit log */ }
 
-        if (convData != null) {
-          const converted = Number(convData);
-          const rate = amount > 0 ? converted / amount : 0;
-          return ok(res, { amount, from, to, rate, converted });
-        }
-      } catch {
-        /* fallback to local rates table */
-      }
+      return ok(res, null, 'Commission structure deleted');
+    } catch (err: any) {
+      console.error('[costing.commission-structures.delete] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to delete commission structure');
     }
-
-    
-
-    // Standard fallback default rates
-    const defaults: Record<string, number> = {
-      'USD_PKR': 278.0,
-      'AED_PKR': 76.0,
-      'EUR_PKR': 302.0,
-      'GBP_PKR': 355.0,
-      'PKR_USD': 0.0036,
-      'PKR_AED': 0.0132,
-    };
-
-    const rate = defaults[`${from}_${to}`] ?? (from === 'USD' ? 278 : from === 'AED' ? 76 : 1);
-    const converted = amount * rate;
-
-    ok(res, { amount, from, to, rate, converted });
   });
 
-  r.post(['/exchange-rates', '/costing/exchange-rates'], async (req: Request, res: Response) => {
-    const { base, quote, rate } = req.body as { base: string; quote: string; rate: number };
+  return r;
+}
 
-    if (!base || !quote || rate == null || Number(rate) <= 0) {
+export function createExchangeRatesWriteRouter(): Router {
+  const r = Router({ mergeParams: true });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 2. TENANT-SCOPED EXCHANGE RATE OVERRIDES (§5, §8, §20, §33 #6 & #11)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const { base, quote, rate } = req.body as { base?: string; quote?: string; rate?: number };
+
+    if (!base || !quote || rate == null || !Number.isFinite(Number(rate)) || Number(rate) <= 0) {
       return fail(res, 400, 'Valid base, quote, and positive rate are required');
     }
 
@@ -539,261 +512,373 @@ export function createCostingRouter(): Router {
     const asOf = new Date().toISOString().slice(0, 10);
 
     const sb = getSupabaseAdminClient();
-    if (sb) {
-      try {
-        await sb.from('exchange_rates').upsert({
-          base: b,
-          quote: q,
-          rate: rVal,
-          as_of: asOf,
-          source: 'manual',
-        }, { onConflict: 'base,quote,as_of' });
-      } catch (err) {
-        console.error('[costing.exchange-rates.post] Supabase error:', err);
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      // Tenant-isolated upsert: ALWAYS writes organization_id = orgId, never mutating global rates
+      const { data: existing } = await sb
+        .from('exchange_rates')
+        .select('id, rate')
+        .eq('organization_id', orgId)
+        .eq('base', b)
+        .eq('quote', q)
+        .eq('as_of', asOf)
+        .maybeSingle();
+
+      if (existing?.id) {
+        const { error } = await sb
+          .from('exchange_rates')
+          .update({ rate: rVal, source: 'org_manual' })
+          .eq('id', existing.id)
+          .eq('organization_id', orgId);
+        if (error) return fail(res, 500, error.message);
+      } else {
+        const { error } = await sb
+          .from('exchange_rates')
+          .insert({
+            organization_id: orgId,
+            base: b,
+            quote: q,
+            rate: rVal,
+            as_of: asOf,
+            source: 'org_manual',
+          });
+        if (error) {
+          if (isMissingRelationOrColumn(error)) {
+            return fail(
+              res,
+              503,
+              'Tenant-scoped exchange_rates column (organization_id) not yet migrated. Apply migration 0047 before saving org FX overrides.',
+            );
+          }
+          return fail(res, 500, error.message);
+        }
       }
+
+      try {
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'exchange_rate_updated',
+          entityType: 'exchange_rate',
+          entityId: `${b}_${q}_${asOf}`,
+          description: `Saved organization FX override ${b}/${q} = ${rVal} (as of ${asOf})`,
+          beforeState: existing ? { rate: Number(existing.rate) } : null,
+          afterState: { organizationId: orgId, base: b, quote: q, rate: rVal, asOf },
+        });
+      } catch { /* non-blocking audit log */ }
+
+      return ok(res, { organizationId: orgId, base: b, quote: q, rate: rVal, asOf, source: 'org_manual' }, 'Organization exchange rate saved');
+    } catch (err: any) {
+      console.error('[costing.exchange-rates.post] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to save exchange rate');
     }
-
-    
-
-    ok(res, { base: b, quote: q, rate: rVal, asOf }, 'Exchange rate saved');
   });
 
+  return r;
+}
+
+export function createQuotesRouter(): Router {
+  const r = Router({ mergeParams: true });
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 4. §14 QUOTE SIMULATOR, PRICING & VERSIONING ENGINE
+  // 3. §14 QUOTE SIMULATOR, PRICING & VERSIONING ENGINE
+  //    (Normalized `quotes` + `quote_versions`, zero cross-instance memory cache)
   // ══════════════════════════════════════════════════════════════════════════
 
-  // In-memory cache synced with Supabase organizations.settings.saved_quotes
-  const orgQuotesCache = new Map<string, any[]>();
+  async function loadOrgQuotesFromDb(sb: any, orgId: string): Promise<{ quotes: Quote[]; usingNormalizedTable: boolean }> {
+    const { data: qRows, error: qErr } = await sb
+      .from('quotes')
+      .select('*')
+      .eq('organization_id', orgId)
+      .order('updated_at', { ascending: false });
 
-  async function loadOrgQuotes(sb: any, orgId: string): Promise<any[]> {
-    if (orgQuotesCache.has(orgId)) {
-      return orgQuotesCache.get(orgId) || [];
-    }
-    if (sb) {
-      try {
-        const { data: orgData } = await sb
-          .from('organizations')
-          .select('settings')
-          .eq('id', orgId)
-          .maybeSingle();
-        if (orgData?.settings?.saved_quotes && Array.isArray(orgData.settings.saved_quotes)) {
-          orgQuotesCache.set(orgId, orgData.settings.saved_quotes);
-          return orgData.settings.saved_quotes;
+    if (!qErr && Array.isArray(qRows)) {
+      const quoteIds = qRows.map((q: any) => q.id);
+      let versionsByQuote = new Map<string, any[]>();
+      if (quoteIds.length > 0) {
+        const { data: vRows } = await sb
+          .from('quote_versions')
+          .select('*')
+          .eq('organization_id', orgId)
+          .in('quote_id', quoteIds)
+          .order('created_at', { ascending: true });
+        for (const v of vRows || []) {
+          const list = versionsByQuote.get(v.quote_id) || [];
+          list.push(v);
+          versionsByQuote.set(v.quote_id, list);
         }
-      } catch (err) {
-        console.warn('[costing.quotes] Error loading saved_quotes from DB:', err);
       }
+      return {
+        quotes: qRows.map((row: any) => mapDbRowToQuote(row, versionsByQuote.get(row.id) || [])),
+        usingNormalizedTable: true,
+      };
     }
-    orgQuotesCache.set(orgId, []);
-    return [];
-  }
 
-  async function persistOrgQuotes(sb: any, orgId: string, quotes: any[]): Promise<void> {
-    orgQuotesCache.set(orgId, quotes);
-    if (sb) {
-      try {
-        const { data: orgData } = await sb
-          .from('organizations')
-          .select('settings')
-          .eq('id', orgId)
-          .maybeSingle();
-        const currentSettings = (orgData?.settings && typeof orgData.settings === 'object') ? orgData.settings : {};
-        await sb
-          .from('organizations')
-          .update({
-            settings: {
-              ...currentSettings,
-              saved_quotes: quotes,
-            },
-          })
-          .eq('id', orgId);
-      } catch (err) {
-        console.warn('[costing.quotes] Error saving quotes to DB:', err);
-      }
+    if (qErr && !isMissingRelationOrColumn(qErr)) {
+      throw new Error(qErr.message);
     }
+
+    // Pre-migration 0047 graceful fallback (read directly from DB, never stale process memory)
+    const { data: orgData } = await sb
+      .from('organizations')
+      .select('settings')
+      .eq('id', orgId)
+      .maybeSingle();
+    const saved = Array.isArray(orgData?.settings?.saved_quotes) ? orgData.settings.saved_quotes : [];
+    return { quotes: saved, usingNormalizedTable: false };
   }
 
-  function calculateQuoteFormulas(body: any) {
-    const roleEstimates: any[] = Array.isArray(body.roleEstimates) ? body.roleEstimates : [];
-    const directPurchases: any[] = Array.isArray(body.directPurchases) ? body.directPurchases : [];
-
-    // 1. estimated_direct_labor = Σ estimated_hours_by_role × cost_rate
-    const estimatedDirectLabor = roleEstimates.reduce(
-      (sum, r) => sum + (Math.max(0, Number(r.estimatedHours || 0)) * Math.max(0, Number(r.costRate || 0))),
-      0
-    );
-
-    // 2. direct_purchases
-    const directPurchasesTotal = directPurchases.reduce(
-      (sum, p) => sum + Math.max(0, Number(p.amount || 0)),
-      0
-    );
-
-    // 3. attributed_overhead
-    const overheadAmount = Math.max(0, Number(body.overheadAmount || 0));
-
-    // 4. contingency
-    const subtotal = estimatedDirectLabor + directPurchasesTotal + overheadAmount;
-    const contingencyPercent = Math.max(0, Number(body.contingencyPercent || 0));
-    const contingencyAmount = Number(body.contingencyAmount || 0) > 0
-      ? Number(body.contingencyAmount)
-      : (subtotal * (contingencyPercent / 100));
-
-    // 5. estimated_total_cost = labor + direct_purchases + attributed_overhead + contingency
-    const estimatedTotalCost = subtotal + contingencyAmount;
-
-    // 6. profit_amount = proposed_price − estimated_total_cost
-    const proposedPrice = Math.max(0, Number(body.proposedPrice || 0));
-    const profitAmount = proposedPrice - estimatedTotalCost;
-
-    // 7. margin_percent = profit_amount / proposed_price × 100 (Safe divide: block div by zero)
-    const marginPercent = proposedPrice > 0 ? (profitAmount / proposedPrice) * 100 : 0;
-
-    // 8. markup_percent = profit_amount / estimated_total_cost × 100 (Safe divide: block div by zero)
-    const markupPercent = estimatedTotalCost > 0 ? (profitAmount / estimatedTotalCost) * 100 : 0;
-
-    // 9. required_price_for_target_margin = estimated_total_cost / (1 − target_margin_fraction)
-    // Block invalid target margins (>= 100% or <= -100%)
-    const targetMarginPercent = Number(body.targetMarginPercent ?? 25);
-    const targetMarginFraction = targetMarginPercent / 100;
-    const isTargetMarginValid = targetMarginFraction < 1 && targetMarginFraction > -1 && (1 - targetMarginFraction) > 1e-6;
-    const requiredPriceForTargetMargin = isTargetMarginValid
-      ? estimatedTotalCost / (1 - targetMarginFraction)
-      : null;
-
-    // Target markup price
-    const targetMarkupPercent = Number(body.targetMarkupPercent ?? 33.33);
-    const targetMarkupFraction = targetMarkupPercent / 100;
-    const requiredPriceForTargetMarkup = estimatedTotalCost * (1 + targetMarkupFraction);
-
-    return {
-      estimatedDirectLabor: Math.round(estimatedDirectLabor * 100) / 100,
-      directPurchasesTotal: Math.round(directPurchasesTotal * 100) / 100,
-      overheadAmount: Math.round(overheadAmount * 100) / 100,
-      contingencyAmount: Math.round(contingencyAmount * 100) / 100,
-      contingencyPercent,
-      estimatedTotalCost: Math.round(estimatedTotalCost * 100) / 100,
-      proposedPrice: Math.round(proposedPrice * 100) / 100,
-      profitAmount: Math.round(profitAmount * 100) / 100,
-      marginPercent: Math.round(marginPercent * 100) / 100,
-      markupPercent: Math.round(markupPercent * 100) / 100,
-      requiredPriceForTargetMargin: requiredPriceForTargetMargin != null ? Math.round(requiredPriceForTargetMargin * 100) / 100 : null,
-      requiredPriceForTargetMarkup: Math.round(requiredPriceForTargetMarkup * 100) / 100,
-      isTargetMarginValid,
-      isRevenueRecognized: false, // Invariant (§14): Not recognized revenue until contracted/billed
-    };
+  async function persistLegacyOrgQuotes(sb: any, orgId: string, quotes: Quote[]): Promise<void> {
+    const { data: orgData } = await sb
+      .from('organizations')
+      .select('settings')
+      .eq('id', orgId)
+      .maybeSingle();
+    const currentSettings = (orgData?.settings && typeof orgData.settings === 'object') ? orgData.settings : {};
+    const { error } = await sb
+      .from('organizations')
+      .update({ settings: { ...currentSettings, saved_quotes: quotes } })
+      .eq('id', orgId);
+    if (error) throw new Error(error.message);
   }
 
-  // Pure Calculation Endpoint for real-time simulator preview
-  r.post(['/quotes/calculate', '/costing/quotes/calculate'], (req: Request, res: Response) => {
-    const calc = calculateQuoteFormulas(req.body);
+  // Pure Calculation Endpoint for real-time simulator preview (zero DB writes — §14 L739)
+  r.post('/calculate', (req: Request, res: Response) => {
+    const body = req.body || {};
+    const targetMargin = Number(body.targetMarginPercent ?? 25);
+    if (!Number.isFinite(targetMargin) || targetMargin < 0 || targetMargin >= 100) {
+      return fail(res, 400, 'Target margin must be between 0% and 99.99% (cannot be negative or >= 100%)');
+    }
+    const calc = calculateQuoteFormulas(body);
     return ok(res, calc);
   });
 
-  // GET /quotes - list all quotes with versions
-  r.get(['/quotes', '/costing/quotes'], async (req: Request, res: Response) => {
+  // GET / — List all saved quotes with versions
+  r.get('/', async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
-    const quotes = await loadOrgQuotes(sb, orgId);
-    return ok(res, quotes);
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      const { quotes } = await loadOrgQuotesFromDb(sb, orgId);
+      return ok(res, quotes);
+    } catch (err: any) {
+      return fail(res, 500, err?.message || 'Failed to load quotes');
+    }
   });
 
-  // POST /quotes - Create quote or new version
-  r.post(['/quotes', '/costing/quotes'], async (req: Request, res: Response) => {
+  // POST / — Create quote or append immutable new quote version (§14)
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
-    const body = req.body;
+    const body = req.body || {};
     const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
 
-    if (!body.projectName || !body.projectName.trim()) {
+    if (!body.projectName || !String(body.projectName).trim()) {
       return fail(res, 400, 'Project / Quote name is required');
     }
 
-    const calc = calculateQuoteFormulas(body);
-    const list = [...(await loadOrgQuotes(sb, orgId))];
-    
-    // Check if updating existing quote with new version
-    const existingIndex = body.id ? list.findIndex((q: any) => q.id === body.id) : -1;
-    let quote: any;
+    const targetMargin = Number(body.targetMarginPercent ?? 25);
+    if (!Number.isFinite(targetMargin) || targetMargin < 0 || targetMargin >= 100) {
+      return fail(res, 400, 'Target margin must be between 0% and 99.99%');
+    }
 
-    if (existingIndex >= 0) {
-      const prev = list[existingIndex];
-      const versionNum = (prev.versions?.length || 1) + 1;
-      const nextVersion = `v1.${versionNum - 1}`;
+    const calc = calculateQuoteFormulas(body);
+    const nowIso = new Date().toISOString();
+
+    try {
+      const { quotes: existingList, usingNormalizedTable } = await loadOrgQuotesFromDb(sb, orgId);
+      const existing = body.id ? existingList.find(q => q.id === body.id) : undefined;
+      const quoteId = existing?.id || body.id || (`quote-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`);
+      const nextVersionNum = existing ? (existing.versions?.length || 1) + 1 : 1;
+      const nextVersion = `v1.${nextVersionNum - 1}`;
+      const versionNotes = String(body.versionNotes || (existing ? `Version update ${nextVersion}` : 'Initial baseline quote version'));
+
+      if (usingNormalizedTable) {
+        const dbQuoteRow = {
+          id: quoteId,
+          organization_id: orgId,
+          department_id: body.departmentId || existing?.departmentId || null,
+          client_name: String(body.clientName || existing?.clientName || 'Client').trim(),
+          project_name: String(body.projectName).trim(),
+          service_type: String(body.serviceType || existing?.serviceType || 'Custom Project'),
+          billing_model: String(body.billingModel || existing?.billingModel || 'fixed_price'),
+          delivery_horizon_months: Math.max(0.25, Number(body.deliveryHorizonMonths ?? existing?.deliveryHorizonMonths ?? 1)),
+          currency: String(body.currency || existing?.currency || 'USD').toUpperCase(),
+          target_margin_percent: targetMargin,
+          target_markup_percent: Math.max(0, Number(body.targetMarkupPercent ?? existing?.targetMarkupPercent ?? 33.33)),
+          role_estimates: Array.isArray(body.roleEstimates) ? body.roleEstimates : (existing?.roleEstimates || []),
+          direct_purchases: Array.isArray(body.directPurchases) ? body.directPurchases : (existing?.directPurchases || []),
+          overhead_amount: calc.overheadAmount,
+          overhead_method: String(body.overheadMethod || existing?.overheadMethod || 'headcount'),
+          contingency_percent: calc.contingencyPercent,
+          contingency_amount: calc.contingencyAmount,
+          estimated_direct_labor: calc.estimatedDirectLabor,
+          direct_purchases_total: calc.directPurchasesTotal,
+          estimated_total_cost: calc.estimatedTotalCost,
+          proposed_price: calc.proposedPrice,
+          profit_amount: calc.profitAmount,
+          margin_percent: calc.marginPercent,
+          markup_percent: calc.markupPercent,
+          required_price_for_target_margin: calc.requiredPriceForTargetMargin,
+          required_price_for_target_markup: calc.requiredPriceForTargetMarkup,
+          current_version: nextVersion,
+          status: existing?.status || body.status || 'draft',
+          is_revenue_recognized: false,
+          created_by: existing ? undefined : (req.authUser?.id || null),
+          updated_at: nowIso,
+        };
+
+        const { data: savedRow, error: saveErr } = existing
+          ? await sb.from('quotes').update(dbQuoteRow).eq('id', quoteId).eq('organization_id', orgId).select().single()
+          : await sb.from('quotes').insert({ ...dbQuoteRow, created_at: nowIso }).select().single();
+
+        if (saveErr) return fail(res, 500, saveErr.message);
+
+        await sb.from('quote_versions').insert({
+          quote_id: quoteId,
+          organization_id: orgId,
+          version: nextVersion,
+          notes: versionNotes,
+          proposed_price: calc.proposedPrice,
+          estimated_total_cost: calc.estimatedTotalCost,
+          profit_amount: calc.profitAmount,
+          margin_percent: calc.marginPercent,
+          markup_percent: calc.markupPercent,
+          snapshot_payload: { ...dbQuoteRow, decimals: calc.decimals },
+          created_by: req.authUser?.id || null,
+          created_at: nowIso,
+        });
+
+        const { data: vRows } = await sb
+          .from('quote_versions')
+          .select('*')
+          .eq('quote_id', quoteId)
+          .order('created_at', { ascending: true });
+
+        const mapped = mapDbRowToQuote(savedRow, vRows || []);
+
+        try {
+          await logAuditEvent(req, {
+            organizationId: orgId,
+            action: existing ? 'quote_version_created' : 'quote_created',
+            entityType: 'quote',
+            entityId: mapped.id,
+            description: `${existing ? 'Saved new version' : 'Created quote'} "${mapped.projectName}" (${mapped.currentVersion})`,
+            afterState: { version: mapped.currentVersion, proposedPrice: mapped.proposedPrice, estimatedTotalCost: mapped.estimatedTotalCost, marginPercent: mapped.marginPercent, markupPercent: mapped.markupPercent },
+          });
+        } catch { /* non-blocking audit log */ }
+
+        return created(res, mapped);
+      }
+
+      // Pre-migration 0047 fallback in organizations.settings.saved_quotes (always fresh DB read)
       const versionEntry = {
         version: nextVersion,
-        createdAt: new Date().toISOString(),
-        notes: body.versionNotes || `Version update ${nextVersion}`,
+        createdAt: nowIso,
+        notes: versionNotes,
         proposedPrice: calc.proposedPrice,
         estimatedTotalCost: calc.estimatedTotalCost,
         profitAmount: calc.profitAmount,
         marginPercent: calc.marginPercent,
         markupPercent: calc.markupPercent,
       };
-
-      quote = {
-        ...prev,
-        ...body,
-        ...calc,
+      const quote: Quote = {
+        id: quoteId,
         organizationId: orgId,
+        departmentId: body.departmentId || existing?.departmentId || null,
+        clientName: String(body.clientName || existing?.clientName || 'Client').trim(),
+        projectName: String(body.projectName).trim(),
+        serviceType: String(body.serviceType || existing?.serviceType || 'Custom Project'),
+        billingModel: String(body.billingModel || existing?.billingModel || 'fixed_price'),
+        deliveryHorizonMonths: Number(body.deliveryHorizonMonths ?? existing?.deliveryHorizonMonths ?? 1),
+        currency: String(body.currency || existing?.currency || 'USD').toUpperCase(),
+        targetMarginPercent: targetMargin,
+        targetMarkupPercent: Number(body.targetMarkupPercent ?? existing?.targetMarkupPercent ?? 33.33),
+        roleEstimates: Array.isArray(body.roleEstimates) ? body.roleEstimates : (existing?.roleEstimates || []),
+        directPurchases: Array.isArray(body.directPurchases) ? body.directPurchases : (existing?.directPurchases || []),
+        overheadMethod: String(body.overheadMethod || existing?.overheadMethod || 'headcount'),
+        ...calc,
         currentVersion: nextVersion,
-        versions: [...(prev.versions || []), versionEntry],
-        isRevenueRecognized: false, // Invariant (§14)
-        updatedAt: new Date().toISOString(),
+        versions: [...(existing?.versions || []), versionEntry],
+        status: existing?.status || body.status || 'draft',
+        isRevenueRecognized: false,
+        createdAt: existing?.createdAt || nowIso,
+        updatedAt: nowIso,
       };
-      list[existingIndex] = quote;
-    } else {
-      const newId = body.id || ('quote-' + Date.now().toString(36));
-      quote = {
-        id: newId,
-        organizationId: orgId,
-        clientName: body.clientName?.trim() || 'New Client',
-        projectName: body.projectName.trim(),
-        serviceType: body.serviceType || 'Custom Project',
-        billingModel: body.billingModel || 'fixed_price',
-        deliveryHorizonMonths: Number(body.deliveryHorizonMonths || 3),
-        currency: body.currency || 'USD',
-        targetMarginPercent: Number(body.targetMarginPercent ?? 25),
-        targetMarkupPercent: Number(body.targetMarkupPercent ?? 33.33),
-        roleEstimates: body.roleEstimates || [],
-        directPurchases: body.directPurchases || [],
-        overheadMethod: body.overheadMethod || 'headcount',
-        ...calc,
-        currentVersion: 'v1.0',
-        versions: [
-          {
-            version: 'v1.0',
-            createdAt: new Date().toISOString(),
-            notes: body.versionNotes || 'Initial baseline quote version',
-            proposedPrice: calc.proposedPrice,
-            estimatedTotalCost: calc.estimatedTotalCost,
-            profitAmount: calc.profitAmount,
-            marginPercent: calc.marginPercent,
-            markupPercent: calc.markupPercent,
-          },
-        ],
-        status: 'draft',
-        isRevenueRecognized: false, // Invariant (§14)
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      list.unshift(quote);
-    }
 
-    await persistOrgQuotes(sb, orgId, list);
-    return created(res, quote);
+      const nextList = existing
+        ? existingList.map(q => (q.id === quoteId ? quote : q))
+        : [quote, ...existingList];
+
+      await persistLegacyOrgQuotes(sb, orgId, nextList);
+
+      try {
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: existing ? 'quote_version_created' : 'quote_created',
+          entityType: 'quote',
+          entityId: quote.id,
+          description: `${existing ? 'Saved new version' : 'Created quote'} "${quote.projectName}" (${quote.currentVersion})`,
+          afterState: { version: quote.currentVersion, proposedPrice: quote.proposedPrice, estimatedTotalCost: quote.estimatedTotalCost },
+        });
+      } catch { /* non-blocking audit log */ }
+
+      return created(res, quote);
+    } catch (err: any) {
+      console.error('[costing.quotes.post] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to save quote');
+    }
   });
 
-  // DELETE /quotes/:id
-  r.delete(['/quotes/:id', '/costing/quotes/:id'], async (req: Request, res: Response) => {
+  // DELETE /:id
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const quoteId = req.params.id;
     const sb = getSupabaseAdminClient();
-    const list = await loadOrgQuotes(sb, orgId);
-    const filtered = list.filter((q: any) => q.id !== quoteId);
-    await persistOrgQuotes(sb, orgId, filtered);
-    return ok(res, null, 'Quote deleted');
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      const { quotes, usingNormalizedTable } = await loadOrgQuotesFromDb(sb, orgId);
+      const before = quotes.find(q => q.id === quoteId);
+
+      if (usingNormalizedTable) {
+        const { error } = await sb
+          .from('quotes')
+          .delete()
+          .eq('id', quoteId)
+          .eq('organization_id', orgId);
+        if (error) return fail(res, 500, error.message);
+      } else {
+        await persistLegacyOrgQuotes(sb, orgId, quotes.filter(q => q.id !== quoteId));
+      }
+
+      try {
+        await logAuditEvent(req, {
+          organizationId: orgId,
+          action: 'quote_deleted',
+          entityType: 'quote',
+          entityId: String(quoteId),
+          description: `Deleted quote "${before?.projectName || quoteId}"`,
+          beforeState: before ? { projectName: before.projectName, currentVersion: before.currentVersion, proposedPrice: before.proposedPrice } : null,
+        });
+      } catch { /* non-blocking audit log */ }
+
+      return ok(res, null, 'Quote deleted');
+    } catch (err: any) {
+      console.error('[costing.quotes.delete] Exception:', err);
+      return fail(res, 500, err?.message || 'Failed to delete quote');
+    }
   });
 
+  return r;
+}
+
+export function createCostingRouter(): Router {
+  const r = Router({ mergeParams: true });
+  r.use('/commission-structures', createCommissionStructuresRouter());
+  r.use('/exchange-rates', createExchangeRatesReadRouter());
+  r.use('/exchange-rates', createExchangeRatesWriteRouter());
+  r.use('/quotes', createQuotesRouter());
   return r;
 }

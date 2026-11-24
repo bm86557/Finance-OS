@@ -2569,6 +2569,8 @@ export async function executeAIJSON<T>(
   params: {
     prompt: string;
     temperature?: number;
+    maxTokens?: number;
+    timeoutMs?: number;
     portalType?: string;
     featureArea?: string;
   },
@@ -2589,7 +2591,7 @@ export async function executeAIJSON<T>(
     throw new Error(`Your organization's AI API quota is currently exceeded.`);
   }
 
-  const { prompt, temperature = 0.2 } = params;
+  const { prompt, temperature = 0.2, maxTokens = 8192, timeoutMs } = params;
 
   // ──────────────────────────────────────────────────────────────────────────
   // CASE A: Tenant BYOK Key
@@ -2601,6 +2603,8 @@ export async function executeAIJSON<T>(
         model: config.modelName || 'gemini-flash-latest',
         prompt,
         temperature,
+        maxTokens,
+        timeoutMs: timeoutMs || 22_000,
       });
 
       await recordAiTelemetryEvent({
@@ -2713,10 +2717,16 @@ export async function executeAIJSON<T>(
 
   let lastError: Error | null = null;
   let attemptCount = 0;
+  const triedNormalizedModels = new Set<string>();
 
   for (const node of cascade) {
     const nodeKey = resolveNodeApiKey(node);
     if (!nodeKey) continue;
+
+    const prov = (node.provider || '').toLowerCase();
+    const dedupeModelKey = `${prov}:${prov === 'gemini' ? normalizeGeminiModel(node.modelName) : node.modelName}`;
+    if (triedNormalizedModels.has(dedupeModelKey)) continue;
+    triedNormalizedModels.add(dedupeModelKey);
 
     attemptCount++;
     try {
@@ -2728,14 +2738,15 @@ export async function executeAIJSON<T>(
         latencyMs: number;
       };
 
-      const prov = (node.provider || '').toLowerCase();
+      const effectiveTimeout = timeoutMs || node.timeoutMs || 25_000;
       if (prov === 'gemini') {
         res = await callGeminiJSONDirect<T>({
           apiKey: nodeKey,
           model: node.modelName,
           prompt,
           temperature,
-          timeoutMs: node.timeoutMs || 35_000,
+          maxTokens,
+          timeoutMs: effectiveTimeout,
         });
         recordSuccessfulCall(nodeKey, 'platform');
       } else if (prov === 'anthropic') {
@@ -2744,7 +2755,8 @@ export async function executeAIJSON<T>(
           model: node.modelName,
           prompt,
           temperature,
-          timeoutMs: node.timeoutMs || 35_000,
+          maxTokens,
+          timeoutMs: effectiveTimeout,
         });
       } else {
         res = await callOpenAiCompatibleJSONDirect<T>({
@@ -2753,7 +2765,8 @@ export async function executeAIJSON<T>(
           model: node.modelName,
           prompt,
           temperature,
-          timeoutMs: node.timeoutMs || 35_000,
+          maxTokens,
+          timeoutMs: effectiveTimeout,
         });
       }
 

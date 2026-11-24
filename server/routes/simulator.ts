@@ -69,6 +69,7 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { getGlobalPlatformSettings } from './platformSettings.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import { executeAIJSON } from '../lib/aiGateway.js';
+import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
 import type { ServiceResponse } from '../../src/services/types.js';
 
 interface WhatIfScenario {
@@ -340,21 +341,27 @@ export function createSimulatorRouter(): Router {
       }
       const avgSalary = salariedCount > 0 ? Math.round(totalSalary / salariedCount) : 0;
 
-      // 5. Utilization rate from trailing 90d timesheets
-      const { data: tsEntries } = await sb
-        .from('timesheet_entries')
-        .select('hours, billable')
-        .eq('organization_id', orgId)
-        .gte('date', ninetyDaysAgo);
+      // 5. Utilization rate from trailing 90d scheduled active project allocation (Mon–Fri 160h/mo)
+      const { data: simProjects } = await sb
+        .from('projects')
+        .select('*')
+        .eq('organization_id', orgId);
 
-      let totalHours = 0;
-      let billableHours = 0;
-      for (const te of (tsEntries || [])) {
-        const h = Number(te.hours || 0);
-        totalHours += h;
-        if (te.billable !== false) billableHours += h;
-      }
-      const utilizationRate = totalHours > 0 ? Math.round((billableHours / totalHours) * 100) : 75;
+      const schedResult = computeOrgProjectsProfitability({
+        projects: simProjects || [],
+        transactions: [],
+        members: members || [],
+        departments: [],
+        overheadAllocations: [],
+        orgCurrency,
+        fromDate: ninetyDaysAgo,
+      });
+
+      const totalScheduled90dHours = schedResult.projects.reduce((s, p) => s + (p.elapsedHours || 0), 0);
+      const capacity90dHours = Math.max(1, currentTeam || 1) * 160 * 3;
+      const utilizationRate = totalScheduled90dHours > 0
+        ? Math.min(100, Math.max(10, Math.round((totalScheduled90dHours / capacity90dHours) * 100)))
+        : 75;
 
       const monthlyRevenue = Math.round(total90dIncome / effectiveMonths);
       const monthlyExpense = Math.round(total90dExpense / effectiveMonths);
