@@ -11,6 +11,7 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { DEFAULT_RATES_TO_USD, convertCurrency, getEstimatedFxRate } from '../lib/fxConverter.js';
 export { DEFAULT_RATES_TO_USD, convertCurrency, getEstimatedFxRate };
 import { logAuditEvent } from '../lib/auditLogger.js';
+import { requirePermission } from '../middleware/auth.js';
 import { isCurrencyEnabledGlobally } from './platformSettings.js';
 import { computeLiveBankBalance, convertTxnAmountToCurrency, NON_POSTED_STATUSES } from '../services/financialTruthService.js';
 
@@ -169,7 +170,7 @@ export function createBankAccountsRouter(): Router {
     return ok(res, mapDbToDomainBankAccount(data));
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<BankAccount, 'id' | 'organizationId'>;
     if (!data.bankName?.trim()) {
@@ -262,7 +263,7 @@ export function createBankAccountsRouter(): Router {
     return fail(res, 503, 'Supabase client is unconfigured');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const updates = req.body as Partial<BankAccount> & { setAsBaseCurrency?: boolean };
 
@@ -364,7 +365,7 @@ export function createBankAccountsRouter(): Router {
     return fail(res, 503, 'Supabase client is unconfigured');
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) {

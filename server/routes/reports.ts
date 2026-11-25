@@ -4,7 +4,8 @@ import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
 
-import { canViewConfidentialPayroll } from '../middleware/auth.js';
+import { canViewConfidentialPayroll, requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import {
   computeBalanceSheetSnapshot,
   computeCashFlowSnapshot,
@@ -1286,7 +1287,7 @@ export function createReportsRouter(): Router {
     }
   });
 
-  r.post('/forecast/generate', async (req: Request, res: Response) => {
+  r.post('/forecast/generate', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = String(req.params.organizationId);
     const horizonDays = Number(req.body?.horizonDays || req.query.horizonDays || 90);
     const scenario = ((req.body?.scenario || req.query.scenario || 'realistic') as string) as 'realistic' | 'best' | 'worst';
@@ -1296,229 +1297,17 @@ export function createReportsRouter(): Router {
       if (outcome.status !== 200) {
         return res.status(outcome.status).json({ error: outcome.error });
       }
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'generate_forecast',
+        entityType: 'forecast',
+        entityId: orgId,
+        description: `Generated ${scenario} forecast (${horizonDays}d)`,
+      });
       return ok(res, outcome.payload);
     } catch (err) {
       console.error('[reports.forecast/generate] DB query error:', err);
       return res.status(500).json({ error: 'Failed to fetch forecast data from Supabase.' });
-    }
-  });
-
-  // ── GET /forecast/profit — Accrued / Recognized Profit Forecast ───────────
-  r.get('/forecast/profit', async (req: Request, res: Response) => {
-    const orgId = String(req.params.organizationId);
-    const horizonMonths = Number(req.query.horizonMonths || 6);
-    const scenario = ((req.query.scenario as string) || 'realistic') as 'realistic' | 'best' | 'worst';
-
-    const sb = getSupabaseAdminClient();
-    if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-
-    try {
-      const [
-        { data: txns },
-        { data: recurring },
-        { data: overheadRows },
-        { data: assetRows },
-      ] = await Promise.all([
-        sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('recurring_transactions').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('overhead_allocations').select('amount').eq('organization_id', orgId),
-        sb.from('assets').select('purchase_price, salvage_value, useful_life_years, status').eq('organization_id', orgId).eq('status', 'active'),
-      ]);
-
-      // Calculate 3-month trailing baseline averages
-      const threeMonthsAgo = new Date();
-      threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
-      const cutoffStr = threeMonthsAgo.toISOString().split('T')[0];
-
-      let totalHistCredit = 0;
-      let totalHistDebit = 0;
-      for (const t of (txns || [])) {
-        if (t.date >= cutoffStr) {
-          const amt = Math.abs(Number(t.amount || 0));
-          if (t.type === 'credit') totalHistCredit += amt;
-          else totalHistDebit += amt;
-        }
-      }
-      const baselineMonthlyRevenue = totalHistCredit / 3;
-      const baselineMonthlyCogs = (totalHistDebit * 0.4) / 3;
-      const baselineMonthlyOpex = (totalHistDebit * 0.6) / 3;
-
-      let recRev = 0;
-      let recExp = 0;
-      for (const r of (recurring || [])) {
-        const amt = Math.abs(Number(r.amount || 0));
-        if (r.type === 'credit') recRev += amt;
-        else recExp += amt;
-      }
-
-      const monthlyOverhead = (overheadRows || []).reduce((s: number, o: any) => s + Number(o.amount || 0), 0);
-      let monthlyDepr = 0;
-      for (const a of (assetRows || [])) {
-        const p = Number(a.purchase_price || 0);
-        const s = Number(a.salvage_value || 0);
-        const l = Math.max(1, Number(a.useful_life_years || 5));
-        monthlyDepr += (p - s) / (l * 12);
-      }
-
-      const { computeProfitForecast } = await import('../services/forecastEngine.js');
-      const forecast = computeProfitForecast({
-        organizationId: orgId,
-        horizonMonths,
-        scenario,
-        baselineMonthlyRevenue,
-        baselineMonthlyCogs,
-        baselineMonthlyOpex,
-        monthlyRecurringRevenue: recRev,
-        monthlyRecurringExpense: recExp,
-        monthlyOverheadPool: monthlyOverhead,
-        monthlyDepreciation: monthlyDepr,
-      });
-
-      return ok(res, forecast);
-    } catch (err: any) {
-      console.error('[reports.forecast.profit] error:', err);
-      return fail(res, 500, err?.message || 'Failed to generate profit forecast');
-    }
-  });
-
-  // ── GET /forecast/capacity — Hours, Billing Rates & Utilization Forecast ──
-  r.get('/forecast/capacity', async (req: Request, res: Response) => {
-    const orgId = String(req.params.organizationId);
-    const horizonMonths = Number(req.query.horizonMonths || 6);
-    const scenario = ((req.query.scenario as string) || 'realistic') as 'realistic' | 'best' | 'worst';
-
-    const sb = getSupabaseAdminClient();
-    if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-
-    try {
-      const [{ data: members }, { data: projects }] = await Promise.all([
-        sb.from('organization_members').select('*').eq('organization_id', orgId).eq('status', 'active'),
-        sb.from('projects').select('*').eq('organization_id', orgId),
-      ]);
-
-      const activeHeadcount = Math.max(1, (members || []).length);
-      const schedEngine = computeOrgProjectsProfitability({
-        projects: projects || [],
-        transactions: [],
-        members: members || [],
-        departments: [],
-        overheadAllocations: [],
-      });
-
-      let totalPlannedHours = 0;
-      let totalQuotedVal = 0;
-      for (const p of schedEngine.projects) {
-        if (p.plannedHours > 0 && p.quotedAmount > 0) {
-          totalPlannedHours += p.plannedHours;
-          totalQuotedVal += p.quotedAmount;
-        }
-      }
-      const avgRate = totalPlannedHours > 0 ? totalQuotedVal / totalPlannedHours : 85;
-      const monthlyPayroll = (members || []).reduce((sum: number, m: any) => {
-        const sal = Number(m.fixed_salary || m.salary || 0);
-        return sum + (sal > 0 ? sal : Number(m.hourly_rate || 0) * 160);
-      }, 0);
-
-      const { computeCapacityForecast } = await import('../services/forecastEngine.js');
-      const forecast = computeCapacityForecast({
-        organizationId: orgId,
-        horizonMonths,
-        scenario,
-        activeHeadcount,
-        standardHoursPerFte: 160,
-        historicalBillableRate: Math.round(avgRate * 100) / 100,
-        directStaffCostPerMonth: monthlyPayroll > 0 ? monthlyPayroll : activeHeadcount * 4500,
-      });
-
-      return ok(res, forecast);
-    } catch (err: any) {
-      console.error('[reports.forecast.capacity] error:', err);
-      return fail(res, 500, err?.message || 'Failed to generate capacity forecast');
-    }
-  });
-
-  // ── GET /forecast/combined — Integrated Cash, Profit & Capacity Forecast ───
-  r.get('/forecast/combined', async (req: Request, res: Response) => {
-    const orgId = String(req.params.organizationId);
-    const horizonMonths = Number(req.query.horizonMonths || 6);
-    const scenario = ((req.query.scenario as string) || 'realistic') as 'realistic' | 'best' | 'worst';
-
-    const sb = getSupabaseAdminClient();
-    if (!sb) return res.status(503).json({ error: 'Database unavailable' });
-
-    try {
-      const [
-        { data: orgData },
-        { data: bankData },
-        { data: txnData },
-        { data: recData },
-        { data: loanData },
-        { data: members },
-        { data: overheadRows },
-        { data: assetRows },
-      ] = await Promise.all([
-        sb.from('organizations').select('currency').eq('id', orgId).single(),
-        sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('transactions').select('*').eq('organization_id', orgId),
-        sb.from('recurring_transactions').select('*').eq('organization_id', orgId).eq('is_active', true),
-        sb.from('loans').select('*').eq('organization_id', orgId),
-        sb.from('organization_members').select('*').eq('organization_id', orgId).eq('status', 'active'),
-        sb.from('overhead_allocations').select('amount').eq('organization_id', orgId),
-        sb.from('assets').select('purchase_price, salvage_value, useful_life_years').eq('organization_id', orgId).eq('status', 'active'),
-      ]);
-
-      const baseCurrency = orgData?.currency || 'USD';
-      const currentCash = await computeLiveLiquidCash(orgId, sb, bankData || [], txnData || [], baseCurrency);
-
-      const { computeCashFlowForecast, computeProfitForecast, computeCapacityForecast, SCENARIO_ASSUMPTIONS } = await import('../services/forecastEngine.js');
-
-      const cashResult = computeCashFlowForecast({
-        organizationId: orgId,
-        horizonDays: horizonMonths * 30,
-        scenario,
-        currentCash,
-        baseCurrency,
-        transactions: txnData || [],
-        recurring: recData || [],
-        loans: loanData || [],
-      });
-
-      const monthlyOverhead = (overheadRows || []).reduce((s: number, o: any) => s + Number(o.amount || 0), 0);
-      let monthlyDepr = 0;
-      for (const a of (assetRows || [])) {
-        monthlyDepr += (Number(a.purchase_price || 0) - Number(a.salvage_value || 0)) / (Math.max(1, Number(a.useful_life_years || 5)) * 12);
-      }
-
-      const profitResult = computeProfitForecast({
-        organizationId: orgId,
-        horizonMonths,
-        scenario,
-        baselineMonthlyRevenue: cashResult.kpis.dailyIncome * 30,
-        baselineMonthlyCogs: cashResult.kpis.dailyBurn * 12,
-        baselineMonthlyOpex: cashResult.kpis.dailyBurn * 18,
-        monthlyOverheadPool: monthlyOverhead,
-        monthlyDepreciation: monthlyDepr,
-      });
-
-      const capacityResult = computeCapacityForecast({
-        organizationId: orgId,
-        horizonMonths,
-        scenario,
-        activeHeadcount: (members || []).length || 1,
-      });
-
-      return ok(res, {
-        organizationId: orgId,
-        scenario,
-        assumptions: SCENARIO_ASSUMPTIONS[scenario],
-        cutoffDate: new Date().toISOString().split('T')[0],
-        cashForecast: cashResult,
-        profitForecast: profitResult,
-        capacityForecast: capacityResult,
-      });
-    } catch (err: any) {
-      console.error('[reports.forecast.combined] error:', err);
-      return fail(res, 500, err?.message || 'Failed to generate combined forecast');
     }
   });
 
@@ -1617,8 +1406,8 @@ export function createReportsRouter(): Router {
       ]);
 
       const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
-      const totalOverhead = (allocRows || []).reduce((sum: number, a: any) => sum + Number(a.amount || 0), 0) || 105000;
-      const activeDepts = (depts && depts.length > 0) ? depts : [{ id: 'dept-1', name: 'General Operations', budget: 50000 }];
+      const totalOverhead = (allocRows || []).reduce((sum: number, a: any) => sum + Number(a.amount || 0), 0);
+      const activeDepts = (depts && depts.length > 0) ? depts : [];
       const deptCount = activeDepts.length;
 
       const matchDepartmentId = (rawVal: string | undefined | null): string | null => {
@@ -1999,6 +1788,30 @@ export function createReportsRouter(): Router {
         // Non-fatal
       }
 
+      // Compute authoritative double-entry journal_lines balance & real cash flow reconciliation (§15, §33 #8)
+      const { data: glLines } = await sb
+        .from('journal_lines')
+        .select('base_debit, base_credit, debit, credit')
+        .eq('organization_id', orgId);
+
+      const glTotalDebits = Math.round(
+        (glLines || []).reduce((s: number, l: any) => s + Number(l.base_debit ?? l.debit ?? 0), 0) * 100
+      ) / 100;
+      const glTotalCredits = Math.round(
+        (glLines || []).reduce((s: number, l: any) => s + Number(l.base_credit ?? l.credit ?? 0), 0) * 100
+      ) / 100;
+      const glDiff = Math.round(Math.abs(glTotalDebits - glTotalCredits) * 100) / 100;
+      const hasGlLines = (glLines || []).length > 0;
+      const effectiveJournalDebits = hasGlLines ? glTotalDebits : totalDebits;
+      const effectiveJournalCredits = hasGlLines ? glTotalCredits : totalCredits;
+      const effectiveJournalDiff = hasGlLines ? glDiff : journalDiff;
+
+      const openingBankCash = Math.round(
+        (bankAccounts || []).reduce((s: number, b: any) => s + Number(b.opening_balance || 0), 0) * 100
+      ) / 100;
+      const expectedClosingCash = Math.round((openingBankCash + netCashMovement) * 100) / 100;
+      const cashDiscrepancy = Math.round((actualBankClosingCash - expectedClosingCash) * 100) / 100;
+
       return ok(res, {
         checkedAt: new Date().toISOString(),
         balanceSheetEquation: {
@@ -2009,16 +1822,19 @@ export function createReportsRouter(): Router {
           discrepancy: bsDiscrepancy,
         },
         journalBalance: {
-          totalDebits,
-          totalCredits,
-          isBalanced: journalDiff === 0 || allTxns.length > 0,
-          discrepancy: journalDiff,
+          source: hasGlLines ? 'journal_lines' : 'transactions_fallback',
+          totalDebits: effectiveJournalDebits,
+          totalCredits: effectiveJournalCredits,
+          isBalanced: hasGlLines ? effectiveJournalDiff < 0.05 : effectiveJournalDiff < 0.05,
+          discrepancy: effectiveJournalDiff,
         },
         cashFlowReconciliation: {
+          openingBankCash,
           netCashMovement,
+          expectedClosingCash,
           actualBankClosingCash,
-          isBalanced: true,
-          discrepancy: 0,
+          isBalanced: Math.abs(cashDiscrepancy) < 1,
+          discrepancy: cashDiscrepancy,
         },
         profitMeasuresExplanation: {
           cashFlowNet: netCashMovement,
@@ -2167,7 +1983,7 @@ export function createReportsRouter(): Router {
     })));
   });
 
-  r.post('/snapshots', async (req: Request, res: Response) => {
+  r.post('/snapshots', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return res.status(503).json({ error: 'Database unavailable' });
@@ -2234,9 +2050,329 @@ export function createReportsRouter(): Router {
 
     if (error || !data) return notFound(res, 'Snapshot');
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'download_report_snapshot',
+      entityType: 'report_snapshot',
+      entityId: String(data.id),
+      description: `Downloaded report snapshot ${data.report_type} v${data.version}`,
+    }).catch(() => {});
+
+    const format = String(req.query.format || 'json').toLowerCase();
+    if (format === 'csv') {
+      const payload = data.snapshot_data;
+      const rows: Record<string, any>[] = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload?.rows)
+          ? payload.rows
+          : [typeof payload === 'object' && payload ? payload : { value: payload }];
+      const headers = Array.from(new Set(rows.flatMap((row) => Object.keys(row || {}))));
+      const esc = (v: any) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const csvLines = [
+        headers.map(esc).join(','),
+        ...rows.map((row) => headers.map((h) => esc(typeof row?.[h] === 'object' ? JSON.stringify(row[h]) : row?.[h])).join(',')),
+      ];
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="report-snapshot-${data.report_type}-v${data.version}.csv"`);
+      return res.status(200).send(csvLines.join('\n'));
+    }
+
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename="report-snapshot-${data.report_type}-v${data.version}.json"`);
     return res.status(200).send(JSON.stringify(data.snapshot_data, null, 2));
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // §15 — Core Accounting Reports: Trial Balance, General Ledger, Aging, Tax
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  r.get('/trial-balance', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const asOf = String(req.query.asOf || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      const [{ data: accounts }, { data: entries }, { data: lines }, { data: orgRow }] = await Promise.all([
+        sb.from('accounts').select('id, code, name, type, subtype').eq('organization_id', orgId),
+        sb.from('journal_entries').select('id, entry_date, status').eq('organization_id', orgId).eq('status', 'posted').lte('entry_date', asOf),
+        sb.from('journal_lines').select('journal_entry_id, account_id, debit, credit, base_debit, base_credit').eq('organization_id', orgId),
+        sb.from('organizations').select('base_currency, currency').eq('id', orgId).maybeSingle(),
+      ]);
+
+      const validEntryIds = new Set((entries || []).map((e: any) => String(e.id)));
+      const acctMap = new Map((accounts || []).map((a: any) => [String(a.id), a]));
+      const totalsByAccount = new Map<string, { debit: number; credit: number }>();
+
+      for (const l of lines || []) {
+        if (!validEntryIds.has(String(l.journal_entry_id))) continue;
+        const aId = String(l.account_id);
+        const cur = totalsByAccount.get(aId) || { debit: 0, credit: 0 };
+        cur.debit += Number(l.base_debit ?? l.debit ?? 0);
+        cur.credit += Number(l.base_credit ?? l.credit ?? 0);
+        totalsByAccount.set(aId, cur);
+      }
+
+      const rows = Array.from(totalsByAccount.entries())
+        .map(([accountId, agg]) => {
+          const acct = acctMap.get(accountId);
+          const debit = Math.round(agg.debit * 100) / 100;
+          const credit = Math.round(agg.credit * 100) / 100;
+          return {
+            accountId,
+            code: acct?.code || '',
+            name: acct?.name || accountId,
+            type: acct?.type || 'unknown',
+            subtype: acct?.subtype || '',
+            debit,
+            credit,
+            netBalance: Math.round((debit - credit) * 100) / 100,
+          };
+        })
+        .sort((a, b) => String(a.code || a.name).localeCompare(String(b.code || b.name)));
+
+      const totalDebits = Math.round(rows.reduce((s, r) => s + r.debit, 0) * 100) / 100;
+      const totalCredits = Math.round(rows.reduce((s, r) => s + r.credit, 0) * 100) / 100;
+      const discrepancy = Math.round(Math.abs(totalDebits - totalCredits) * 100) / 100;
+
+      return ok(res, {
+        asOf,
+        baseCurrency: String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase(),
+        rows,
+        totalDebits,
+        totalCredits,
+        discrepancy,
+        isBalanced: discrepancy < 0.05,
+      });
+    } catch (err: any) {
+      return fail(res, 500, err?.message || 'Failed to compute trial balance');
+    }
+  });
+
+  r.get('/general-ledger', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const startDate = req.query.startDate ? String(req.query.startDate).slice(0, 10) : null;
+    const endDate = req.query.endDate ? String(req.query.endDate).slice(0, 10) : null;
+    const accountId = req.query.accountId ? String(req.query.accountId) : null;
+    const limit = Math.min(500, Math.max(10, Number(req.query.limit || 200)));
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      let jeQuery = sb
+        .from('journal_entries')
+        .select('*')
+        .eq('organization_id', orgId)
+        .order('entry_date', { ascending: false })
+        .limit(limit);
+      if (startDate) jeQuery = jeQuery.gte('entry_date', startDate);
+      if (endDate) jeQuery = jeQuery.lte('entry_date', endDate);
+
+      const [{ data: entries, error: jeErr }, { data: accounts }] = await Promise.all([
+        jeQuery,
+        sb.from('accounts').select('id, code, name, type').eq('organization_id', orgId),
+      ]);
+      if (jeErr) return fail(res, 500, jeErr.message);
+
+      const entryIds = (entries || []).map((e: any) => e.id);
+      let lineRows: any[] = [];
+      if (entryIds.length > 0) {
+        let lineQ = sb
+          .from('journal_lines')
+          .select('*')
+          .eq('organization_id', orgId)
+          .in('journal_entry_id', entryIds);
+        if (accountId) lineQ = lineQ.eq('account_id', accountId);
+        const { data: lines } = await lineQ;
+        lineRows = lines || [];
+      }
+
+      const acctMap = new Map((accounts || []).map((a: any) => [String(a.id), a]));
+      const linesByJe = new Map<string, any[]>();
+      for (const l of lineRows) {
+        const jId = String(l.journal_entry_id);
+        if (!linesByJe.has(jId)) linesByJe.set(jId, []);
+        const acct = acctMap.get(String(l.account_id));
+        linesByJe.get(jId)!.push({
+          ...l,
+          accountCode: acct?.code || '',
+          accountName: acct?.name || l.account_id,
+          accountType: acct?.type || '',
+        });
+      }
+
+      const ledgerEntries = (entries || [])
+        .map((e: any) => ({
+          ...e,
+          lines: linesByJe.get(String(e.id)) || [],
+        }))
+        .filter((e: any) => !accountId || e.lines.length > 0);
+
+      return ok(res, {
+        startDate,
+        endDate,
+        accountId,
+        count: ledgerEntries.length,
+        entries: ledgerEntries,
+      });
+    } catch (err: any) {
+      return fail(res, 500, err?.message || 'Failed to fetch general ledger');
+    }
+  });
+
+  r.get('/aging', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const asOfStr = String(req.query.asOf || new Date().toISOString().slice(0, 10)).slice(0, 10);
+    const asOfMs = new Date(`${asOfStr}T00:00:00Z`).getTime();
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      const [{ data: invoices }, { data: loans }, { data: orgRow }] = await Promise.all([
+        sb.from('invoices').select('*').eq('organization_id', orgId),
+        sb.from('loans').select('*').eq('organization_id', orgId).neq('status', 'paid'),
+        sb.from('organizations').select('base_currency, currency').eq('id', orgId).maybeSingle(),
+      ]);
+
+      const baseCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+      const emptyBuckets = () => ({ current: 0, days_1_30: 0, days_31_60: 0, days_61_90: 0, days_90_plus: 0, total: 0 });
+      const arBuckets = emptyBuckets();
+      const apBuckets = emptyBuckets();
+
+      const addToBucket = (buckets: ReturnType<typeof emptyBuckets>, dueDateStr: string | null | undefined, amt: number) => {
+        if (amt <= 0) return;
+        const dueMs = dueDateStr ? new Date(`${String(dueDateStr).slice(0, 10)}T00:00:00Z`).getTime() : asOfMs;
+        const daysPastDue = Number.isFinite(dueMs) ? Math.floor((asOfMs - dueMs) / 86_400_000) : 0;
+        if (daysPastDue <= 0) buckets.current += amt;
+        else if (daysPastDue <= 30) buckets.days_1_30 += amt;
+        else if (daysPastDue <= 60) buckets.days_31_60 += amt;
+        else if (daysPastDue <= 90) buckets.days_61_90 += amt;
+        else buckets.days_90_plus += amt;
+        buckets.total += amt;
+      };
+
+      const arItems: any[] = [];
+      for (const inv of invoices || []) {
+        const status = String(inv.status || '').toLowerCase();
+        if (['paid', 'cancelled', 'void', 'draft'].includes(status)) continue;
+        const total = Number(inv.total_amount ?? inv.total ?? inv.amount ?? 0);
+        const paid = Number(inv.amount_paid ?? inv.paid_amount ?? 0);
+        const openAmt = Math.max(0, total - paid);
+        if (openAmt <= 0) continue;
+        const convAmt = Math.round(convertCurrency(openAmt, String(inv.currency || baseCurrency), baseCurrency) * 100) / 100;
+        addToBucket(arBuckets, inv.due_date || inv.issue_date, convAmt);
+        arItems.push({
+          id: inv.id,
+          invoiceNumber: inv.invoice_number || inv.id,
+          clientName: inv.client_name || 'Client',
+          dueDate: inv.due_date || null,
+          openAmount: convAmt,
+          status,
+        });
+      }
+
+      const apItems: any[] = [];
+      for (const loan of loans || []) {
+        const rem = Number(loan.remaining_balance ?? loan.principal ?? 0);
+        if (rem <= 0) continue;
+        const convAmt = Math.round(convertCurrency(rem, String(loan.currency || baseCurrency), baseCurrency) * 100) / 100;
+        if (loan.type === 'to_receive') {
+          addToBucket(arBuckets, loan.next_payment_date || loan.due_date, convAmt);
+        } else {
+          addToBucket(apBuckets, loan.next_payment_date || loan.due_date, convAmt);
+          apItems.push({
+            id: loan.id,
+            party: loan.party || 'Lender',
+            dueDate: loan.next_payment_date || loan.due_date || null,
+            openAmount: convAmt,
+            status: loan.status,
+          });
+        }
+      }
+
+      const roundBuckets = (b: ReturnType<typeof emptyBuckets>) => ({
+        current: Math.round(b.current * 100) / 100,
+        days_1_30: Math.round(b.days_1_30 * 100) / 100,
+        days_31_60: Math.round(b.days_31_60 * 100) / 100,
+        days_61_90: Math.round(b.days_61_90 * 100) / 100,
+        days_90_plus: Math.round(b.days_90_plus * 100) / 100,
+        total: Math.round(b.total * 100) / 100,
+      });
+
+      return ok(res, {
+        asOf: asOfStr,
+        baseCurrency,
+        receivables: { buckets: roundBuckets(arBuckets), items: arItems },
+        payables: { buckets: roundBuckets(apBuckets), items: apItems },
+      });
+    } catch (err: any) {
+      return fail(res, 500, err?.message || 'Failed to compute AR/AP aging report');
+    }
+  });
+
+  r.get('/tax-summary', async (req: Request, res: Response) => {
+    const orgId = getOrgId(req);
+    const startDate = req.query.startDate ? String(req.query.startDate).slice(0, 10) : null;
+    const endDate = req.query.endDate ? String(req.query.endDate).slice(0, 10) : null;
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    try {
+      let txnQ = sb.from('transactions').select('*').eq('organization_id', orgId);
+      if (startDate) txnQ = txnQ.gte('date', startDate);
+      if (endDate) txnQ = txnQ.lte('date', endDate);
+
+      const [{ data: txns }, { data: invoices }, { data: categories }, { data: orgRow }] = await Promise.all([
+        txnQ,
+        sb.from('invoices').select('*').eq('organization_id', orgId),
+        sb.from('categories').select('id, name').eq('organization_id', orgId),
+        sb.from('organizations').select('base_currency, currency').eq('id', orgId).maybeSingle(),
+      ]);
+
+      const baseCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase();
+      const catMap = new Map((categories || []).map((c: any) => [String(c.id), String(c.name || '')]));
+
+      let taxPaidExpenses = 0;
+      const taxExpenseItems: any[] = [];
+      for (const t of txns || []) {
+        const status = String(t.status || 'posted').toLowerCase();
+        if (['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status)) continue;
+        if (t.type !== 'debit') continue;
+        const catName = (t.category_id ? catMap.get(String(t.category_id)) || '' : '').toLowerCase();
+        const desc = `${t.description || ''} ${t.narration || ''}`.toLowerCase();
+        if (catName.includes('tax') || desc.includes('tax') || desc.includes('vat') || desc.includes('gst') || desc.includes('withholding')) {
+          const amt = Math.abs(convertCurrency(Number(t.base_amount ?? t.amount ?? 0), String(t.currency || baseCurrency), baseCurrency));
+          taxPaidExpenses += amt;
+          taxExpenseItems.push({ id: t.id, date: t.date, description: t.description || t.narration, category: catName || 'Taxes', amount: Math.round(amt * 100) / 100 });
+        }
+      }
+
+      let outputTaxCollected = 0;
+      for (const inv of invoices || []) {
+        const status = String(inv.status || '').toLowerCase();
+        if (['draft', 'cancelled', 'void'].includes(status)) continue;
+        const invDate = String(inv.issue_date || inv.created_at || '').slice(0, 10);
+        if (startDate && invDate && invDate < startDate) continue;
+        if (endDate && invDate && invDate > endDate) continue;
+        const taxAmt = Number(inv.tax_amount ?? inv.tax ?? 0);
+        if (taxAmt > 0) {
+          outputTaxCollected += convertCurrency(taxAmt, String(inv.currency || baseCurrency), baseCurrency);
+        }
+      }
+
+      return ok(res, {
+        startDate,
+        endDate,
+        baseCurrency,
+        outputTaxCollected: Math.round(outputTaxCollected * 100) / 100,
+        taxPaidExpenses: Math.round(taxPaidExpenses * 100) / 100,
+        netTaxPosition: Math.round((outputTaxCollected - taxPaidExpenses) * 100) / 100,
+        taxExpenseCount: taxExpenseItems.length,
+        taxExpenseItems: taxExpenseItems.slice(0, 100),
+      });
+    } catch (err: any) {
+      return fail(res, 500, err?.message || 'Failed to compute tax summary');
+    }
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -2261,7 +2397,7 @@ export function createReportsRouter(): Router {
 
       const accuracyPct = (autoApproved + manuallyClassified) > 0
         ? Math.round((autoApproved / (autoApproved + manuallyClassified)) * 1000) / 10
-        : 94.2;
+        : 0;
 
       return ok(res, {
         totalRules: (rules || []).length,

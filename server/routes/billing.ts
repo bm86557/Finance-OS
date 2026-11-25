@@ -2,6 +2,8 @@ import { Router, type Request, type Response } from 'express';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { ok, fail, notFound } from '../lib/http.js';
 import { env } from '../config/env.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import { stripeService, type PlatformPlan, type OrganizationSubscription, type BillingInvoice } from '../services/stripeService.js';
 import {
   resolveAuthoritativeOrgPlan,
@@ -153,7 +155,7 @@ export function createBillingRouter(): Router {
   });
 
   // POST /api/v1/organizations/:organizationId/billing/checkout-session
-  router.post('/checkout-session', async (req: Request, res: Response) => {
+  router.post('/checkout-session', requirePermission('org:manage_settings'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     if (!orgId) return fail(res, 'Missing organization ID', 400);
 
@@ -223,7 +225,7 @@ export function createBillingRouter(): Router {
   });
 
   // POST /api/v1/organizations/:organizationId/billing/verify-session
-  router.post('/verify-session', async (req: Request, res: Response) => {
+  router.post('/verify-session', requirePermission('org:manage_settings'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     if (!orgId) return fail(res, 'Missing organization ID', 400);
 
@@ -245,7 +247,7 @@ export function createBillingRouter(): Router {
   });
 
   // POST /api/v1/organizations/:organizationId/billing/cancel
-  router.post('/cancel', async (req: Request, res: Response) => {
+  router.post('/cancel', requirePermission('org:manage_settings'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     if (!orgId) return fail(res, 'Missing organization ID', 400);
 

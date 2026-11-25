@@ -8,6 +8,8 @@ import { Router, type Request, type Response } from 'express';
 import type { Project, TimesheetEntry, ProjectTask } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import {
   reconcileTask,
@@ -553,7 +555,7 @@ export function createProjectsRouter(): Router {
   // ─────────────────────────────────────────────────────────────────────────────
   // POST /:id/timesheets/:entryId/approve - §13 Manager Approval & Rate Lock
   // ─────────────────────────────────────────────────────────────────────────────
-  r.post('/:id/timesheets/:entryId/approve', async (req: Request, res: Response) => {
+  r.post('/:id/timesheets/:entryId/approve', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = req.params.id;
     const entryId = req.params.entryId;
@@ -736,7 +738,7 @@ export function createProjectsRouter(): Router {
   // ─────────────────────────────────────────────────────────────────────────────
   // POST /:id/timesheets/:entryId/revise - §13 Time Revision with Audit Delta
   // ─────────────────────────────────────────────────────────────────────────────
-  r.post('/:id/timesheets/:entryId/revise', async (req: Request, res: Response) => {
+  r.post('/:id/timesheets/:entryId/revise', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = req.params.id;
     const entryId = req.params.entryId;
@@ -810,7 +812,7 @@ export function createProjectsRouter(): Router {
   // ─────────────────────────────────────────────────────────────────────────────
   // POST /:id/timesheets/:entryId/reject - Reject timesheet
   // ─────────────────────────────────────────────────────────────────────────────
-  r.post('/:id/timesheets/:entryId/reject', async (req: Request, res: Response) => {
+  r.post('/:id/timesheets/:entryId/reject', requirePermission('finance:approve'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = req.params.id;
     const entryId = req.params.entryId;
@@ -903,7 +905,7 @@ export function createProjectsRouter(): Router {
     return ok(res, mapDbToDomainProject(data));
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Project, 'id' | 'organizationId'>;
     const sb = getSupabaseAdminClient();
@@ -970,7 +972,7 @@ export function createProjectsRouter(): Router {
     return created(res, mapDbToDomainProject(insertedData), 'Project created');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = String(req.params.id);
     const updates = req.body as Partial<Project>;
@@ -1099,7 +1101,7 @@ export function createProjectsRouter(): Router {
   });
 
   // POST /:id/complete — Lock exact completion date & freeze Mon–Fri hours permanently
-  r.post('/:id/complete', async (req: Request, res: Response) => {
+  r.post('/:id/complete', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = String(req.params.id);
     const body = (req.body || {}) as { completedAt?: string };
@@ -1140,7 +1142,7 @@ export function createProjectsRouter(): Router {
     return ok(res, mapDbToDomainProject(data), `Project marked completed on ${completedAt}. Hours are now frozen.`);
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -1196,7 +1198,7 @@ export function createProjectsRouter(): Router {
   });
 
   // Batch create whole-week tasks (Mon–Fri) at once with auto-validated dates
-  r.post('/:id/tasks/batch', async (req: Request, res: Response) => {
+  r.post('/:id/tasks/batch', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = req.params.id;
     const { tasks } = req.body as { tasks: Array<Partial<ProjectTask>> };
@@ -1316,7 +1318,7 @@ export function createProjectsRouter(): Router {
     return created(res, dbRows.map((row) => reconcileTask(row, [])));
   });
 
-  r.post('/:id/tasks', async (req: Request, res: Response) => {
+  r.post('/:id/tasks', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const projectId = req.params.id;
     const body = req.body as Partial<ProjectTask>;
@@ -1376,7 +1378,7 @@ export function createProjectsRouter(): Router {
     return created(res, mapDbToDomainTask(dbRow));
   });
 
-  r.patch('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  r.patch('/:id/tasks/:taskId', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const { id: projectId, taskId } = req.params;
     const updates = req.body as Partial<ProjectTask>;
@@ -1426,7 +1428,7 @@ export function createProjectsRouter(): Router {
     return ok(res, { id: taskId, projectId, organizationId: orgId, ...updates });
   });
 
-  r.delete('/:id/tasks/:taskId', async (req: Request, res: Response) => {
+  r.delete('/:id/tasks/:taskId', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const { id: projectId, taskId } = req.params;
     const sb = getSupabaseAdminClient();

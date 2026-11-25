@@ -10,14 +10,6 @@ import { useAuth } from '@/contexts/AuthContext';
 import type { ActiveSession } from '@/services/types';
 import { ViewHeader } from './ViewHeader';
 
-const fallbackSessionHistory = [
-  { id: '1', action: 'Login', device: 'Chrome on Windows', location: 'New York', time: '2025-01-16 09:30 AM', status: 'success' },
-  { id: '2', action: 'Login', device: 'Safari on iOS', location: 'New York', time: '2025-01-16 08:00 AM', status: 'success' },
-  { id: '3', action: 'Logout', device: 'Chrome on Windows', location: 'New York', time: '2025-01-15 11:30 PM', status: 'success' },
-  { id: '4', action: 'Failed Login', device: 'Chrome on Android', location: 'Unknown', time: '2025-01-15 03:22 PM', status: 'failed' },
-  { id: '5', action: 'Login', device: 'Firefox on macOS', location: 'New York', time: '2025-01-14 05:45 PM', status: 'success' },
-];
-
 export function ActiveSessionsView() {
   const { user } = useAuth();
   const [sessions, setSessions] = useState<ActiveSession[]>([]);
@@ -32,18 +24,18 @@ export function ActiveSessionsView() {
   }>>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
-  // Fetch session history when toggled
+  // Fetch session history when toggled (no fake fallback history — §0 #3, §26)
   useEffect(() => {
     if (showHistory && user?.id) {
       setLoadingHistory(true);
       authService.getSessionHistory(user.id).then(res => {
-        if (res.success && Array.isArray(res.data) && res.data.length > 0) {
+        if (res.success && Array.isArray(res.data)) {
           setSessionHistory(res.data);
-        } else if (res.success && Array.isArray(res.data) && res.data.length === 0) {
-          setSessionHistory(fallbackSessionHistory);
+        } else {
+          setSessionHistory([]);
         }
       }).catch(() => {
-        setSessionHistory(fallbackSessionHistory);
+        setSessionHistory([]);
       }).finally(() => {
         setLoadingHistory(false);
       });

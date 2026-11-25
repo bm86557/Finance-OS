@@ -301,7 +301,7 @@ export interface BudgetServices {
   createFromTemplate(
     templateName: string,
     totalAmount: number,
-    categories: { category: string; percentage: number }[],
+    categories: { category: string; categoryId?: string | null; percentage: number }[],
     options?: {
       period?: 'monthly' | 'quarterly' | 'yearly';
       startDate?: string;
@@ -310,6 +310,10 @@ export interface BudgetServices {
     },
   ): ReturnType<typeof budgetService.createFromTemplate>;
   rollForward(id: string): ReturnType<typeof budgetService.rollForward>;
+  getTemplates(): ReturnType<typeof budgetService.getTemplates>;
+  createTemplate(payload: Parameters<typeof budgetService.createTemplate>[1]): ReturnType<typeof budgetService.createTemplate>;
+  updateTemplate(templateId: string, payload: Parameters<typeof budgetService.updateTemplate>[2]): ReturnType<typeof budgetService.updateTemplate>;
+  deleteTemplate(templateId: string): ReturnType<typeof budgetService.deleteTemplate>;
 }
 
 export interface LoanServices {
@@ -490,7 +494,7 @@ export interface SimulatorServices {
 }
 
 export interface ProfitIntelligenceServices {
-  getSummary(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof profitIntelligenceService.getSummary>;
+  getSummary(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' | 'ALL' }): ReturnType<typeof profitIntelligenceService.getSummary>;
   getClientProfitability(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof profitIntelligenceService.getClientProfitability>;
   getOverheadSummary(): ReturnType<typeof profitIntelligenceService.getOverheadSummary>;
   getBusinessVsPersonal(params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }): ReturnType<typeof profitIntelligenceService.getBusinessVsPersonal>;
@@ -638,6 +642,10 @@ export function useOrgServices(): OrgServices {
       getSummary:           ()              => budgetService.getSummary(orgId),
       createFromTemplate:   (name, amt, cats, opt) => budgetService.createFromTemplate(orgId, name, amt, cats, opt),
       rollForward:          (id)            => budgetService.rollForward(id, orgId),
+      getTemplates:         ()              => budgetService.getTemplates(orgId),
+      createTemplate:       (payload)       => budgetService.createTemplate(orgId, payload),
+      updateTemplate:       (tid, payload)  => budgetService.updateTemplate(orgId, tid, payload),
+      deleteTemplate:       (tid)           => budgetService.deleteTemplate(orgId, tid),
     },
 
     loans: {

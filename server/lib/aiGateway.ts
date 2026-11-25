@@ -517,6 +517,19 @@ export function isNodeFreeTierZeroBilled(node: GatewayModelState, apiKey: string
   return detectNodeBillingTier(node, apiKey).isBilledAsZero;
 }
 
+let gatewayHydratedFromDb = false;
+let gatewayHydrationPromise: Promise<GatewayModelState[]> | null = null;
+
+export async function ensureGatewayProvidersHydrated(): Promise<GatewayModelState[]> {
+  if (gatewayHydratedFromDb) return runtimeGatewayModels;
+  if (!gatewayHydrationPromise) {
+    gatewayHydrationPromise = syncGatewayProvidersFromDb().finally(() => {
+      gatewayHydrationPromise = null;
+    });
+  }
+  return gatewayHydrationPromise;
+}
+
 /**
  * Synchronize runtime gateway models with authoritative Supabase platform_ai_gateway_providers table
  * and hydrate per-node token, latency, and cost counters from platform_ai_usage_events.
@@ -691,7 +704,7 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
           rateLimitRpm: row.rate_limit_rpm || existing?.rateLimitRpm || 60,
           rateLimitTpm: row.rate_limit_tpm || existing?.rateLimitTpm || 1000000,
           maxTokensPerReq: row.max_tokens_per_req || existing?.maxTokensPerReq || 4096,
-          timeoutMs: row.timeout_ms || existing?.timeoutMs || 10000,
+          timeoutMs: Math.max(20000, Number(row.timeout_ms || existing?.timeoutMs || 25000)),
         };
       });
 
@@ -707,6 +720,7 @@ export async function syncGatewayProvidersFromDb(): Promise<GatewayModelState[]>
       runtimeGatewayModels.length = 0;
       runtimeGatewayModels.push(...updatedModels, ...unpersistedCustomNodes);
       runtimeGatewayModels.sort((a, b) => a.priority - b.priority);
+      gatewayHydratedFromDb = true;
     }
   } catch (err) {
     console.warn('[aiGateway] Failed to sync providers from Supabase:', err);
@@ -2078,6 +2092,9 @@ async function callGeminiJSONDirect<T>(params: {
   const normalized = normalizeGeminiModel(model);
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${normalized}:generateContent`;
 
+  const isThinkingModel = /gemini-(2\.5|3)/i.test(normalized);
+  const effectiveMaxOutputTokens = isThinkingModel ? Math.max(maxTokens, 4096) : Math.max(maxTokens, 2048);
+
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
@@ -2089,7 +2106,7 @@ async function callGeminiJSONDirect<T>(params: {
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
         temperature,
-        maxOutputTokens: maxTokens,
+        maxOutputTokens: effectiveMaxOutputTokens,
         candidateCount: 1,
         responseMimeType: 'application/json',
       },
@@ -2107,7 +2124,13 @@ async function callGeminiJSONDirect<T>(params: {
   }
 
   const resJson: any = await response.json();
-  const raw = resJson.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+  const parts: Array<{ text?: string; thought?: boolean }> = resJson.candidates?.[0]?.content?.parts || [];
+  const nonThoughtText = parts
+    .filter((p) => !p.thought && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join('')
+    .trim();
+  const raw = nonThoughtText || parts.map((p) => p.text || '').join('').trim() || '{}';
   const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
   const parsed = JSON.parse(cleaned) as T;
 
@@ -2437,6 +2460,8 @@ export async function executeAIChat(
     throw new Error(`Your organization has reached its monthly AI credits limit (${quotaCheck.creditsQuota} requests) on the ${quotaCheck.planName} plan. Please upgrade your plan in Plans & Billing or configure your own API key (BYOK) in AI Settings.`);
   }
 
+  await ensureGatewayProvidersHydrated();
+
   // Build sorted active failover cascade ($P_1 \to P_2 \to P_3 \to \dots$)
   let cascade = runtimeGatewayModels
     .filter((m) => m.isActive !== false && !m.circuitOpen)
@@ -2712,6 +2737,8 @@ export async function executeAIJSON<T>(
     throw new Error('Global AI Kill Switch is active. All platform AI inference calls are temporarily halted by the Super Admin.');
   }
 
+  await ensureGatewayProvidersHydrated();
+
   let cascade = runtimeGatewayModels
     .filter((m) => m.isActive !== false && !m.circuitOpen)
     .sort((a, b) => a.priority - b.priority);
@@ -2747,14 +2774,16 @@ export async function executeAIJSON<T>(
         latencyMs: number;
       };
 
-      const effectiveTimeout = timeoutMs || node.timeoutMs || 25_000;
+      const effectiveTimeout = timeoutMs || Math.min(node.timeoutMs || 18_000, 18_000);
+      const isGroqNode = String(node.baseUrl || '').toLowerCase().includes('groq.com') || String(node.name || '').toLowerCase().includes('groq');
+      const effectiveMaxTokens = isGroqNode ? Math.min(maxTokens, 1400) : maxTokens;
       if (prov === 'gemini') {
         res = await callGeminiJSONDirect<T>({
           apiKey: nodeKey,
           model: node.modelName,
           prompt,
           temperature,
-          maxTokens,
+          maxTokens: effectiveMaxTokens,
           timeoutMs: effectiveTimeout,
         });
         recordSuccessfulCall(nodeKey, 'platform');
@@ -2764,7 +2793,7 @@ export async function executeAIJSON<T>(
           model: node.modelName,
           prompt,
           temperature,
-          maxTokens,
+          maxTokens: effectiveMaxTokens,
           timeoutMs: effectiveTimeout,
         });
       } else {
@@ -2774,7 +2803,7 @@ export async function executeAIJSON<T>(
           model: node.modelName,
           prompt,
           temperature,
-          maxTokens,
+          maxTokens: effectiveMaxTokens,
           timeoutMs: effectiveTimeout,
         });
       }

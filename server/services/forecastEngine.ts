@@ -270,6 +270,28 @@ export function computeCashFlowForecast(input: EngineInput): {
     (t) => !isInternalTransfer(t) && !excludedStatuses.has(String(t.status || 'classified').toLowerCase())
   );
 
+  const hasActiveRecurring = (input.recurring || []).some(r => r.is_active !== false && r.isActive !== false);
+  const hasActiveLoans = (input.loans || []).some(l => (l.status || 'active') === 'active');
+
+  const isCoveredByScheduledRecurringOrLoan = (t: any): boolean => {
+    const tags: string[] = Array.isArray(t.tags) ? t.tags.map((x: any) => String(x).toLowerCase()) : [];
+    const desc = `${t.description || ''} ${t.narration || ''}`.toLowerCase();
+    if (hasActiveRecurring && (t.recurring_transaction_id || t.recurringTransactionId || tags.includes('recurring'))) {
+      return true;
+    }
+    if (
+      hasActiveLoans &&
+      (tags.includes('loan-principal') ||
+        tags.includes('loan-interest') ||
+        tags.includes('loan-fee') ||
+        desc.includes('loan repayment') ||
+        (desc.includes('monthly installment') && desc.includes('loan')))
+    ) {
+      return true;
+    }
+    return false;
+  };
+
   const windowTxns = txns.filter((t) => t.date >= windowStartStr && t.date <= todayStr);
   let windowCreditTotal = 0;
   let windowDebitTotal = 0;
@@ -278,6 +300,11 @@ export function computeCashFlowForecast(input: EngineInput): {
   for (const t of windowTxns) {
     if (t.date < earliestWindowDate) {
       earliestWindowDate = t.date;
+    }
+    // Anti-double-counting (§15): exclude historical recurring & loan flows from ad-hoc daily baseline
+    // because active recurring templates and loan schedules are projected explicitly below.
+    if (isCoveredByScheduledRecurringOrLoan(t)) {
+      continue;
     }
     const rawAmt = Number(t.amount || 0);
     const txnCurrency = (t.currency || baseCurrency).toUpperCase();
@@ -361,9 +388,11 @@ export function computeCashFlowForecast(input: EngineInput): {
     }
   }
 
-  // 3. Pre-index scheduled loan payments (converted to baseCurrency)
+  // 3. Pre-index scheduled loan payments expanded across the full horizon (converted to baseCurrency)
   const loansByDate: Record<string, { income: number; expense: number }> = {};
-  const activeLoans = (input.loans || []).filter(l => (l.status || 'active') === 'active');
+  const activeLoans = (input.loans || []).filter(l => (l.status || 'active') === 'active' || l.status === 'partially_paid');
+  const loanHorizonEnd = new Date();
+  loanHorizonEnd.setDate(loanHorizonEnd.getDate() + horizonDays + 30);
 
   for (const loan of activeLoans) {
     const nextStr = loan.next_payment_date || loan.nextPaymentDate;
@@ -374,15 +403,31 @@ export function computeCashFlowForecast(input: EngineInput): {
 
     const loanCurrency = (loan.currency || baseCurrency).toUpperCase();
     const installment = convertCurrency(rawInstallment, loanCurrency, baseCurrency);
-
+    const loanAny = loan as any;
+    const rawRemaining = Number(loanAny.remaining_balance ?? loanAny.remainingBalance ?? loanAny.principal ?? 0);
+    const remainingConverted = rawRemaining > 0 ? convertCurrency(rawRemaining, loanCurrency, baseCurrency) : installment * 12;
+    const maxInstallments = Math.max(1, Math.min(60, Math.ceil(remainingConverted / Math.max(1, installment))));
+    const freq = String(loanAny.frequency || 'monthly').toLowerCase();
     const isReceivable = loan.type === 'to_receive';
-    if (!loansByDate[nextStr]) {
-      loansByDate[nextStr] = { income: 0, expense: 0 };
-    }
-    if (isReceivable) {
-      loansByDate[nextStr].income += installment * profile.incomeFactor;
-    } else {
-      loansByDate[nextStr].expense += installment * profile.expenseFactor;
+
+    let curDate = new Date(nextStr);
+    let count = 0;
+    while (!isNaN(curDate.getTime()) && curDate <= loanHorizonEnd && count < maxInstallments) {
+      count++;
+      const dStr = curDate.toISOString().split('T')[0];
+      if (!loansByDate[dStr]) {
+        loansByDate[dStr] = { income: 0, expense: 0 };
+      }
+      if (isReceivable) {
+        loansByDate[dStr].income += installment * profile.incomeFactor;
+      } else {
+        loansByDate[dStr].expense += installment * profile.expenseFactor;
+      }
+      if (freq === 'weekly') curDate.setDate(curDate.getDate() + 7);
+      else if (freq === 'biweekly') curDate.setDate(curDate.getDate() + 14);
+      else if (freq === 'quarterly') curDate.setMonth(curDate.getMonth() + 3);
+      else if (freq === 'annual' || freq === 'yearly') curDate.setFullYear(curDate.getFullYear() + 1);
+      else curDate.setMonth(curDate.getMonth() + 1);
     }
   }
 
@@ -458,39 +503,71 @@ export function computeCashFlowForecast(input: EngineInput): {
   const projectedMonthlyIncome = Math.round(projectedDailyIncome * 30);
   const netBurnMonthly = Math.round(burnRate - projectedMonthlyIncome);
 
-  // 6. Generate accurate monthly breakdown using actual monthly transaction data in baseCurrency
+  // 6. Generate accurate monthly breakdown:
+  //    - Walk backwards from currentCash across historical months so ending balance of the latest month === currentCash
+  //    - Append projected future months aggregated from daily forecasts
   const monthlyBreakdown: MonthlyBreakdown[] = [];
   const historicalMonthly = aggregateTransactionsByMonth(txns, baseCurrency);
 
   const todayMonth = todayStr.substring(0, 7);
-  const relevantMonths = Object.keys(historicalMonthly).filter(
-    month => month <= todayMonth
-  );
-  
-  let runningMonthlyBalance = currentCash;
-  
-  for (const month of relevantMonths.sort()) {
+  const sortedHistMonths = Object.keys(historicalMonthly)
+    .filter(month => month <= todayMonth)
+    .sort();
+
+  const histRowsReversed: MonthlyBreakdown[] = [];
+  let closingBalanceForMonth = currentCash;
+
+  for (let i = sortedHistMonths.length - 1; i >= 0; i--) {
+    const month = sortedHistMonths[i];
     const historical = historicalMonthly[month];
-    
-    if (historical) {
-      const income = Math.round(historical.income * 100) / 100;
-      const expense = Math.round(historical.expense * 100) / 100;
-      const net = Math.round((income - expense) * 100) / 100;
-      runningMonthlyBalance = Math.round((runningMonthlyBalance + net) * 100) / 100;
-      
-      const parts = month.split('-');
-      const daysInMonth = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10), 0).getDate();
-      
-      monthlyBreakdown.push({
-        month,
-        income,
-        expense,
-        net,
-        balance: runningMonthlyBalance,
-        type: 'actual',
-        daysInMonth,
-      });
-    }
+    if (!historical) continue;
+    const income = Math.round(historical.income * 100) / 100;
+    const expense = Math.round(historical.expense * 100) / 100;
+    const net = Math.round((income - expense) * 100) / 100;
+    const parts = month.split('-');
+    const daysInMonth = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10), 0).getDate();
+
+    histRowsReversed.push({
+      month,
+      income,
+      expense,
+      net,
+      balance: Math.round(closingBalanceForMonth * 100) / 100,
+      type: 'actual',
+      daysInMonth,
+    });
+    // Closing balance of prior month = current month closing balance - current month net
+    closingBalanceForMonth = Math.round((closingBalanceForMonth - net) * 100) / 100;
+  }
+
+  for (let i = histRowsReversed.length - 1; i >= 0; i--) {
+    monthlyBreakdown.push(histRowsReversed[i]);
+  }
+
+  // Append projected future months from daily forecast series
+  const projectedMonthMap = new Map<string, { income: number; expense: number; balance: number; days: number }>();
+  for (const day of forecasts) {
+    const ym = day.date.substring(0, 7);
+    if (ym <= todayMonth) continue;
+    const cur = projectedMonthMap.get(ym) || { income: 0, expense: 0, balance: day.balance, days: 0 };
+    cur.income += day.income;
+    cur.expense += day.expense;
+    cur.balance = day.balance;
+    cur.days += 1;
+    projectedMonthMap.set(ym, cur);
+  }
+  for (const [ym, agg] of Array.from(projectedMonthMap.entries()).sort((a, b) => a[0].localeCompare(b[0]))) {
+    const inc = Math.round(agg.income * 100) / 100;
+    const exp = Math.round(agg.expense * 100) / 100;
+    monthlyBreakdown.push({
+      month: ym,
+      income: inc,
+      expense: exp,
+      net: Math.round((inc - exp) * 100) / 100,
+      balance: Math.round(agg.balance * 100) / 100,
+      type: 'projected',
+      daysInMonth: agg.days,
+    });
   }
 
   let adjustedRunway: number | null = null;

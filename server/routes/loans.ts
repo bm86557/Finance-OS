@@ -586,6 +586,7 @@ export function createLoansRouter(): Router {
         const { data: existingPayment } = await sb
           .from('loan_payments')
           .select('id, paid_on, amount, payment_month')
+          .eq('organization_id', orgId)
           .eq('loan_id', loanId)
           .eq('payment_month', targetMonth)
           .maybeSingle();
@@ -602,7 +603,7 @@ export function createLoansRouter(): Router {
           return fail(res, 400, 'This loan has already been fully paid.');
         }
 
-        // 3. Compute explicit split: principal, interest, fees
+        // 3. Compute explicit split: principal, interest, fees (§15)
         const remaining = currentLoan.remainingBalance ?? currentLoan.principal;
         const rateMonthly = currentLoan.interestRate ? (Number(currentLoan.interestRate) / 100 / 12) : 0;
         let computedInterest = Math.round(remaining * rateMonthly * 100) / 100;
@@ -617,14 +618,52 @@ export function createLoansRouter(): Router {
         if (actualPrincipal < 0 || actualInterest < 0 || actualFees < 0) {
           return fail(res, 400, 'Principal, interest, and fee portions must be non-negative.');
         }
+        if (actualPrincipal > remaining + 0.01) {
+          return fail(res, 400, `Principal portion (${actualPrincipal}) cannot exceed remaining loan principal (${remaining}).`);
+        }
         const splitTotal = Math.round((actualPrincipal + actualInterest + actualFees) * 100) / 100;
         if (splitTotal <= 0) {
           return fail(res, 400, 'Total payment split must be greater than zero.');
         }
+        if (Math.abs(splitTotal - paymentAmount) > 0.01) {
+          return fail(
+            res,
+            400,
+            `Payment split mismatch: principal (${actualPrincipal}) + interest (${actualInterest}) + fees (${actualFees}) = ${splitTotal}, which does not equal payment amount (${paymentAmount}).`,
+          );
+        }
 
         const paymentId = `lp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
-        // 3b. Post balanced double-entry journal for principal / interest / fees split (§8, §15)
+        // 4. Insert payment ledger record FIRST so unique index (loan_id, payment_month) blocks concurrent duplicates BEFORE posting GL journals
+        const paymentRow: any = {
+          id: paymentId,
+          organization_id: orgId,
+          loan_id: loanId,
+          amount: splitTotal,
+          payment_month: targetMonth,
+          paid_on: paidOn,
+          principal_part: actualPrincipal,
+          interest_part: actualInterest,
+          fee_part: actualFees,
+          journal_entry_id: null,
+          method,
+          reference: (reference || '').trim(),
+          notes: (notes || '').trim(),
+        };
+        if (bankAccountId) {
+          paymentRow.bank_account_id = bankAccountId;
+        }
+
+        const { error: insErr } = await sb.from('loan_payments').insert([paymentRow]);
+        if (insErr) {
+          if (insErr.code === '23505') {
+            return fail(res, 409, `The installment for ${targetMonth} has already been paid for this loan.`);
+          }
+          return fail(res, 500, `Could not record loan payment: ${insErr.message}`);
+        }
+
+        // 4b. Post balanced double-entry journal for principal / interest / fees split (§8, §15)
         const isPayable = currentLoan.type === 'to_pay';
         let bankGlId = '';
         if (bankAccountId) {
@@ -674,35 +713,13 @@ export function createLoansRouter(): Router {
           entryPrefix: 'LOANPAY',
           lines: journalLines,
         });
-        const journalEntryId = jeResult.journalEntryId || `JRN-LOAN-${loanId}-${targetMonth}`;
-
-        // 4. Insert payment ledger record
-        const paymentRow: any = {
-          id: paymentId,
-          organization_id: orgId,
-          loan_id: loanId,
-          amount: paymentAmount,
-          payment_month: targetMonth,
-          paid_on: paidOn,
-          principal_part: actualPrincipal,
-          interest_part: actualInterest,
-          fee_part: actualFees,
-          journal_entry_id: journalEntryId,
-          method,
-          reference: (reference || '').trim(),
-          notes: (notes || '').trim(),
-        };
-        if (bankAccountId) {
-          paymentRow.bank_account_id = bankAccountId;
+        if (!jeResult.success || !jeResult.journalEntryId) {
+          // Roll back loan_payments row so subledger never diverges from GL
+          await sb.from('loan_payments').delete().eq('id', paymentId).eq('organization_id', orgId);
+          return fail(res, 400, `Loan payment journal posting failed: ${jeResult.error || 'Unable to post balanced journal entry'}`);
         }
-
-        const { error: insErr } = await sb.from('loan_payments').insert([paymentRow]);
-        if (insErr) {
-          if (insErr.code === '23505') {
-            return fail(res, 400, `The installment for ${targetMonth} has already been paid for this loan.`);
-          }
-          return fail(res, 500, `Could not record loan payment: ${insErr.message}`);
-        }
+        const journalEntryId = jeResult.journalEntryId;
+        await sb.from('loan_payments').update({ journal_entry_id: journalEntryId }).eq('id', paymentId).eq('organization_id', orgId);
 
         // 5. Update loan balances & status — ONLY principal reduces liability!
         const newAmountPaid = Math.round(((currentLoan.amountPaid || 0) + actualPrincipal) * 100) / 100;
@@ -855,6 +872,19 @@ export function createLoansRouter(): Router {
         if (!existing) return notFound(res, 'Loan');
 
         const currentLoan = mapSupabaseRowToLoan(existing);
+        const callerRole = String((req as any).orgMembership?.role || '').toLowerCase();
+        const isModifyingPrincipalOrBalance =
+          (updates.principal !== undefined && Number(updates.principal) !== Number(currentLoan.principal)) ||
+          (updates.remainingBalance !== undefined && Number(updates.remainingBalance) !== Number(currentLoan.remainingBalance)) ||
+          (updates.amountPaid !== undefined && Number(updates.amountPaid) !== Number(currentLoan.amountPaid));
+        if (isModifyingPrincipalOrBalance) {
+          if (currentLoan.status === 'paid') {
+            return fail(res, 400, 'Cannot alter principal or balances on a fully paid loan.');
+          }
+          if (!['owner', 'admin', 'accountant'].includes(callerRole)) {
+            return fail(res, 403, 'Adjusting loan principal or balances requires owner, admin, or accountant approval (Handoff §16).');
+          }
+        }
         const normalized = normalizeBalances(updates, currentLoan);
 
         const dbUpdates: any = {};

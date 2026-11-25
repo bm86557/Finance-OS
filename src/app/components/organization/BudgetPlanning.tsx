@@ -11,6 +11,7 @@ import { useService, useServiceArray } from '@/hooks/useService';
 import { useAuth } from '@/contexts/AuthContext';
 import { isHttpBackendConfigured } from '@/lib/apiClient';
 import type { Budget as ServiceBudget } from '@/services/types';
+import type { BudgetTemplateRecord, BudgetTemplateItem } from '@/services/budgetService';
 
 // ── View-model extends service Budget with computed UI fields ───────────
 interface Budget extends Omit<ServiceBudget, 'status'> {
@@ -62,38 +63,45 @@ function calculateDefaultEndDate(startDateStr: string, period: Budget['period'])
   }
 }
 
-/** Pre-built splits for “Use template”; percentages sum to 100 per template. */
-interface BudgetTemplate {
-  name: string;
-  categories: { category: string; percentage: number }[];
-}
-
-const budgetTemplates: BudgetTemplate[] = [
+/** Fallback starter templates if backend hasn't returned yet; percentages sum to 100. */
+const FALLBACK_STARTER_TEMPLATES: BudgetTemplateRecord[] = [
   {
-    name: 'Creative agency',
+    id: 'starter-creative-agency',
+    name: 'Creative Agency',
+    description: 'Balanced split for creative & software agencies',
+    defaultPeriod: 'monthly',
+    isDefault: true,
     categories: [
-      { category: 'Payroll', percentage: 45 },
-      { category: 'Facilities', percentage: 10 },
+      { category: 'Payroll & Salaries', percentage: 45 },
+      { category: 'Office Rent', percentage: 10 },
       { category: 'Marketing', percentage: 15 },
-      { category: 'Software', percentage: 12 },
-      { category: 'Operations', percentage: 18 },
+      { category: 'Software & Tools', percentage: 12 },
+      { category: 'Office Supplies', percentage: 18 },
     ],
   },
   {
-    name: 'Lean team',
+    id: 'starter-lean-team',
+    name: 'Lean Team',
+    description: 'Lean operating split focused on core team & growth',
+    defaultPeriod: 'monthly',
+    isDefault: true,
     categories: [
-      { category: 'People', percentage: 55 },
-      { category: 'Infrastructure', percentage: 15 },
-      { category: 'Growth', percentage: 30 },
+      { category: 'Payroll & Salaries', percentage: 55 },
+      { category: 'Software & Tools', percentage: 15 },
+      { category: 'Marketing', percentage: 30 },
     ],
   },
   {
-    name: 'Services business',
+    id: 'starter-services-business',
+    name: 'Services Business',
+    description: 'Delivery-first allocation for consulting & client services',
+    defaultPeriod: 'monthly',
+    isDefault: true,
     categories: [
       { category: 'Delivery', percentage: 40 },
-      { category: 'Sales', percentage: 12 },
-      { category: 'Admin', percentage: 18 },
-      { category: 'Tools', percentage: 15 },
+      { category: 'Marketing', percentage: 12 },
+      { category: 'Office Maintenance', percentage: 18 },
+      { category: 'Software & Tools', percentage: 15 },
       { category: 'Buffer', percentage: 15 },
     ],
   },
@@ -228,9 +236,30 @@ export function BudgetPlanning() {
     return rawBudgets.map(toViewModel);
   }, [rawBudgets, rawTxns, categoryMap, departmentMap, projectDeptMap]);
 
+  const { data: serverTemplates, refetch: refetchTemplates } = useServiceArray(
+    () => svc.budgets.getTemplates(),
+    [svc.orgId],
+    ['budgets'],
+  );
+  const budgetTemplates: BudgetTemplateRecord[] = useMemo(
+    () => (serverTemplates && serverTemplates.length > 0 ? serverTemplates : FALLBACK_STARTER_TEMPLATES),
+    [serverTemplates],
+  );
+
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
   const [templateDialogOpen, setTemplateDialogOpen] = useState(false);
+  const [templateModalMode, setTemplateModalMode] = useState<'browse' | 'edit'>('browse');
+  const [editingTemplateId, setEditingTemplateId] = useState<string | null>(null);
+  const [templateEditorName, setTemplateEditorName] = useState('');
+  const [templateEditorDesc, setTemplateEditorDesc] = useState('');
+  const [templateEditorPeriod, setTemplateEditorPeriod] = useState<Budget['period']>('monthly');
+  const [templateEditorRows, setTemplateEditorRows] = useState<BudgetTemplateItem[]>([
+    { category: '', categoryId: null, percentage: 50 },
+    { category: '', categoryId: null, percentage: 50 },
+  ]);
+  const [savingTemplate, setSavingTemplate] = useState(false);
+  const [applyingTemplateId, setApplyingTemplateId] = useState<string | null>(null);
   const [templateTotalAmount, setTemplateTotalAmount] = useState<string>('500000');
   const [templatePeriod, setTemplatePeriod] = useState<Budget['period']>('monthly');
   const [selectedBudget, setSelectedBudget] = useState<Budget | null>(null);
@@ -488,25 +517,164 @@ export function BudgetPlanning() {
     refetchBudgets();
   };
 
-  const applyTemplate = async (template: BudgetTemplate, totalBudget: number) => {
-    const res = await svc.budgets.createFromTemplate(
-      template.name,
-      totalBudget,
-      template.categories,
-      {
-        period: templatePeriod,
-        startDate: todayStr,
-        currency: orgCurrency,
-      },
+  const resolveMatchedExpenseCategoryName = (item: BudgetTemplateItem): string | null => {
+    if (item.categoryId) {
+      const byId = expenseCategories.find((c) => c.id === item.categoryId);
+      if (byId) return byId.name;
+    }
+    const target = item.category.toLowerCase().trim();
+    if (!target) return null;
+    const exact = expenseCategories.find((c) => c.name.toLowerCase().trim() === target);
+    if (exact) return exact.name;
+    const partial = expenseCategories.find((c) => {
+      const n = c.name.toLowerCase().trim();
+      return n.includes(target) || target.includes(n);
+    });
+    return partial ? partial.name : null;
+  };
+
+  const openNewTemplateEditor = () => {
+    setEditingTemplateId(null);
+    setTemplateEditorName('');
+    setTemplateEditorDesc('');
+    setTemplateEditorPeriod(templatePeriod);
+    const defaultRows: BudgetTemplateItem[] = expenseCategories.slice(0, 2).map((c) => ({
+      category: c.name,
+      categoryId: c.id,
+      percentage: 50,
+    }));
+    setTemplateEditorRows(
+      defaultRows.length >= 2
+        ? defaultRows
+        : [
+            { category: expenseCategories[0]?.name || 'Payroll & Salaries', categoryId: expenseCategories[0]?.id || null, percentage: 50 },
+            { category: expenseCategories[1]?.name || 'Marketing', categoryId: expenseCategories[1]?.id || null, percentage: 50 },
+          ],
     );
-    if (!res.success) {
-      toast.error(res.error || 'Template apply failed');
+    setTemplateModalMode('edit');
+  };
+
+  const openEditTemplateEditor = (template: BudgetTemplateRecord) => {
+    const isStarter = Boolean(template.isDefault || template.id.startsWith('starter-'));
+    setEditingTemplateId(isStarter ? null : template.id);
+    setTemplateEditorName(isStarter ? `${template.name} (Custom)` : template.name);
+    setTemplateEditorDesc(template.description || '');
+    setTemplateEditorPeriod(template.defaultPeriod || 'monthly');
+    setTemplateEditorRows(
+      template.categories.map((c) => {
+        const matched = expenseCategories.find(
+          (ec) =>
+            (c.categoryId && ec.id === c.categoryId) ||
+            ec.name.toLowerCase().trim() === c.category.toLowerCase().trim() ||
+            ec.name.toLowerCase().includes(c.category.toLowerCase().trim()),
+        );
+        return {
+          category: matched?.name || c.category,
+          categoryId: matched?.id || c.categoryId || null,
+          percentage: c.percentage,
+        };
+      }),
+    );
+    setTemplateModalMode('edit');
+  };
+
+  const autoBalanceTemplateRows = () => {
+    if (templateEditorRows.length === 0) return;
+    const base = Math.floor((100 / templateEditorRows.length) * 10) / 10;
+    const remainder = Math.round((100 - base * templateEditorRows.length) * 10) / 10;
+    setTemplateEditorRows(
+      templateEditorRows.map((row, idx) => ({
+        ...row,
+        percentage: idx === 0 ? Math.round((base + remainder) * 10) / 10 : base,
+      })),
+    );
+  };
+
+  const handleSaveTemplate = async () => {
+    const cleanName = templateEditorName.trim();
+    if (!cleanName) {
+      toast.error('Please enter a template name');
+      return;
+    }
+    const cleanedRows = templateEditorRows
+      .map((r) => ({
+        category: r.category.trim(),
+        categoryId: r.categoryId || null,
+        percentage: Number(r.percentage) || 0,
+      }))
+      .filter((r) => r.category && r.percentage > 0);
+
+    if (cleanedRows.length === 0) {
+      toast.error('Add at least one category with percentage > 0');
+      return;
+    }
+    const totalPct = Math.round(cleanedRows.reduce((s, r) => s + r.percentage, 0) * 100) / 100;
+    if (Math.abs(totalPct - 100) > 0.5) {
+      toast.error(`Category percentages must sum to 100% (currently ${totalPct}%)`);
       return;
     }
 
-    toast.success(`Applied ${template.name} template`);
-    setTemplateDialogOpen(false);
-    refetchBudgets();
+    setSavingTemplate(true);
+    try {
+      const payload = {
+        name: cleanName,
+        description: templateEditorDesc.trim() || undefined,
+        defaultPeriod: templateEditorPeriod,
+        categories: cleanedRows,
+      };
+      const res = editingTemplateId
+        ? await svc.budgets.updateTemplate(editingTemplateId, payload)
+        : await svc.budgets.createTemplate(payload);
+
+      if (!res.success) {
+        toast.error(res.error || 'Failed to save template');
+        return;
+      }
+      toast.success(editingTemplateId ? `Updated "${cleanName}"` : `Saved "${cleanName}" template`);
+      setTemplateModalMode('browse');
+      setEditingTemplateId(null);
+      await refetchTemplates();
+    } finally {
+      setSavingTemplate(false);
+    }
+  };
+
+  const handleDeleteTemplate = async (template: BudgetTemplateRecord) => {
+    if (template.isDefault || template.id.startsWith('starter-')) return;
+    if (!confirm(`Delete custom template "${template.name}"?`)) return;
+    const res = await svc.budgets.deleteTemplate(template.id);
+    if (!res.success) {
+      toast.error(res.error || 'Failed to delete template');
+      return;
+    }
+    toast.success(`Deleted "${template.name}"`);
+    await refetchTemplates();
+  };
+
+  const applyTemplate = async (template: BudgetTemplateRecord, totalBudget: number) => {
+    setApplyingTemplateId(template.id);
+    try {
+      const res = await svc.budgets.createFromTemplate(
+        template.name,
+        totalBudget,
+        template.categories,
+        {
+          period: templatePeriod,
+          startDate: todayStr,
+          currency: orgCurrency,
+        },
+      );
+      if (!res.success) {
+        toast.error(res.error || 'Template apply failed');
+        return;
+      }
+
+      toast.success(`Applied "${template.name}" (${template.categories.length} budgets created)`);
+      setTemplateDialogOpen(false);
+      refetchBudgets();
+    } finally {
+      setApplyingTemplateId(null);
+    }
   };
 
   const getPercentageUsed = (budget: Budget) => {
@@ -1414,135 +1582,393 @@ export function BudgetPlanning() {
         </DialogContent>
       </Dialog>
 
-      {/* Template Dialog */}
-      <Dialog open={templateDialogOpen} onOpenChange={setTemplateDialogOpen}>
-        <DialogContent 
-          className="max-w-2xl text-white"
+      {/* Template Dialog — Opaque, Scrollable, Manageable (Handoff §15, §29 X-13) */}
+      <Dialog
+        open={templateDialogOpen}
+        onOpenChange={(open) => {
+          setTemplateDialogOpen(open);
+          if (!open) setTemplateModalMode('browse');
+        }}
+      >
+        <DialogContent
+          className="max-w-2xl w-[95vw] max-h-[85vh] flex flex-col overflow-hidden p-0 text-white shadow-2xl"
           style={{
-            background: AXIOM.containers.list.background,
-            border: AXIOM.containers.list.border,
+            background: '#0B0F1A',
+            border: '1px solid rgba(6, 182, 212, 0.3)',
+            boxShadow: '0 25px 60px rgba(0, 0, 0, 0.85)',
           }}
         >
-          <DialogHeader>
-            <DialogTitle className="text-white text-xl font-bold flex items-center gap-2">
-              <Sparkles className="size-5 text-cyan-400" />
-              Apply Budget Template
-            </DialogTitle>
-            <DialogDescription className="text-slate-400">
-              Apply industry-standard splits across your organization categories in one click.
-            </DialogDescription>
-          </DialogHeader>
-
-          <div className="space-y-4 pt-2">
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="text-white text-sm font-medium mb-2 block">
-                  Total Budget Amount ({orgCurrency}) *
-                </label>
-                <input
-                  type="number"
-                  value={templateTotalAmount}
-                  onChange={(e) => setTemplateTotalAmount(e.target.value)}
-                  placeholder="e.g., 500000"
-                  min="1"
-                  className="w-full px-4 py-3 rounded-xl text-white"
-                  style={{
-                    background: AXIOM.inputs.background,
-                    border: AXIOM.inputs.border,
-                  }}
-                />
+          {/* Sticky Header */}
+          <div className="px-6 pt-5 pb-4 border-b border-slate-800 bg-[#0D1322] shrink-0">
+            <DialogHeader>
+              <div className="flex flex-wrap items-center justify-between gap-3 pr-6">
+                <div>
+                  <DialogTitle className="text-white text-xl font-bold flex items-center gap-2">
+                    <Sparkles className="size-5 text-cyan-400" />
+                    {templateModalMode === 'browse'
+                      ? 'Budget Templates'
+                      : editingTemplateId
+                        ? 'Edit Budget Template'
+                        : 'Create Custom Template'}
+                  </DialogTitle>
+                  <DialogDescription className="text-slate-400 text-xs mt-1">
+                    {templateModalMode === 'browse'
+                      ? 'Apply or customize percentage splits mapped to your organization expense categories.'
+                      : 'Choose real organization expense categories and set splits totaling 100%.'}
+                  </DialogDescription>
+                </div>
+                <div className="flex items-center gap-2">
+                  {templateModalMode === 'browse' ? (
+                    <button
+                      type="button"
+                      onClick={openNewTemplateEditor}
+                      className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer transition-opacity hover:opacity-90"
+                      style={AXIOM.buttons.primary}
+                    >
+                      <Plus className="size-3.5" />
+                      New Template
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTemplateModalMode('browse');
+                        setEditingTemplateId(null);
+                      }}
+                      className="px-3 py-1.5 rounded-lg text-xs font-medium text-slate-300 border border-slate-700 hover:bg-slate-800 cursor-pointer"
+                    >
+                      Back to Templates
+                    </button>
+                  )}
+                </div>
               </div>
+            </DialogHeader>
+          </div>
 
-              <div>
-                <label className="text-white text-sm font-medium mb-2 block">
-                  Budget Period
-                </label>
-                <Select 
-                  value={templatePeriod} 
-                  onValueChange={(v: any) => setTemplatePeriod(v)}
-                >
-                  <SelectTrigger 
-                    className="w-full text-white"
-                    style={{
-                      background: AXIOM.inputs.background,
-                      border: AXIOM.inputs.border,
-                    }}
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent 
-                    style={{
-                      background: AXIOM.containers.list.background,
-                      border: AXIOM.containers.list.border,
-                    }}
-                  >
-                    <SelectItem value="monthly" className="text-white">Monthly</SelectItem>
-                    <SelectItem value="quarterly" className="text-white">Quarterly</SelectItem>
-                    <SelectItem value="yearly" className="text-white">Yearly</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            </div>
+          {/* Scrollable Body */}
+          <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+            {templateModalMode === 'browse' ? (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-slate-900/90 border border-slate-800">
+                  <div>
+                    <label className="text-slate-200 text-xs font-medium mb-1.5 block">
+                      Total Budget Amount ({orgCurrency}) *
+                    </label>
+                    <input
+                      type="number"
+                      value={templateTotalAmount}
+                      onChange={(e) => setTemplateTotalAmount(e.target.value)}
+                      placeholder="e.g., 500000"
+                      min="1"
+                      className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white bg-slate-950 border border-slate-700 focus:border-cyan-500 focus:outline-none"
+                    />
+                  </div>
 
-            <div className="space-y-3 pt-2">
-              {budgetTemplates.map((template) => {
-                const totalNum = parseFloat(templateTotalAmount) || 0;
+                  <div>
+                    <label className="text-slate-200 text-xs font-medium mb-1.5 block">
+                      Budget Period
+                    </label>
+                    <Select
+                      value={templatePeriod}
+                      onValueChange={(v: any) => setTemplatePeriod(v)}
+                    >
+                      <SelectTrigger className="w-full text-white bg-slate-950 border-slate-700 h-[42px] rounded-xl">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="bg-[#0D1322] border-slate-700 text-white">
+                        <SelectItem value="monthly" className="text-white">Monthly</SelectItem>
+                        <SelectItem value="quarterly" className="text-white">Quarterly</SelectItem>
+                        <SelectItem value="yearly" className="text-white">Yearly</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
 
-                return (
-                  <div 
-                    key={template.name} 
-                    className="p-4 rounded-xl"
-                    style={AXIOM.containers.item}
-                  >
-                    <div className="flex items-start justify-between mb-3">
-                      <div>
-                        <h3 className="text-white font-semibold mb-1 text-base">{template.name}</h3>
-                        <p className="text-xs text-slate-400">{template.categories.length} categories (100% total allocation)</p>
-                      </div>
-                      <motion.button
-                        whileHover={{ scale: 1.05 }}
-                        whileTap={{ scale: 0.95 }}
-                        className="px-4 py-2 rounded-lg text-xs font-semibold text-white"
-                        style={{
-                          background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.5), rgba(59, 130, 246, 0.5))',
-                          border: '1px solid rgba(6, 182, 212, 0.5)',
-                        }}
-                        onClick={() => {
-                          if (totalNum && totalNum > 0) {
-                            applyTemplate(template, totalNum);
-                          } else {
-                            toast.error('Please enter a valid total budget amount');
-                          }
-                        }}
+                <div className="space-y-3">
+                  {budgetTemplates.map((template) => {
+                    const totalNum = parseFloat(templateTotalAmount) || 0;
+                    const isStarter = Boolean(template.isDefault || template.id.startsWith('starter-'));
+                    const isApplying = applyingTemplateId === template.id;
+
+                    return (
+                      <div
+                        key={template.id}
+                        className="p-4 rounded-xl bg-slate-900/95 border border-slate-800 hover:border-cyan-500/35 transition-colors"
                       >
-                        Apply Template
-                      </motion.button>
-                    </div>
-
-                    <div className="space-y-1.5">
-                      {template.categories.map(cat => {
-                        const calculatedAmt = totalNum > 0 ? (totalNum * cat.percentage) / 100 : 0;
-                        return (
-                          <div key={cat.category} className="flex items-center justify-between text-sm">
-                            <span className="text-slate-300 font-medium">{cat.category}</span>
-                            <div className="flex items-center gap-3">
-                              {totalNum > 0 && (
-                                <span className="text-xs text-cyan-400 font-medium">
-                                  {formatCurrency(calculatedAmt, orgCurrency)}
-                                </span>
-                              )}
-                              <span className="px-2 py-0.5 rounded-lg text-xs font-medium" style={AXIOM.badges.info}>
-                                {cat.percentage}%
+                        <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <h3 className="text-white font-semibold text-base truncate">{template.name}</h3>
+                              <span
+                                className={`px-2 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide ${
+                                  isStarter
+                                    ? 'bg-slate-800 text-slate-300 border border-slate-700'
+                                    : 'bg-cyan-500/15 text-cyan-300 border border-cyan-500/30'
+                                }`}
+                              >
+                                {isStarter ? 'Starter' : 'Custom'}
                               </span>
                             </div>
+                            <p className="text-xs text-slate-400 mt-0.5">
+                              {template.description || `${template.categories.length} categories (100% total allocation)`}
+                            </p>
                           </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => openEditTemplateEditor(template)}
+                              title={isStarter ? 'Customize a copy of this template' : 'Edit template'}
+                              className="p-2 rounded-lg text-slate-300 hover:text-cyan-300 hover:bg-slate-800 border border-slate-700/80 cursor-pointer"
+                            >
+                              <Edit className="size-3.5" />
+                            </button>
+                            {!isStarter && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteTemplate(template)}
+                                title="Delete custom template"
+                                className="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-950/40 border border-slate-700/80 cursor-pointer"
+                              >
+                                <Trash2 className="size-3.5" />
+                              </button>
+                            )}
+                            <motion.button
+                              whileHover={{ scale: 1.03 }}
+                              whileTap={{ scale: 0.97 }}
+                              disabled={isApplying}
+                              className="px-3.5 py-2 rounded-lg text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                              style={{
+                                background: 'linear-gradient(135deg, rgba(6, 182, 212, 0.75), rgba(59, 130, 246, 0.75))',
+                                border: '1px solid rgba(6, 182, 212, 0.6)',
+                              }}
+                              onClick={() => {
+                                if (totalNum && totalNum > 0) {
+                                  applyTemplate(template, totalNum);
+                                } else {
+                                  toast.error('Please enter a valid total budget amount');
+                                }
+                              }}
+                            >
+                              {isApplying && <Loader2 className="size-3 animate-spin" />}
+                              {isApplying ? 'Applying...' : 'Apply Template'}
+                            </motion.button>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5 pt-2 border-t border-slate-800/80">
+                          {template.categories.map((cat, idx) => {
+                            const calculatedAmt = totalNum > 0 ? (totalNum * cat.percentage) / 100 : 0;
+                            const mappedCat = resolveMatchedExpenseCategoryName(cat);
+                            return (
+                              <div key={`${template.id}-${idx}`} className="flex items-center justify-between text-xs sm:text-sm gap-2">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <span className="text-slate-200 font-medium truncate">{cat.category}</span>
+                                  {mappedCat ? (
+                                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 shrink-0">
+                                      Linked: {mappedCat}
+                                    </span>
+                                  ) : (
+                                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20 shrink-0">
+                                      Unlinked
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="flex items-center gap-2.5 shrink-0">
+                                  {totalNum > 0 && (
+                                    <span className="text-xs text-cyan-400 font-medium">
+                                      {formatCurrency(calculatedAmt, orgCurrency)}
+                                    </span>
+                                  )}
+                                  <span className="px-2 py-0.5 rounded-md text-xs font-semibold bg-cyan-500/15 text-cyan-300 border border-cyan-500/25">
+                                    {cat.percentage}%
+                                  </span>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            ) : (
+              /* Custom Template Builder / Editor */
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-slate-200 text-xs font-medium mb-1.5 block">
+                      Template Name *
+                    </label>
+                    <input
+                      type="text"
+                      value={templateEditorName}
+                      onChange={(e) => setTemplateEditorName(e.target.value)}
+                      placeholder="e.g., Q4 Growth Plan"
+                      className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white bg-slate-950 border border-slate-700 focus:border-cyan-500 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-slate-200 text-xs font-medium mb-1.5 block">
+                      Default Period
+                    </label>
+                    <Select
+                      value={templateEditorPeriod}
+                      onValueChange={(v: any) => setTemplateEditorPeriod(v)}
+                    >
+                      <SelectTrigger className="w-full text-white bg-slate-950 border-slate-700 h-[42px] rounded-xl">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent className="bg-[#0D1322] border-slate-700 text-white">
+                        <SelectItem value="monthly" className="text-white">Monthly</SelectItem>
+                        <SelectItem value="quarterly" className="text-white">Quarterly</SelectItem>
+                        <SelectItem value="yearly" className="text-white">Yearly</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="text-slate-200 text-xs font-medium mb-1.5 block">
+                    Description (optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={templateEditorDesc}
+                    onChange={(e) => setTemplateEditorDesc(e.target.value)}
+                    placeholder="Short note on when to use this allocation split"
+                    className="w-full px-3.5 py-2.5 rounded-xl text-sm text-white bg-slate-950 border border-slate-700 focus:border-cyan-500 focus:outline-none"
+                  />
+                </div>
+
+                <div className="p-4 rounded-xl bg-slate-900/90 border border-slate-800 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-200">
+                      Category Splits (must total 100%)
+                    </span>
+                    <div className="flex items-center gap-2">
+                      {(() => {
+                        const pctSum = Math.round(templateEditorRows.reduce((s, r) => s + (Number(r.percentage) || 0), 0) * 10) / 10;
+                        const isExact = Math.abs(pctSum - 100) <= 0.5;
+                        return (
+                          <span
+                            className={`px-2 py-0.5 rounded-md text-xs font-semibold ${
+                              isExact
+                                ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
+                                : 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                            }`}
+                          >
+                            Total: {pctSum}% / 100%
+                          </span>
                         );
-                      })}
+                      })()}
+                      <button
+                        type="button"
+                        onClick={autoBalanceTemplateRows}
+                        className="px-2.5 py-1 rounded-lg text-[11px] font-medium text-cyan-300 border border-cyan-500/30 hover:bg-cyan-500/10 cursor-pointer"
+                      >
+                        Auto-Balance
+                      </button>
                     </div>
                   </div>
-                );
-              })}
-            </div>
+
+                  <div className="space-y-2">
+                    {templateEditorRows.map((row, idx) => (
+                      <div key={idx} className="grid grid-cols-12 gap-2 items-center">
+                        <div className="col-span-7">
+                          <select
+                            value={row.categoryId || ''}
+                            onChange={(e) => {
+                              const picked = expenseCategories.find((c) => c.id === e.target.value);
+                              setTemplateEditorRows((prev) =>
+                                prev.map((r, i) =>
+                                  i === idx
+                                    ? { ...r, categoryId: picked?.id || null, category: picked?.name || r.category }
+                                    : r,
+                                ),
+                              );
+                            }}
+                            className="w-full px-3 py-2 rounded-lg text-xs text-white bg-slate-950 border border-slate-700 focus:border-cyan-500 focus:outline-none"
+                          >
+                            <option value="">-- Select Expense Category --</option>
+                            {expenseCategories.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="col-span-3 relative">
+                          <input
+                            type="number"
+                            min="1"
+                            max="100"
+                            step="1"
+                            value={row.percentage}
+                            onChange={(e) => {
+                              const val = parseFloat(e.target.value) || 0;
+                              setTemplateEditorRows((prev) =>
+                                prev.map((r, i) => (i === idx ? { ...r, percentage: val } : r)),
+                              );
+                            }}
+                            className="w-full px-3 py-2 pr-7 rounded-lg text-xs text-white bg-slate-950 border border-slate-700 focus:border-cyan-500 focus:outline-none"
+                          />
+                          <span className="absolute right-2.5 top-2 text-xs text-slate-400">%</span>
+                        </div>
+                        <div className="col-span-2 flex justify-end">
+                          <button
+                            type="button"
+                            disabled={templateEditorRows.length <= 1}
+                            onClick={() => setTemplateEditorRows((prev) => prev.filter((_, i) => i !== idx))}
+                            className="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-red-950/40 disabled:opacity-30 cursor-pointer"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setTemplateEditorRows((prev) => [
+                        ...prev,
+                        { category: expenseCategories[0]?.name || '', categoryId: expenseCategories[0]?.id || null, percentage: 10 },
+                      ])
+                    }
+                    className="w-full py-2 rounded-lg text-xs font-medium text-cyan-300 border border-dashed border-cyan-500/40 hover:bg-cyan-500/10 flex items-center justify-center gap-1.5 cursor-pointer"
+                  >
+                    <Plus className="size-3.5" />
+                    Add Category Row
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTemplateModalMode('browse');
+                      setEditingTemplateId(null);
+                    }}
+                    className="px-4 py-2 rounded-xl text-xs font-medium text-slate-300 border border-slate-700 hover:bg-slate-800 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingTemplate}
+                    onClick={handleSaveTemplate}
+                    className="px-5 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    style={AXIOM.buttons.primary}
+                  >
+                    {savingTemplate && <Loader2 className="size-3.5 animate-spin" />}
+                    {savingTemplate ? 'Saving...' : editingTemplateId ? 'Save Changes' : 'Save Template'}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </DialogContent>
       </Dialog>

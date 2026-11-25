@@ -7,6 +7,7 @@ import { Router, type Request, type Response } from 'express';
 import { ok, fail, notFound, created } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
+import { requirePermission } from '../middleware/auth.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -132,7 +133,7 @@ export function createInvoicesRouter(): Router {
   });
 
   // POST / — Create a new customer invoice with line items
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -232,7 +233,7 @@ export function createInvoicesRouter(): Router {
   });
 
   // POST /:id/issue — Issue/Send invoice
-  r.post('/:id/issue', async (req: Request, res: Response) => {
+  r.post('/:id/issue', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -269,7 +270,7 @@ export function createInvoicesRouter(): Router {
   });
 
   // POST /:id/payments — Record collection payment against invoice (X-12)
-  r.post('/:id/payments', async (req: Request, res: Response) => {
+  r.post('/:id/payments', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -351,7 +352,7 @@ export function createInvoicesRouter(): Router {
   });
 
   // POST /:id/void — Void an invoice
-  r.post('/:id/void', async (req: Request, res: Response) => {
+  r.post('/:id/void', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');

@@ -360,6 +360,16 @@ export function createAIAssistantRouter(): Router {
   });
 
   /**
+   * Short-TTL cache & in-flight deduplication for GET /ai-assistant/analysis
+   * Prevents React StrictMode double-mounts and tab switches (AI Assistant <-> Profit Intelligence)
+   * from firing redundant multi-provider LLM cascades for the same organization.
+   */
+  const ANALYSIS_AI_CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes for live AI-generated analysis
+  const ANALYSIS_FALLBACK_CACHE_TTL_MS = 30 * 1000; // 30s cooldown when providers fell back
+  const analysisCache = new Map<string, { expiresAt: number; payload: any }>();
+  const analysisInFlight = new Map<string, Promise<any>>();
+
+  /**
    * GET /ai-assistant/analysis — full financial analysis (situation, projections, insights, patterns)
    */
   r.get('/analysis', async (req: Request, res: Response) => {
@@ -368,8 +378,27 @@ export function createAIAssistantRouter(): Router {
     const callerRole = (req as any).orgMembership?.role || 'admin';
     const canViewPayroll = canViewConfidentialPayroll(req);
     const isOwner = callerRole === 'owner';
+    const forceRefresh = req.query.refresh === 'true' || req.query.force === 'true';
+    const cacheKey = `${orgId}:${canViewPayroll ? 'payroll' : 'restricted'}`;
 
-    try {
+    if (!forceRefresh) {
+      const cached = analysisCache.get(cacheKey);
+      if (cached && Date.now() < cached.expiresAt) {
+        return ok(res, cached.payload);
+      }
+      const pending = analysisInFlight.get(cacheKey);
+      if (pending) {
+        try {
+          const sharedPayload = await pending;
+          return ok(res, sharedPayload);
+        } catch (err: any) {
+          console.error('[ai-assistant] Shared in-flight analysis error:', err);
+          return fail(res, 500, 'Failed to generate financial analysis.');
+        }
+      }
+    }
+
+    const computeAnalysis = async () => {
       const dossier = await buildOrganizationFinancialDossier(orgId, {
         userId,
         role: callerRole,
@@ -378,6 +407,19 @@ export function createAIAssistantRouter(): Router {
       });
 
       const curr = dossier.baseCurrency;
+      const dataAvailable = dossier.verifiedTransactionCount > 0 || dossier.projects.length > 0;
+
+      // Compute real team utilization from project logged/elapsed hours vs department monthly capacity
+      const totalCapacityHours = dossier.departments.reduce((s, d) => s + Number(d.capacityHours || 0), 0);
+      const activeLoggedHours = dossier.projects
+        .filter((p) => p.status !== 'cancelled')
+        .reduce((s, p) => s + Number(p.loggedHours || 0), 0);
+      const teamUtilization =
+        totalCapacityHours > 0
+          ? activeLoggedHours > 0
+            ? `${Math.min(100, Math.round((activeLoggedHours / totalCapacityHours) * 100))}%`
+            : '0%'
+          : 'N/A';
 
       const situation = {
         cashPosition: dossier.totalLiquidCash > dossier.monthlyBurnRate * 3
@@ -391,65 +433,343 @@ export function createAIAssistantRouter(): Router {
         personalDrawings: dossier.ownerDrawingsRatio > 0
           ? `${dossier.ownerDrawingsRatio}% of revenue${dossier.ownerDrawingsRatio > 25 ? ' (high)' : ''}`
           : '0% (none)',
-        teamUtilization: dossier.departments.length > 0 ? '82%' : 'N/A',
+        teamUtilization,
       };
 
-      const qtrRev = formatCurrencyValue(dossier.totalRevenue * 0.28, curr);
-      const qtrProfit = formatCurrencyValue(dossier.netProfit * 0.3, curr);
-      const yrRev = formatCurrencyValue(dossier.totalRevenue * 1.25, curr);
-      const yrProfit = formatCurrencyValue(dossier.netProfit * 1.3, curr);
+      // Projections grounded in observed monthly averages (active months in ledger)
+      const activeMonthCount = Math.max(1, dossier.monthlyData.length);
+      const avgMonthlyRevenue = dossier.totalRevenue / activeMonthCount;
+      const avgMonthlyProfit = dossier.netProfit / activeMonthCount;
+      const qtrRev = formatCurrencyValue(avgMonthlyRevenue * 3, curr);
+      const qtrProfit = formatCurrencyValue(avgMonthlyProfit * 3, curr);
+      const yrRev = formatCurrencyValue(avgMonthlyRevenue * 12, curr);
+      const yrProfit = formatCurrencyValue(avgMonthlyProfit * 12, curr);
 
       const projections = {
         nextQuarter: {
           revenue: qtrRev,
           profit: qtrProfit,
-          confidence: Math.min(90, Math.max(60, 50 + dossier.verifiedTransactionCount)),
+          confidence: Math.min(92, Math.max(45, 45 + activeMonthCount * 6 + Math.min(20, dossier.verifiedTransactionCount))),
         },
         nextYear: {
           revenue: yrRev,
           profit: yrProfit,
-          confidence: Math.min(80, Math.max(45, 40 + dossier.verifiedTransactionCount)),
+          confidence: Math.min(82, Math.max(35, 35 + activeMonthCount * 5 + Math.min(15, dossier.verifiedTransactionCount))),
         },
       };
 
-      const insights = dossier.strategicImprovements.map(s => ({
-        id: s.id,
-        type: s.priority === 'high' ? ('warning' as const) : ('opportunity' as const),
-        category: s.category.replace('_', ' ').toUpperCase(),
-        title: s.title,
-        description: s.prescription,
-        impact: s.priority,
-        actionable: true,
-        recommendation: s.prescription,
-      }));
+      // Deterministic fallback insights with distinct observation (description) vs action (recommendation)
+      const fallbackInsights = dossier.strategicImprovements.map((s) => {
+        const sentences = s.prescription
+          .split(/(?<=\.)\s+/)
+          .map((part) => part.trim())
+          .filter(Boolean);
+        const description = sentences[0] || s.prescription;
+        const recommendation =
+          sentences.length > 1
+            ? sentences.slice(1).join(' ')
+            : `Review ${s.title.toLowerCase()} with department owners and set a measurable target this month.`;
 
-      const patterns = [
+        return {
+          id: s.id,
+          type: s.priority === 'high' ? ('warning' as const) : ('opportunity' as const),
+          category: s.category.replace(/_/g, ' ').toUpperCase(),
+          title: s.title,
+          description,
+          impact: s.priority,
+          actionable: true,
+          recommendation,
+        };
+      });
+
+      const fallbackPatterns: Array<{
+        id: string;
+        pattern: string;
+        frequency: string;
+        trend: 'increasing' | 'decreasing' | 'stable';
+        suggestion: string;
+      }> = [
         {
           id: 'pat-profit-velocity',
           pattern: 'Profit Generation Velocity',
           frequency: 'Daily business pace',
-          trend: dossier.profitVelocity.velocityAmount >= 0 ? ('stable' as const) : ('decreasing' as const),
-          suggestion: `Operating pace generates ${formatCurrencyValue(dossier.profitVelocity.velocityAmount, curr)} per business day across ${dossier.profitVelocity.businessDays} tracked days.`,
+          trend: dossier.profitVelocity.velocityAmount > 0 ? 'increasing' : dossier.profitVelocity.velocityAmount < 0 ? 'decreasing' : 'stable',
+          suggestion: `Operating pace generates ${formatCurrencyValue(dossier.profitVelocity.velocityAmount, curr)} per business day across ${dossier.profitVelocity.businessDays} tracked business days.`,
         },
         {
           id: 'pat-quoted-pipeline',
-          pattern: 'Quoted Pipeline Capitalization',
+          pattern: 'Unbilled Quoted Pipeline',
           frequency: 'Project cycles',
-          trend: dossier.totalQuotedPipeline > 0 ? ('increasing' as const) : ('stable' as const),
-          suggestion: `Pipeline contains ${formatCurrencyValue(dossier.totalQuotedPipeline, curr)} in quotes. Securing upfront milestone billing accelerates liquidity.`,
+          trend: dossier.totalQuotedPipeline > 0 ? 'increasing' : 'stable',
+          suggestion:
+            dossier.totalQuotedPipeline > 0
+              ? `Active and quoted projects hold ${formatCurrencyValue(dossier.totalQuotedPipeline, curr)} in unbilled quoted value. Invoicing milestone deposits will accelerate cash conversion.`
+              : `No unbilled quoted project backlog is currently open.`,
         },
       ];
 
-      return ok(res, {
+      if (dossier.priorMonth.revenue > 0 || dossier.currentMonth.revenue > 0) {
+        const profitDelta = dossier.momVariance.profitDelta;
+        const revDeltaPct = dossier.momVariance.revenueDeltaPercent;
+        const expDeltaPct = dossier.momVariance.expenseDeltaPercent;
+        fallbackPatterns.push({
+          id: 'pat-mom-trajectory',
+          pattern: 'Month-over-Month Profit Trajectory',
+          frequency: 'Monthly P&L cycle',
+          trend: profitDelta > 0 ? 'increasing' : profitDelta < 0 ? 'decreasing' : 'stable',
+          suggestion: `${dossier.currentMonth.period} net profit is ${formatCurrencyValue(dossier.currentMonth.profit, curr)} (${dossier.currentMonth.margin}% margin) vs ${formatCurrencyValue(dossier.priorMonth.profit, curr)} in ${dossier.priorMonth.period}${revDeltaPct !== null ? ` (revenue ${revDeltaPct >= 0 ? '+' : ''}${revDeltaPct}% MoM` : ''}${expDeltaPct !== null ? `, expenses ${expDeltaPct >= 0 ? '+' : ''}${expDeltaPct}% MoM)` : revDeltaPct !== null ? ')' : ''}.`,
+        });
+      }
+
+      if (dossier.expensesByCategory.length > 0) {
+        const topCat = dossier.expensesByCategory[0];
+        fallbackPatterns.push({
+          id: 'pat-top-expense',
+          pattern: `Top Expense Concentration: ${topCat.category}`,
+          frequency: 'Recurring operating spend',
+          trend: topCat.percentage >= 30 ? 'increasing' : 'stable',
+          suggestion: `${topCat.category} represents ${topCat.percentage}% of total operating expenses (${formatCurrencyValue(topCat.amount, curr)}). Monitor this category closely for cost-rationalization opportunities.`,
+        });
+      }
+
+      // Generate live AI-powered insights & financial patterns grounded strictly in the organization's dossier
+      let insights: Array<{
+        id: string;
+        type: 'warning' | 'opportunity' | 'success' | 'info';
+        category: string;
+        title: string;
+        description: string;
+        impact: 'high' | 'medium' | 'low';
+        actionable: boolean;
+        recommendation?: string;
+      }> = fallbackInsights;
+      let patterns = fallbackPatterns;
+      let generatedByAI = false;
+
+      if (dataAvailable) {
+        try {
+          const compactDossier = {
+            organizationName: dossier.organizationName,
+            baseCurrency: curr,
+            allTime: {
+              totalRevenue: dossier.totalRevenue,
+              totalOperatingExpenses: dossier.totalOperatingExpenses,
+              netProfit: dossier.netProfit,
+              profitMarginPercent: dossier.profitMargin,
+              activeMonths: activeMonthCount,
+              verifiedTransactions: dossier.verifiedTransactionCount,
+            },
+            liquidity: {
+              totalLiquidCash: dossier.totalLiquidCash,
+              monthlyBurnRate: dossier.monthlyBurnRate,
+              runwayMonths: dossier.runwayMonths,
+              ownerDrawingsRatioPercent: dossier.ownerDrawingsRatio,
+            },
+            currentMonth: dossier.currentMonth,
+            priorMonth: dossier.priorMonth,
+            momVariance: {
+              revenueDelta: dossier.momVariance.revenueDelta,
+              revenueDeltaPercent: dossier.momVariance.revenueDeltaPercent,
+              expenseDelta: dossier.momVariance.expenseDelta,
+              expenseDeltaPercent: dossier.momVariance.expenseDeltaPercent,
+              profitDelta: dossier.momVariance.profitDelta,
+              profitDeltaPercent: dossier.momVariance.profitDeltaPercent,
+              topExpenseIncreaseDrivers: dossier.momVariance.topExpenseIncreaseDrivers.slice(0, 3),
+              topExpenseDecreaseDrivers: dossier.momVariance.topExpenseDecreaseDrivers.slice(0, 3),
+            },
+            profitVelocity: dossier.profitVelocity,
+            unbilledQuotedPipeline: dossier.totalQuotedPipeline,
+            topExpensesByCategory: dossier.expensesByCategory.slice(0, 6),
+            departments: dossier.departments.map((d) => ({
+              name: d.name,
+              headcount: d.headcount,
+              capacityHours: d.capacityHours,
+              directLaborCost: d.directLaborCost,
+              allocatedOverhead: d.allocatedOverhead,
+              fullLoadedCost: d.fullLoadedCost,
+              costPerHour: d.costPerHour,
+              revenue: d.revenue,
+              operatingProfit: d.operatingProfit,
+              marginPercent: d.marginPercent,
+            })),
+            projects: dossier.projects.slice(0, 8).map((p) => ({
+              name: p.name,
+              clientName: p.clientName,
+              status: p.status,
+              quotedAmount: p.quotedAmount,
+              recognizedRevenue: p.recognizedRevenue,
+              unbilledQuotedValue: Math.max(0, p.quotedAmount - p.recognizedRevenue),
+              totalBurn: p.totalBurn,
+              operatingProfit: p.operatingProfit,
+              marginPercent: p.marginPercent,
+            })),
+            budgetsAtRisk: dossier.budgets
+              .filter((b) => b.utilizationPercent >= 80)
+              .slice(0, 5)
+              .map((b) => ({
+                category: b.categoryName,
+                department: b.departmentName,
+                budgeted: b.budgetedAmount,
+                spent: b.actualSpent,
+                utilizationPercent: b.utilizationPercent,
+                status: b.status,
+              })),
+            pendingReview: {
+              count: dossier.pendingReviewCount,
+              amount: dossier.pendingReviewAmount,
+            },
+            activeRecurringCount: dossier.activeRecurringCount,
+          };
+
+          const analysisPrompt = [
+            `You are an institutional CFO financial intelligence engine analyzing live ledger data for "${dossier.organizationName}".`,
+            `Return ONLY valid JSON with the exact shape: { "insights": [...], "patterns": [...] }.`,
+            ``,
+            `STRICT ACCURACY & GROUNDING RULES:`,
+            `1. Every single dollar figure, percentage, day count, department name, project name, and category name MUST come directly from ORGANIZATION_FINANCIAL_DATA below. NEVER invent, guess, or contradict any number.`,
+            `2. Use currency "${curr}" consistently when formatting amounts (e.g. "${formatCurrencyValue(12500, curr)}").`,
+            `3. Respect Accounting Invariants: unbilledQuotedPipeline / quotedAmount is NOT recognized revenue until billed.`,
+            `4. Generate 3 to 5 high-impact "insights" prioritized by financial materiality (e.g., unbilled project WIP/quotes, department unit economics & pricing floors, top expense concentration, MoM anomalies, pending review items, or runway/drawings discipline).`,
+            `5. For EVERY insight: "description" MUST state the observed financial fact/metric (1-2 sentences), and "recommendation" MUST state a distinct, concrete next action (1-2 sentences). NEVER repeat or copy "description" into "recommendation".`,
+            `6. Generate 3 to 4 "patterns" capturing real recurring rhythms/trends in the data (e.g., Profit Generation Velocity over the exact tracked business days, Unbilled Quoted Pipeline, MoM Revenue/Expense trajectory, Expense Concentration, or Department Cost Structure).`,
+            ``,
+            `JSON SCHEMA:`,
+            `{`,
+            `  "insights": [`,
+            `    {`,
+            `      "id": "string (kebab-case unique id)",`,
+            `      "type": "warning" | "opportunity" | "success" | "info",`,
+            `      "category": "SHORT UPPERCASE LABEL (e.g. REVENUE ACCELERATION, BURN REDUCTION, DEPARTMENT PRICING, PROJECT MARGIN)",`,
+            `      "title": "Concise action-oriented title (4-8 words)",`,
+            `      "description": "Observed financial metric/finding from the data (1-2 sentences)",`,
+            `      "impact": "high" | "medium" | "low",`,
+            `      "actionable": true,`,
+            `      "recommendation": "Distinct concrete CFO action step with quantified impact (1-2 sentences)"`,
+            `    }`,
+            `  ],`,
+            `  "patterns": [`,
+            `    {`,
+            `      "id": "string (kebab-case unique id)",`,
+            `      "pattern": "Short pattern name (3-6 words)",`,
+            `      "frequency": "Short cadence label (e.g. Daily business pace, Monthly P&L cycle, Project billing cycles)",`,
+            `      "trend": "increasing" | "decreasing" | "stable",`,
+            `      "suggestion": "1-2 sentence data-backed observation and actionable takeaway using exact figures from the data"`,
+            `    }`,
+            `  ]`,
+            `}`,
+            ``,
+            `ORGANIZATION_FINANCIAL_DATA:`,
+            JSON.stringify(compactDossier),
+          ].join('\n');
+
+          type AIAnalysisJSON = {
+            insights?: Array<Record<string, any>>;
+            patterns?: Array<Record<string, any>>;
+          };
+
+          const aiResult = await executeAIJSON<AIAnalysisJSON>(orgId, {
+            prompt: analysisPrompt,
+            temperature: 0.2,
+            maxTokens: 2048,
+            timeoutMs: 18000,
+            portalType: 'organization',
+            featureArea: 'copilot_analysis',
+          });
+
+          const allowedTypes = new Set(['warning', 'opportunity', 'success', 'info']);
+          const allowedImpacts = new Set(['high', 'medium', 'low']);
+          const allowedTrends = new Set(['increasing', 'decreasing', 'stable']);
+
+          const rawInsights = Array.isArray(aiResult.data?.insights) ? aiResult.data.insights : [];
+          const parsedInsights = rawInsights
+            .map((item, idx) => {
+              const title = String(item?.title || '').trim();
+              const description = String(item?.description || '').trim();
+              let recommendation = String(item?.recommendation || '').trim();
+              if (!title || !description) return null;
+              if (!recommendation || recommendation.toLowerCase() === description.toLowerCase()) {
+                recommendation = `Take immediate action on ${title.toLowerCase()} and track progress in next month's review.`;
+              }
+              const rawType = String(item?.type || 'info').toLowerCase();
+              const rawImpact = String(item?.impact || 'medium').toLowerCase();
+              return {
+                id: String(item?.id || `ai-insight-${idx + 1}`).trim(),
+                type: (allowedTypes.has(rawType) ? rawType : 'info') as 'warning' | 'opportunity' | 'success' | 'info',
+                category: String(item?.category || 'FINANCIAL INTELLIGENCE').trim().toUpperCase(),
+                title,
+                description,
+                impact: (allowedImpacts.has(rawImpact) ? rawImpact : 'medium') as 'high' | 'medium' | 'low',
+                actionable: item?.actionable !== false,
+                recommendation,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null)
+            .slice(0, 6);
+
+          const rawPatterns = Array.isArray(aiResult.data?.patterns) ? aiResult.data.patterns : [];
+          const parsedPatterns = rawPatterns
+            .map((item, idx) => {
+              const pattern = String(item?.pattern || '').trim();
+              const frequency = String(item?.frequency || 'Ongoing').trim();
+              const suggestion = String(item?.suggestion || '').trim();
+              if (!pattern || !suggestion) return null;
+              const rawTrend = String(item?.trend || 'stable').toLowerCase();
+              return {
+                id: String(item?.id || `ai-pattern-${idx + 1}`).trim(),
+                pattern,
+                frequency,
+                trend: (allowedTrends.has(rawTrend) ? rawTrend : 'stable') as 'increasing' | 'decreasing' | 'stable',
+                suggestion,
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => x !== null)
+            .slice(0, 5);
+
+          if (parsedInsights.length > 0) {
+            insights = parsedInsights;
+            generatedByAI = true;
+          }
+          if (parsedPatterns.length > 0) {
+            patterns = parsedPatterns;
+            generatedByAI = true;
+          }
+        } catch (aiErr: any) {
+          console.warn(
+            `[AI-Assistant] Live AI analysis enrichment fell back to deterministic dossier for Org "${orgId}": ${aiErr?.message || aiErr}`
+          );
+        }
+      }
+
+      const payload = {
         situation,
         projections,
         insights,
         patterns,
-        dataAvailable: dossier.verifiedTransactionCount > 0 || dossier.projects.length > 0,
+        dataAvailable,
+        generatedByAI,
+      };
+
+      analysisCache.set(cacheKey, {
+        expiresAt: Date.now() + (generatedByAI ? ANALYSIS_AI_CACHE_TTL_MS : ANALYSIS_FALLBACK_CACHE_TTL_MS),
+        payload,
       });
+
+      return payload;
+    };
+
+    const runPromise = computeAnalysis();
+    analysisInFlight.set(cacheKey, runPromise);
+
+    try {
+      const payload = await runPromise;
+      return ok(res, payload);
     } catch (err: any) {
       console.error('[ai-assistant] Analysis generation error:', err);
       return fail(res, 500, 'Failed to generate financial analysis.');
+    } finally {
+      if (analysisInFlight.get(cacheKey) === runPromise) {
+        analysisInFlight.delete(cacheKey);
+      }
     }
   });
 

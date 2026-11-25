@@ -226,6 +226,112 @@ function formatLearningContextBlock(ctx?: OrgLearningContext): string {
   return sections.length > 0 ? `\n\n${sections.join('\n\n')}` : '';
 }
 
+const CATCH_ALL_CATEGORY_RE = /^(debit\s*purchases?|buffer|general|other|misc(ellaneous)?|uncategorized|expenses?|purchases?|operating\s*expenses?)$/i;
+
+const CANONICAL_INTENT_RULES: Array<{
+  pattern: RegExp;
+  canonicalName: string;
+  existingMatch: RegExp;
+  reason: string;
+}> = [
+  {
+    pattern: /\b(restock|purchase\s*order|po[-\s]?\d+|inventory|low[-\s]?stock|stock\s*replenish|wholesale|merchandise|sku)\b/i,
+    canonicalName: 'Inventory & Stock',
+    existingMatch: /\b(inventory|stock|cogs|cost\s*of\s*goods|merchandise)\b/i,
+    reason: 'Commercial stock/inventory restock purchase order requires dedicated Inventory & Stock tracking',
+  },
+  {
+    pattern: /\b(laptop|macbook|monitor|workstation|server|hardware|equipment|machinery|printer|router)\b/i,
+    canonicalName: 'Equipment & Hardware',
+    existingMatch: /\b(equipment|hardware|it\s*assets?|fixed\s*assets?|computers?)\b/i,
+    reason: 'Hardware/equipment purchase should be tracked separately from generic operating purchases',
+  },
+  {
+    pattern: /\b(electricity|electric\s*bill|water\s*bill|gas\s*bill|internet|broadband|fiber|utility|utilities|wapda|lesco|ke\s*bill|ptcl)\b/i,
+    canonicalName: 'Utilities',
+    existingMatch: /\b(utilit|internet|telecom|power|electricity)\b/i,
+    reason: 'Recurring facility utility/connectivity expense',
+  },
+  {
+    pattern: /\b(bank\s*fee|wire\s*fee|transfer\s*fee|fx\s*fee|service\s*charge|card\s*fee|overdraft|processing\s*fee|stripe\s*fee)\b/i,
+    canonicalName: 'Bank Fees & Charges',
+    existingMatch: /\b(bank\s*fee|charges?|financial\s*fee|payment\s*processing)\b/i,
+    reason: 'Banking or payment processing fee',
+  },
+  {
+    pattern: /\b(legal|attorney|lawyer|audit|chartered\s*accountant|bookkeeping|consulting|advisory|retainer\s*fee)\b/i,
+    canonicalName: 'Professional Services',
+    existingMatch: /\b(professional|legal|consulting|accounting|audit)\b/i,
+    reason: 'External legal, accounting, or advisory professional service',
+  },
+];
+
+/**
+ * Production guard: prevents lightweight fallback models from dumping clearly specialized
+ * commercial transactions (e.g. Inventory Restock POs) into vague catch-all categories
+ * like "Debit Purchases" or "Buffer" when a proper canonical category is missing.
+ */
+function refineCatchAllClassification<T extends {
+  suggestedCategory: string;
+  confidence: number;
+  reasoning: string;
+  alternatives?: CategorySuggestion[];
+  createNewCategory?: boolean;
+  newCategoryName?: string;
+}>(
+  result: T,
+  narration: string,
+  txnType: 'debit' | 'credit',
+  availableCategories: Array<{ id: string; name: string; type: string }>
+): T {
+  if (txnType !== 'debit') return result;
+  if (result.createNewCategory && result.newCategoryName) return result;
+  const chosen = String(result.suggestedCategory || '').trim();
+  if (!CATCH_ALL_CATEGORY_RE.test(chosen)) return result;
+  const baseAlts = Array.isArray(result.alternatives) ? result.alternatives : [];
+
+  for (const rule of CANONICAL_INTENT_RULES) {
+    if (!rule.pattern.test(narration)) continue;
+
+    // 1. Check if org already has a proper matching expense category
+    const existing = availableCategories.find(
+      (c) => String(c.type || '').toLowerCase() !== 'income' && rule.existingMatch.test(c.name)
+    );
+    if (existing) {
+      const nextAlts = [
+        { categoryName: chosen, confidence: Math.min(50, result.confidence), reasoning: 'Generic fallback category' },
+        ...baseAlts.filter((a) => a.categoryName.toLowerCase() !== existing.name.toLowerCase()),
+      ].slice(0, 2);
+      return {
+        ...result,
+        suggestedCategory: existing.name,
+        confidence: Math.max(82, result.confidence),
+        reasoning: rule.reason,
+        alternatives: nextAlts,
+        createNewCategory: false,
+        newCategoryName: undefined,
+      };
+    }
+
+    // 2. Org lacks this canonical category — propose creating it cleanly while keeping the catch-all as an alternative
+    const nextAlts = [
+      { categoryName: chosen, confidence: Math.min(52, result.confidence), reasoning: 'Closest existing generic category' },
+      ...baseAlts.filter((a) => a.categoryName.toLowerCase() !== chosen.toLowerCase()),
+    ].slice(0, 2);
+    return {
+      ...result,
+      suggestedCategory: rule.canonicalName,
+      confidence: Math.max(84, result.confidence),
+      reasoning: rule.reason,
+      alternatives: nextAlts,
+      createNewCategory: true,
+      newCategoryName: rule.canonicalName,
+    };
+  }
+
+  return result;
+}
+
 /**
  * Build system prompt for transaction classification
  */
@@ -247,9 +353,9 @@ ${categoryList}${learningBlock}
 Rules:
 1. Match transaction type (debit=expense, credit=income) with category type.
 ${worldRule}
-3. Understand the FULL commercial intent (e.g., "Purchase: Samsung Mobile (10) - Ref: 002" or "Restock PO" is Inventory / Equipment & Hardware / Cost of Goods Sold — NOT generic shopping).
+3. Understand the FULL commercial intent (e.g., "Purchase: Nokia Mobile - Restock Purchase Order" is Inventory & Stock / Cost of Goods Sold — NOT generic "Debit Purchases" or "Buffer").
 4. Follow Organization Confirmed Rules and Recent Human Corrections whenever the merchant or pattern matches.
-5. Prefer an existing category when it accurately fits. ONLY if NO existing category accurately describes the transaction, set "createNewCategory": true and provide a concise canonical "newCategoryName" (2-4 words).
+5. Prefer an existing SPECIFIC category when it accurately fits. NEVER dump specialized commercial transactions (inventory restock, hardware/equipment, utilities, legal/professional services, bank fees) into vague catch-all categories like "Debit Purchases", "Buffer", "General", "Misc", or "Other" — instead set "createNewCategory": true, provide a concise canonical "newCategoryName" (2-4 words, e.g. "Inventory & Stock"), and put the closest existing category in "alternatives" with lower confidence (<=55).
 6. ALWAYS provide up to 2 sensible "alternatives" from Existing Organization Categories with honest confidence scores and short reasoning.
 7. If Organization Departments are listed, pick the best matching "suggestedDepartment" (or "" if general/shared).
 8. Return honest confidence 0-100 (below 70 if ambiguous). Keep reasoning clear and specific (under 25 words).
@@ -499,16 +605,22 @@ async function callGemini(
         console.warn(`[aiClient] Gemini (${modelName}) returned status ${response.status}`);
         lastError = new Error(`Gemini API error (${response.status}): ${errorText}`);
 
-        if (response.status === 429 || response.status === 503 || response.status === 404) {
-          const retryDelay = response.status === 429 ? parseRetryDelay(errorText) : 120;
+        if (response.status === 429) {
+          const retryDelay = parseRetryDelay(errorText);
           markQuotaExhausted(retryDelay || 120);
           break;
+        }
+        if (response.status === 503 || response.status === 404) {
+          // Transient high-demand spike or unavailable model: step down to next model without freezing quota
+          continue;
         }
         throw lastError;
       }
 
       const data = await response.json();
-      const raw = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+      const parts: Array<{ text?: string; thought?: boolean }> = data.candidates?.[0]?.content?.parts || [];
+      const nonThought = parts.filter((p) => !p.thought && typeof p.text === 'string').map((p) => p.text).join('').trim();
+      const raw = nonThought || parts.map((p) => p.text || '').join('').trim() || '{}';
       const promptTokens = data.usageMetadata?.promptTokenCount || Math.ceil((systemPrompt.length + userPrompt.length) / 4);
       const completionTokens = data.usageMetadata?.candidatesTokenCount || Math.ceil(raw.length / 4);
       const totalTokens = data.usageMetadata?.totalTokenCount || (promptTokens + completionTokens);
@@ -528,11 +640,8 @@ async function callGemini(
     } catch (err: any) {
       lastError = err;
       console.warn(`[aiClient] Gemini attempt with model ${modelName} failed:`, err?.message || err);
-      // On network timeout or 503, set a 60s cooldown to avoid hanging subsequent calls
-      if (!isQuotaExhausted()) {
-        markQuotaExhausted(60);
-      }
-      break;
+      // Try next fallback model instead of triggering a 60s global quota freeze
+      continue;
     }
   }
 
@@ -615,7 +724,7 @@ export async function classifyTransactionWithAI(
     result.usedAI = true;
     result.modelUsed = modelUsed;
 
-    return result;
+    return refineCatchAllClassification(result, input.narration, input.type, input.availableCategories);
   } catch (error) {
     // On failure of ALL AI providers, fall back to local keyword classifier (marked usedAI: false!)
     const localResult = classifyWithKeywords(
@@ -846,9 +955,9 @@ Existing Categories: ${categoryList}${learningBlock}
 Rules:
 1. Match type (exp=expense, inc=income).
 2. ${personalEnabled ? 'Classify world as "business" (company/agency operations, inventory/restock, hardware/equipment, SaaS, payroll, client revenue) or "personal" (groceries, gym, pharmacy, cinema, family, personal shopping/draw).' : 'Always set world="business".'}
-3. Understand FULL meaning (e.g., "Purchase: Samsung Mobile (10)" or "Restock PO" is Inventory / Hardware / Cost of Goods, NOT generic shopping).
+3. Understand FULL meaning (e.g., "Purchase: Nokia Mobile - Restock PO" is Inventory & Stock / Cost of Goods Sold, NOT generic "Debit Purchases" or "Buffer").
 4. Follow Organization Confirmed Rules and Recent Human Corrections when applicable.
-5. Prefer an existing category when it accurately fits. ONLY if NO existing category accurately fits, set createNewCategory:true and newCategoryName:"Concise Name".
+5. Prefer an existing SPECIFIC category when it accurately fits. NEVER dump specialized commercial transactions (inventory/restock POs, hardware/equipment, utilities, legal/professional services, bank fees) into vague catch-all categories like "Debit Purchases", "Buffer", "General", "Misc", or "Other" — instead set createNewCategory:true, newCategoryName:"Canonical Name" (e.g. "Inventory & Stock"), suggestedCategory:"Canonical Name", and place the generic category in "alternatives" with confidence <= 55.
 6. ALWAYS include up to 2 sensible "alternatives" from Existing Categories with confidence and short reasoning.
 7. If Organization Departments are listed, include best matching "suggestedDepartment" (or "").
 8. Honest confidence 35-95. Clear, specific reasoning (<20 words).
@@ -924,7 +1033,8 @@ Return ONLY valid JSON:
                 reasoning: String(a.reasoning || 'Alternative AI suggestion').substring(0, 120),
               }))
           : [];
-        results.set(item.index, {
+        const txnForIdx = allTransactions[item.index];
+        const baseClassified: BatchItemClassification = {
           index: item.index,
           suggestedCategory: String(item.suggestedCategory || newCatName || '').trim(),
           confidence: Math.max(30, Math.min(95, Math.round(Number(item.confidence) || 75))),
@@ -937,7 +1047,11 @@ Return ONLY valid JSON:
           newCategoryName: newCatName,
           usedAI: true,
           modelUsed,
-        });
+        };
+        const refined = txnForIdx
+          ? refineCatchAllClassification(baseClassified, txnForIdx.narration, txnForIdx.type, availableCategories)
+          : baseClassified;
+        results.set(item.index, refined);
       }
     }
 

@@ -2257,8 +2257,9 @@ export function createOrganizationRouter(): Router {
 
     const legacy: any = null;
     const useCustomKey = dbCreds ? Boolean(dbCreds.is_active) : Boolean(legacy?.useCustomKey);
-    const provider = dbCreds?.provider || (legacy?.providerName ? legacy.providerName.toLowerCase() : 'gemini');
-    const providerName = provider === 'openai' ? 'OpenAI' : 'Google Gemini';
+    const rawProvider = String(dbCreds?.provider || (legacy?.providerName ? legacy.providerName.toLowerCase() : 'gemini')).toLowerCase();
+    const provider = rawProvider.includes('openai') && !rawProvider.includes('custom') ? 'openai' : rawProvider.includes('custom') ? 'custom' : 'gemini';
+    const providerName = provider === 'openai' ? 'OpenAI' : provider === 'custom' ? 'Custom OpenAI Compatible' : 'Google Gemini';
     const modelName = dbCreds?.model_name || legacy?.modelName || (provider === 'openai' ? 'gpt-4o-mini' : 'gemini-flash-lite-latest');
     const keyLast4 = dbCreds?.key_last4 || (legacy?.apiKey ? extractLast4(legacy.apiKey) : '');
     const maskedKey = keyLast4 ? `••••••••${keyLast4}` : '';
@@ -2308,12 +2309,17 @@ export function createOrganizationRouter(): Router {
     const rawKey = (body.apiKey || '').trim();
     const isNewKey = rawKey !== '' && !rawKey.includes('•') && !rawKey.includes('…');
 
-    let resolvedProvider = (body.provider || body.providerName || 'gemini').toLowerCase();
-    if (resolvedProvider.includes('openai')) resolvedProvider = 'openai';
+    let resolvedProvider: 'gemini' | 'openai' | 'custom' = 'gemini';
+    const rawProv = String(body.provider || body.providerName || 'gemini').toLowerCase();
+    if (rawProv.includes('custom') || rawProv.includes('compatible')) resolvedProvider = 'custom';
+    else if (rawProv.includes('openai')) resolvedProvider = 'openai';
     else resolvedProvider = 'gemini';
 
-    const resolvedModel = body.modelName?.trim() || (resolvedProvider === 'openai' ? 'gpt-4o-mini' : 'gemini-flash-lite-latest');
+    const resolvedModel = body.modelName?.trim() || (resolvedProvider === 'openai' ? 'gpt-4o-mini' : resolvedProvider === 'custom' ? 'deepseek-chat' : 'gemini-flash-lite-latest');
     const useCustomKey = body.useCustomKey !== undefined ? Boolean(body.useCustomKey) : true;
+
+    let preservedHasKey = false;
+    let preservedMaskedKey = '';
 
     if (sb) {
       try {
@@ -2322,7 +2328,7 @@ export function createOrganizationRouter(): Router {
           const last4 = extractLast4(rawKey);
           const fingerprint = fingerprintKey(rawKey);
 
-          await sb.from('org_ai_credentials').upsert({
+          const { error: upsertErr } = await sb.from('org_ai_credentials').upsert({
             organization_id: orgId,
             provider: resolvedProvider,
             model_name: resolvedModel,
@@ -2335,7 +2341,18 @@ export function createOrganizationRouter(): Router {
             last_tested_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           });
+          if (upsertErr) return fail(res, 500, upsertErr.message);
+          preservedHasKey = true;
+          preservedMaskedKey = maskApiKey(rawKey);
         } else {
+          const { data: existingCred } = await sb
+            .from('org_ai_credentials')
+            .select('key_ciphertext, key_last4')
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          preservedHasKey = Boolean(existingCred?.key_ciphertext);
+          preservedMaskedKey = existingCred?.key_last4 ? `••••••••${existingCred.key_last4}` : '';
+
           const updatePayload: Record<string, any> = {
             is_active: useCustomKey,
             provider: resolvedProvider,
@@ -2343,28 +2360,38 @@ export function createOrganizationRouter(): Router {
             updated_at: new Date().toISOString(),
           };
           if (body.baseUrl !== undefined) updatePayload.base_url = body.baseUrl.trim() || null;
-          await sb.from('org_ai_credentials').update(updatePayload).eq('organization_id', orgId);
+          const { error: updErr } = await sb.from('org_ai_credentials').update(updatePayload).eq('organization_id', orgId);
+          if (updErr) return fail(res, 500, updErr.message);
         }
       } catch (err: any) {
         console.error('[organizations] Supabase org_ai_credentials save error:', err.message);
+        return fail(res, 500, err.message || 'Failed to save AI credentials');
       }
     }
 
     // Invalidate in-memory AI gateway cache
     invalidateOrgAICache(orgId);
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'update_ai_settings',
+      entityType: 'org_ai_credentials',
+      entityId: orgId,
+      description: `Updated org AI settings (provider=${resolvedProvider}, model=${resolvedModel}, active=${useCustomKey})`,
+    }).catch(() => {});
+
     const next: OrgAiIntegrationSettings = {
-      providerName: resolvedProvider === 'openai' ? 'OpenAI' : 'Google Gemini',
+      providerName: resolvedProvider === 'openai' ? 'OpenAI' : resolvedProvider === 'custom' ? 'Custom OpenAI Compatible' : 'Google Gemini',
       modelName: resolvedModel,
-      apiKey: isNewKey ? maskApiKey(rawKey) : '',
+      apiKey: preservedMaskedKey,
       useCustomKey,
     };
 
     ok(res, {
       ...next,
       provider: resolvedProvider,
-      activeSource: useCustomKey ? 'organization' : 'platform',
-      hasApiKey: Boolean(next.apiKey),
+      activeSource: useCustomKey && preservedHasKey ? 'organization' : 'platform',
+      hasApiKey: preservedHasKey,
     }, 'AI connection settings saved securely.');
   });
 
@@ -2377,9 +2404,12 @@ export function createOrganizationRouter(): Router {
       baseUrl?: string;
     };
 
-    let provider = (body.provider || 'gemini').toLowerCase();
-    if (provider.includes('openai')) provider = 'openai';
-    else provider = 'gemini';
+    const rawTestProv = String(body.provider || 'gemini').toLowerCase();
+    let provider = rawTestProv.includes('custom') || rawTestProv.includes('compatible')
+      ? 'custom'
+      : rawTestProv.includes('openai')
+        ? 'openai'
+        : 'gemini';
 
     let modelName = body.modelName?.trim() || (provider === 'openai' ? 'gpt-4o-mini' : 'gemini-flash-lite-latest');
     let apiKey = (body.apiKey || '').trim();
@@ -2435,14 +2465,128 @@ export function createOrganizationRouter(): Router {
     const sb = getSupabaseAdminClient();
     if (sb) {
       try {
-        await sb.from('org_ai_credentials').delete().eq('organization_id', orgId);
+        const { error: delErr } = await sb.from('org_ai_credentials').delete().eq('organization_id', orgId);
+        if (delErr) return fail(res, 500, delErr.message);
       } catch (err: any) {
         console.error('[organizations] Error deleting org_ai_credentials:', err.message);
+        return fail(res, 500, err.message || 'Failed to delete AI credentials');
       }
     }
     invalidateOrgAICache(orgId);
-    // store decommissioned
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'delete_ai_settings',
+      entityType: 'org_ai_credentials',
+      entityId: orgId,
+      description: 'Removed custom organization AI key and reverted to platform default AI',
+    }).catch(() => {});
     ok(res, null, 'Custom AI key removed. Organization reverted to Finance OS default AI.');
+  });
+
+  // ---- §7, §16, §33 #5 Accounting Periods (open / soft_closed / locked) ----
+
+  r.get('/accounting-periods', async (req: Request, res: Response) => {
+    const orgId = paramStr(req.params.organizationId);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const { data, error } = await sb
+      .from('accounting_periods')
+      .select('*')
+      .eq('organization_id', orgId)
+      .order('start_date', { ascending: false });
+
+    if (error) return fail(res, 500, error.message);
+    return ok(res, data || []);
+  });
+
+  r.post('/accounting-periods', ownerOrAdmin, async (req: Request, res: Response) => {
+    const orgId = paramStr(req.params.organizationId);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const { name, startDate, endDate } = req.body as { name?: string; startDate?: string; endDate?: string };
+    if (!startDate || !endDate || !/^\d{4}-\d{2}-\d{2}$/.test(startDate) || !/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+      return fail(res, 400, 'Valid YYYY-MM-DD startDate and endDate are required');
+    }
+    if (startDate > endDate) {
+      return fail(res, 400, 'startDate must be on or before endDate');
+    }
+
+    const periodId = `ap-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const { data, error } = await sb
+      .from('accounting_periods')
+      .insert({
+        id: periodId,
+        organization_id: orgId,
+        name: name?.trim() || `${startDate} to ${endDate}`,
+        start_date: startDate,
+        end_date: endDate,
+        status: 'open',
+      })
+      .select()
+      .single();
+
+    if (error) return fail(res, 500, error.message);
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'create_accounting_period',
+      entityType: 'accounting_period',
+      entityId: periodId,
+      description: `Created accounting period ${data.name} (${startDate} to ${endDate})`,
+      afterState: data,
+    }).catch(() => {});
+
+    return created(res, data, 'Accounting period created');
+  });
+
+  r.post('/accounting-periods/:periodId/status', ownerOrAdmin, async (req: Request, res: Response) => {
+    const orgId = paramStr(req.params.organizationId);
+    const periodId = paramStr(req.params.periodId);
+    const sb = getSupabaseAdminClient();
+    if (!sb) return fail(res, 503, 'Database unavailable');
+
+    const { status, reason } = req.body as { status?: string; reason?: string };
+    if (!status || !['open', 'soft_closed', 'locked'].includes(status)) {
+      return fail(res, 400, 'status must be one of: open, soft_closed, locked');
+    }
+
+    const { data: existing, error: fetchErr } = await sb
+      .from('accounting_periods')
+      .select('*')
+      .eq('id', periodId)
+      .eq('organization_id', orgId)
+      .maybeSingle();
+
+    if (fetchErr) return fail(res, 500, fetchErr.message);
+    if (!existing) return notFound(res, 'Accounting period');
+
+    if (status === 'open' && existing.status !== 'open' && !reason?.trim()) {
+      return fail(res, 400, 'Reopening a closed or locked accounting period requires an explicit reason (§16)');
+    }
+
+    const { data: updated, error: updErr } = await sb
+      .from('accounting_periods')
+      .update({ status })
+      .eq('id', periodId)
+      .eq('organization_id', orgId)
+      .select()
+      .single();
+
+    if (updErr) return fail(res, 500, updErr.message);
+
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: `accounting_period_${status}`,
+      entityType: 'accounting_period',
+      entityId: periodId,
+      description: `Changed accounting period ${existing.name || periodId} from ${existing.status} to ${status}${reason ? ` (Reason: ${reason.trim()})` : ''}`,
+      beforeState: existing,
+      afterState: updated,
+    }).catch(() => {});
+
+    return ok(res, updated, `Accounting period marked as ${status}`);
   });
 
   return r;

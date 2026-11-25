@@ -213,48 +213,12 @@ export function WhatIfSimulator() {
     }
   };
 
-  const handleAIParse = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!baseline || !aiPrompt.trim()) return;
-    setAiParsing(true);
-    setAiRationale(null);
-    try {
-      const res = await simulatorSvc.parseScenarioWithAI(aiPrompt.trim(), baseline);
-      if (res.success && res.data?.scenario) {
-        const s = res.data.scenario;
-        setCurrentScenario({
-          name: s.name,
-          revenueChangePct: s.revenueChangePct,
-          expenseChangePct: s.expenseChangePct,
-          priceIncreasePct: s.priceIncreasePct,
-          utilizationRatePct: s.utilizationRatePct,
-          newHires: s.newHires,
-          avgSalary: s.avgSalary || baseline.avgSalary,
-          salaryChangePct: s.salaryChangePct,
-          vendorCostChangePct: s.vendorCostChangePct,
-          fxSensitivityPct: s.fxSensitivityPct,
-        });
-        setAiRationale(res.data.rationale);
-        toast.success(
-          res.data.aiPowered
-            ? `AI modeled "${s.name}" (${res.data.model})`
-            : `Modeled "${s.name}"`
-        );
-      } else {
-        toast.error(res.error || 'Could not parse scenario prompt');
-      }
-    } catch {
-      toast.error('AI scenario modeling failed');
-    } finally {
-      setAiParsing(false);
-    }
-  };
-
-  const handleAIAnalyze = async () => {
-    if (!baseline || !currentImpact) return;
+  const runAnalysisForScenario = async (targetScenario: typeof currentScenario) => {
+    if (!baseline) return;
+    const targetImpact = simulatorSvc.calculateImpact(baseline, targetScenario);
     setAiAnalyzing(true);
     try {
-      const res = await simulatorSvc.analyzeScenarioWithAI(baseline, currentScenario, currentImpact);
+      const res = await simulatorSvc.analyzeScenarioWithAI(baseline, targetScenario, targetImpact);
       if (res.success && res.data) {
         setAiAnalysis(res.data);
         toast.success(
@@ -272,17 +236,66 @@ export function WhatIfSimulator() {
     }
   };
 
+  const handleAIParse = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!baseline || !aiPrompt.trim()) return;
+    setAiParsing(true);
+    setAiRationale(null);
+    setAiAnalysis(null);
+    try {
+      const res = await simulatorSvc.parseScenarioWithAI(aiPrompt.trim(), baseline);
+      if (res.success && res.data?.scenario) {
+        const s = res.data.scenario;
+        const nextScenario = {
+          name: s.name,
+          revenueChangePct: s.revenueChangePct,
+          expenseChangePct: s.expenseChangePct,
+          priceIncreasePct: s.priceIncreasePct,
+          utilizationRatePct: Math.min(95, Math.max(50, s.utilizationRatePct)),
+          newHires: s.newHires,
+          avgSalary: s.avgSalary || baseline.avgSalary,
+          salaryChangePct: s.salaryChangePct,
+          vendorCostChangePct: s.vendorCostChangePct,
+          fxSensitivityPct: s.fxSensitivityPct,
+        };
+        setCurrentScenario(nextScenario);
+        setAiRationale(res.data.rationale);
+        toast.success(
+          res.data.aiPowered
+            ? `AI modeled "${s.name}" (${res.data.model})`
+            : `Modeled "${s.name}"`
+        );
+        // Automatically generate CFO analysis for the newly modeled scenario
+        void runAnalysisForScenario(nextScenario);
+      } else {
+        toast.error(res.error || 'Could not parse scenario prompt');
+      }
+    } catch {
+      toast.error('AI scenario modeling failed');
+    } finally {
+      setAiParsing(false);
+    }
+  };
+
+  const handleAIAnalyze = async () => {
+    if (!baseline || !currentImpact) return;
+    await runAnalysisForScenario(currentScenario);
+  };
+
   const handleLoadScenario = (scenario: WhatIfScenario) => {
-    setCurrentScenario({
+    const nextScenario = {
       name: scenario.name,
       revenueChangePct: scenario.revenueChangePct,
       expenseChangePct: scenario.expenseChangePct,
       newHires: scenario.newHires,
       avgSalary: scenario.avgSalary,
       priceIncreasePct: scenario.priceIncreasePct,
-      utilizationRatePct: scenario.utilizationRatePct,
-    });
+      utilizationRatePct: Math.min(95, Math.max(50, scenario.utilizationRatePct)),
+    };
+    setCurrentScenario(nextScenario);
+    setAiAnalysis(null);
     toast.success(`Loaded scenario: ${scenario.name}`);
+    void runAnalysisForScenario(nextScenario);
   };
 
   const handleDeleteScenario = async (scenarioId: string, scenarioName: string) => {
@@ -307,10 +320,11 @@ export function WhatIfSimulator() {
 
   const applyQuickScenario = (type: 'aggressive' | 'conservative' | 'team-expansion') => {
     const avgSalary = baseline?.avgSalary ?? 45000;
+    let nextScenario: typeof currentScenario;
     
     switch (type) {
       case 'aggressive':
-        setCurrentScenario({
+        nextScenario = {
           name: 'Aggressive Growth',
           revenueChangePct: 30,
           expenseChangePct: 15,
@@ -318,10 +332,10 @@ export function WhatIfSimulator() {
           avgSalary,
           priceIncreasePct: 15,
           utilizationRatePct: 85,
-        });
+        };
         break;
       case 'conservative':
-        setCurrentScenario({
+        nextScenario = {
           name: 'Conservative Growth',
           revenueChangePct: 10,
           expenseChangePct: 5,
@@ -329,10 +343,10 @@ export function WhatIfSimulator() {
           avgSalary,
           priceIncreasePct: 5,
           utilizationRatePct: 80,
-        });
+        };
         break;
       case 'team-expansion':
-        setCurrentScenario({
+        nextScenario = {
           name: 'Team Expansion',
           revenueChangePct: 25,
           expenseChangePct: 20,
@@ -340,10 +354,13 @@ export function WhatIfSimulator() {
           avgSalary,
           priceIncreasePct: 0,
           utilizationRatePct: 75,
-        });
+        };
         break;
     }
-    toast.success('Quick scenario applied');
+    setCurrentScenario(nextScenario);
+    setAiAnalysis(null);
+    toast.success(`Applied "${nextScenario.name}" — running AI CFO analysis...`);
+    void runAnalysisForScenario(nextScenario);
   };
 
   if (!featureFlags.advanced_what_if_simulations) {
@@ -1182,6 +1199,32 @@ export function WhatIfSimulator() {
               {aiAnalysis && (
                 <div className="p-4 rounded-xl bg-slate-950/60 border border-purple-500/25 space-y-3 text-sm">
                   <p className="text-slate-100 leading-relaxed">{aiAnalysis.executiveSummary}</p>
+                  {aiAnalysis.scenarioDriversBreakdown && aiAnalysis.scenarioDriversBreakdown.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold text-cyan-400 mb-1">
+                        Scenario Drivers Breakdown
+                      </p>
+                      <ul className="space-y-1 text-xs text-slate-300 list-disc pl-4">
+                        {aiAnalysis.scenarioDriversBreakdown.map((item, i) => <li key={i}>{item}</li>)}
+                      </ul>
+                    </div>
+                  )}
+                  {aiAnalysis.stressTestAnalysis && (
+                    <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800">
+                      <p className="text-xs font-semibold text-purple-300 mb-1">
+                        Stress Test &amp; Sensitivity Outlook
+                      </p>
+                      <p className="text-xs text-slate-300 leading-relaxed">{aiAnalysis.stressTestAnalysis}</p>
+                    </div>
+                  )}
+                  {aiAnalysis.departmentCommentary && (
+                    <div className="p-2.5 rounded-lg bg-slate-900/70 border border-slate-800">
+                      <p className="text-xs font-semibold text-indigo-300 mb-1">
+                        Departmental Cost &amp; Margin Impact
+                      </p>
+                      <p className="text-xs text-slate-300 leading-relaxed">{aiAnalysis.departmentCommentary}</p>
+                    </div>
+                  )}
                   {aiAnalysis.keyRisks.length > 0 && (
                     <div>
                       <p className="text-xs font-semibold text-amber-400 mb-1 flex items-center gap-1">

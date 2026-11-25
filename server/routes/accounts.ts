@@ -7,6 +7,8 @@ import { Router, type Request, type Response } from 'express';
 import type { Account } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -396,7 +398,7 @@ export function createAccountsRouter(): Router {
     return ok(res, mapDbToDomainAccount(data));
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Account, 'id' | 'organizationId' | 'createdAt'>;
     if (!data.name?.trim()) {
@@ -423,10 +425,18 @@ export function createAccountsRouter(): Router {
       return fail(res, 500, error.message);
     }
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'create_chart_account',
+      entityType: 'account',
+      entityId: newId,
+      description: `Created chart account ${newAcc.name} (${newAcc.type})`,
+      afterState: inserted,
+    });
     return created(res, mapDbToDomainAccount(inserted), 'Account created');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const updates = req.body as Partial<Account>;
 
@@ -457,10 +467,18 @@ export function createAccountsRouter(): Router {
     }
 
     if (!data) return notFound(res, 'Account');
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'update_chart_account',
+      entityType: 'account',
+      entityId: String(req.params.id),
+      description: `Updated chart account ${data.name || req.params.id}`,
+      afterState: data,
+    });
     return ok(res, mapDbToDomainAccount(data));
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -486,6 +504,13 @@ export function createAccountsRouter(): Router {
       return fail(res, 500, error.message);
     }
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'delete_chart_account',
+      entityType: 'account',
+      entityId: String(req.params.id),
+      description: `Deleted chart account ${req.params.id}`,
+    });
     return ok(res, null, 'Account deleted');
   });
 

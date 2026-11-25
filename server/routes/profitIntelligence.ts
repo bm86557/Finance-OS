@@ -8,9 +8,12 @@
 import { Router, type Request, type Response } from 'express';
 import { ok, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import { calculateDepartmentProfitability } from './departments.js';
 import { computeOrgProjectsProfitability } from '../services/projectScheduleCostEngine.js';
+import { resolveCostingPeriod, isEligibleBusinessCostingTransaction, isCoveredByDeclaredOverheadPool } from '../services/costingEngine.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -47,184 +50,196 @@ export function createProfitIntelligenceRouter(): Router {
     
     const sb = getSupabaseAdminClient();
     if (sb) {
-      // 1. Fetch configured overhead allocations from Supabase
-      let configuredOverhead = 0;
-      let hasAllocations = false;
+      // 1. Authoritative Supabase calculation aligned 1-to-1 with departments.ts & costingEngine.ts (§12.2, §15, §33 #1, #5, #10, #15)
       try {
-        const [{ data: allocRows }, { data: accRows }] = await Promise.all([
+        const [
+          { data: allocRows },
+          { data: accRows },
+          { data: txns, error: txnErr },
+          { data: categories },
+          { data: orgRow },
+        ] = await Promise.all([
           sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
           sb.from('accounts').select('*').eq('organization_id', orgId),
-        ]);
-        if (allocRows && allocRows.length > 0) {
-          hasAllocations = true;
-          for (const alloc of allocRows) {
-            let pool = Number(alloc.amount || 0);
-            const accountIds = Array.isArray(alloc.account_ids) ? alloc.account_ids : [];
-            if (pool === 0 && accountIds.length > 0 && accRows) {
-              pool = accountIds.reduce((sum: number, accId: string) => {
-                const acc = accRows.find((a: any) => a.id === accId);
-                return sum + Math.abs(Number(acc?.balance || 0));
-              }, 0);
-            }
-            configuredOverhead += pool;
-          }
-        }
-      } catch (allocErr) {
-        console.warn('[profitIntelligence.summary] error fetching overhead allocations:', allocErr);
-      }
-
-      // 2. Try Supabase RPC
-      try {
-        const { data, error } = await sb.rpc('organization_profitability_summary', {
-          p_org: orgId,
-          p_from: fromDate,
-          p_to: toDate
-        });
-        
-        if (!error && data) {
-          const rawRev = data.revenue ?? data.totalRevenue ?? (data as any).total_revenue ?? 0;
-          const rawExp = data.expenses ?? data.totalExpense ?? (data as any).total_expense ?? 0;
-          const rawOverhead = data.overhead ?? data.totalOverhead ?? (data as any).total_overhead ?? 0;
-          const totalRevenue = Number(rawRev || 0);
-          const totalExpense = Number(rawExp || 0);
-          const totalOverhead = hasAllocations ? configuredOverhead : Number(rawOverhead || 0);
-          const totalDirectCost = Math.max(0, totalExpense - totalOverhead);
-          const grossProfit = Number((data as any).gross_profit ?? (totalRevenue - totalDirectCost));
-          const operatingProfit = Number((data as any).net_profit ?? (totalRevenue - totalExpense));
-          const netProfit = operatingProfit;
-          const bDays = countBusinessDays(fromDate, toDate);
-          const velocityAmount = Math.round((operatingProfit / bDays) * 100) / 100;
-
-          return ok(res, {
-            ...data,
-            revenue: totalRevenue,
-            expenses: totalExpense,
-            overhead: totalOverhead,
-            direct_cost: totalDirectCost,
-            gross_profit: grossProfit,
-            net_profit: netProfit,
-            totalRevenue,
-            totalExpense,
-            totalOverhead,
-            totalDirectCost,
-            grossProfit,
-            operatingProfit,
-            netProfit,
-            grossMargin: totalRevenue > 0 ? Math.round((grossProfit / totalRevenue) * 1000) / 10 : 0,
-            netMargin: totalRevenue > 0 ? Math.round((netProfit / totalRevenue) * 1000) / 10 : 0,
-            profitVelocity: {
-              velocityAmount,
-              unit: 'USD/business_day',
-              trailingDays: Math.max(1, Math.round((new Date(toDate).getTime() - new Date(fromDate).getTime()) / 86400000)),
-              businessDays: bDays,
-              currency: 'USD',
-              policyStatus: 'calculated_policy_dependent',
-              basis: 'operating_profit',
-            },
-            policyVersion: 'v1.2-costing',
-          });
-        } else if (error) {
-          console.warn('[profitIntelligence.summary] Supabase RPC failed, querying tables directly:', error.message);
-        }
-      } catch (err) {
-        console.warn('[profitIntelligence.summary] Supabase RPC exception:', err);
-      }
-
-      // 3. Supabase direct table query fallback
-      try {
-        const [{ data: txns, error: txnErr }, { data: categories }, { data: orgRow }] = await Promise.all([
           sb.from('transactions').select('*').eq('organization_id', orgId),
           sb.from('categories').select('*').eq('organization_id', orgId),
           sb.from('organizations').select('currency').eq('id', orgId).maybeSingle(),
         ]);
-        const orgCurrency = orgRow?.currency || 'USD';
 
-        if (!txnErr && txns) {
-          const inRange = txns.filter((t: any) => {
-            const d = t.date ? String(t.date).slice(0, 10) : '';
-            const status = String(t.status || 'classified').toLowerCase();
-            const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
-            const isTransfer = t.is_transfer || t.transfer_group_id || tags.includes('transfer');
-            return d >= fromDate && d <= toDate && !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status) && !isTransfer;
-          });
+        if (txnErr) {
+          console.error('[profitIntelligence.summary] Supabase transactions error:', txnErr.message);
+          return fail(res, 500, txnErr.message);
+        }
 
-          const businessTxns = inRange.filter((t: any) => {
-            const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
-            return t.world_scope === 'business' || tags.includes('business') || (!tags.includes('personal') && t.world_scope !== 'personal');
-          });
+        const orgCurrency = String(orgRow?.currency || 'USD').toUpperCase();
+        const allTxns = txns || [];
+        const eligibleAllTxns = allTxns.filter((t: any) => isEligibleBusinessCostingTransaction(t));
+        const requestedPeriod = typeof req.query.period === 'string' ? req.query.period : undefined;
+        const resolvedPeriod = resolveCostingPeriod({
+          from: requestedPeriod ? undefined : (from || undefined),
+          to: requestedPeriod ? undefined : (to || undefined),
+          period: requestedPeriod,
+          transactions: eligibleAllTxns,
+        });
+        const periodMonths = resolvedPeriod.periodMonths;
+        const effectiveFrom = resolvedPeriod.fromDate;
+        const effectiveTo = resolvedPeriod.toDate;
 
-          const isLoanRepaymentTxn = (t: any) => {
-            const desc = (t.description || '').toLowerCase();
-            const narr = (t.narration || '').toLowerCase();
-            return (
-              desc.includes('loan repayment') ||
-              (narr.includes('monthly installment') && narr.includes('loan'))
-            );
-          };
+        const activeAllocations = (allocRows || []).filter((a: any) => a.is_operating !== false);
+        const hasAllocations = activeAllocations.length > 0;
+        let monthlyConfiguredOverhead = 0;
+        for (const alloc of activeAllocations) {
+          let pool = Number(alloc.amount || 0);
+          const poolCurrency = String(alloc.currency || orgCurrency).toUpperCase();
+          if (pool > 0) {
+            pool = convertCurrency(pool, poolCurrency, orgCurrency);
+          } else {
+            const accountIds = Array.isArray(alloc.account_ids) ? alloc.account_ids : [];
+            if (accountIds.length > 0 && accRows) {
+              pool = accountIds.reduce((sum: number, accId: string) => {
+                const acc = accRows.find((a: any) => a.id === accId);
+                if (!acc) return sum;
+                return sum + convertCurrency(Math.abs(Number(acc.balance || 0)), String(acc.currency || orgCurrency).toUpperCase(), orgCurrency);
+              }, 0);
+            }
+          }
+          monthlyConfiguredOverhead += pool;
+        }
+        const configuredOverhead = Math.round(monthlyConfiguredOverhead * periodMonths * 100) / 100;
 
-          const totalRevenue = businessTxns
+        const inRange = allTxns.filter((t: any) => {
+          const d = t.date ? String(t.date).slice(0, 10) : '';
+          if (effectiveFrom && d < effectiveFrom) return false;
+          if (effectiveTo && d > effectiveTo) return false;
+          const status = String(t.status || 'classified').toLowerCase();
+          const tags = Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? JSON.parse(t.tags || '[]') : []);
+          const isTransfer = t.is_transfer || t.transfer_group_id || tags.includes('transfer');
+          return !['pending', 'draft', 'rejected', 'reversed', 'cancelled'].includes(status) && !isTransfer;
+        });
+
+        const businessTxns = inRange.filter((t: any) => isEligibleBusinessCostingTransaction(t, effectiveFrom, effectiveTo));
+        const catMap = new Map((categories || []).map((c: any) => [String(c.id), c]));
+
+        const isLoanRepaymentTxn = (t: any) => {
+          const desc = (t.description || '').toLowerCase();
+          const narr = (t.narration || '').toLowerCase();
+          return (
+            desc.includes('loan repayment') ||
+            (narr.includes('monthly installment') && narr.includes('loan'))
+          );
+        };
+
+        const totalRevenue = Math.round(
+          businessTxns
             .filter((t: any) => t.type === 'credit')
-            .reduce((sum: number, t: any) => sum + convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency), 0);
+            .reduce((sum: number, t: any) => sum + convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency), 0) * 100
+        ) / 100;
 
-          const totalExpense = businessTxns
-            .filter((t: any) => t.type === 'debit' && !isLoanRepaymentTxn(t))
-            .reduce((sum: number, t: any) => sum + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)), 0);
+        const operatingDebits = businessTxns.filter((t: any) => t.type === 'debit' && !isLoanRepaymentTxn(t));
+        const totalExpense = Math.round(
+          operatingDebits.reduce(
+            (sum: number, t: any) => sum + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)),
+            0,
+          ) * 100
+        ) / 100;
 
-          let totalOverhead = configuredOverhead;
-          if (!hasAllocations) {
-            const catMap = new Map((categories || []).map((c: any) => [c.id, c]));
-            totalOverhead = businessTxns
+        let totalOverhead = configuredOverhead;
+        let totalDirectCost = 0;
+
+        if (hasAllocations) {
+          // Anti-double-counting (§33 #10): exclude ledger debits already covered by declared operating overhead pools
+          totalDirectCost = Math.round(
+            operatingDebits
               .filter((t: any) => {
-                if (t.type !== 'debit') return false;
-                const cat = catMap.get(t.category_id);
+                const cat = catMap.get(String(t.category_id || ''));
+                const catName = String(cat?.name || '').toLowerCase();
+                const desc = String(t.description || t.narration || '').toLowerCase();
+                return !isCoveredByDeclaredOverheadPool(catName, desc, activeAllocations);
+              })
+              .reduce(
+                (sum: number, t: any) => sum + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)),
+                0,
+              ) * 100
+          ) / 100;
+        } else {
+          totalOverhead = Math.round(
+            operatingDebits
+              .filter((t: any) => {
+                const cat = catMap.get(String(t.category_id || ''));
                 return cat?.account_id?.includes('operating-expense') || t.account_id?.includes('operating-expense');
               })
-              .reduce((sum: number, t: any) => sum + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)), 0);
-          }
-
+              .reduce(
+                (sum: number, t: any) => sum + Math.abs(convertCurrency(Number(t.amount || 0), t.currency || orgCurrency, orgCurrency)),
+                0,
+              ) * 100
+          ) / 100;
           if (totalOverhead > totalExpense && totalExpense > 0) {
             totalOverhead = totalExpense;
           }
-
-          const totalDirectCost = Math.max(0, totalExpense - totalOverhead);
-          const grossProfit = totalRevenue - totalDirectCost;
-          const operatingProfit = totalRevenue - totalExpense;
-          const netProfit = operatingProfit;
-          const bDays = countBusinessDays(fromDate, toDate);
-          const velocityAmount = Math.round((operatingProfit / bDays) * 100) / 100;
-
-          return ok(res, {
-            totalRevenue,
-            totalExpense,
-            totalOverhead,
-            totalDirectCost,
-            grossProfit,
-            operatingProfit,
-            netProfit,
-            profitVelocity: {
-              velocityAmount,
-              unit: `${orgCurrency}/business_day`,
-              trailingDays: Math.max(1, Math.round((new Date(toDate).getTime() - new Date(fromDate).getTime()) / 86400000)),
-              businessDays: bDays,
-              currency: orgCurrency,
-              policyStatus: 'calculated_policy_dependent',
-              basis: 'operating_profit',
-            },
-            policyVersion: 'v1.2-costing',
-            businessTransactions: businessTxns.length,
-            personalTransactions: inRange.filter((t: any) => {
-              const tags = Array.isArray(t.tags) ? t.tags : [];
-              return tags.includes('personal');
-            }).length,
-            untaggedTransactions: inRange.filter((t: any) => {
-              const tags = Array.isArray(t.tags) ? t.tags : [];
-              return !tags.includes('business') && !tags.includes('personal');
-            }).length,
-            assignedToDepartments: inRange.filter((t: any) => t.department_id || t.departmentId).length,
-            assignedToProjects: inRange.filter((t: any) => t.project_id || t.projectId).length,
-            unassignedTransactions: inRange.filter((t: any) => !t.department_id && !t.departmentId && !t.project_id && !t.projectId).length,
-          });
+          totalDirectCost = Math.round(Math.max(0, totalExpense - totalOverhead) * 100) / 100;
         }
+
+        // Strict accounting reconciliation (§15 L788, §33 #1, #15):
+        // Gross Profit = Revenue - Direct Costs
+        // Operating Profit (Management) = Gross Profit - Total Overhead
+        // Booked Net Profit (Ledger) = Revenue - Actual Ledger Expenses
+        const grossProfit = Math.round((totalRevenue - totalDirectCost) * 100) / 100;
+        const operatingProfit = Math.round((grossProfit - totalOverhead) * 100) / 100;
+        const bookedNetProfit = Math.round((totalRevenue - totalExpense) * 100) / 100;
+        const netProfit = operatingProfit;
+
+        const txnDates = businessTxns
+          .map((t: any) => String(t.date || '').slice(0, 10))
+          .filter((d: string) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+          .sort();
+        const effectiveVelFrom = effectiveFrom || txnDates[0] || new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+        const effectiveVelTo = effectiveTo || txnDates[txnDates.length - 1] || new Date().toISOString().slice(0, 10);
+        const bDays = countBusinessDays(effectiveVelFrom, effectiveVelTo);
+        const velocityAmount = Math.round((operatingProfit / bDays) * 100) / 100;
+
+        return ok(res, {
+          revenue: totalRevenue,
+          expenses: totalExpense,
+          overhead: totalOverhead,
+          direct_cost: totalDirectCost,
+          gross_profit: grossProfit,
+          net_profit: netProfit,
+          totalRevenue,
+          totalExpense,
+          totalOverhead,
+          totalDirectCost,
+          grossProfit,
+          operatingProfit,
+          bookedNetProfit,
+          netProfit,
+          periodMonths,
+          periodLabel: resolvedPeriod.periodLabel,
+          grossMargin: totalRevenue > 0 ? Math.round((grossProfit / totalRevenue) * 1000) / 10 : 0,
+          netMargin: totalRevenue > 0 ? Math.round((netProfit / totalRevenue) * 1000) / 10 : 0,
+          profitVelocity: {
+            velocityAmount,
+            dailyVelocity: velocityAmount,
+            unit: `${orgCurrency}/business_day`,
+            trailingDays: Math.max(1, Math.round((new Date(effectiveVelTo).getTime() - new Date(effectiveVelFrom).getTime()) / 86400000)),
+            businessDays: bDays,
+            currency: orgCurrency,
+            policyStatus: 'calculated_policy_dependent',
+            basis: 'operating_profit',
+          },
+          policyVersion: 'v1.2-costing',
+          businessTransactions: businessTxns.length,
+          personalTransactions: inRange.filter((t: any) => {
+            const tags = Array.isArray(t.tags) ? t.tags : [];
+            return tags.includes('personal') || t.world_scope === 'personal';
+          }).length,
+          untaggedTransactions: inRange.filter((t: any) => {
+            const tags = Array.isArray(t.tags) ? t.tags : [];
+            return !tags.includes('business') && !tags.includes('personal') && !t.world_scope;
+          }).length,
+          assignedToDepartments: inRange.filter((t: any) => t.department_id || t.departmentId).length,
+          assignedToProjects: inRange.filter((t: any) => t.project_id || t.projectId).length,
+          unassignedTransactions: inRange.filter((t: any) => !t.department_id && !t.departmentId && !t.project_id && !t.projectId).length,
+        });
       } catch (tableErr) {
         console.error('[profitIntelligence.summary] Supabase table calculation error:', tableErr);
       }
@@ -582,6 +597,14 @@ export function createProfitIntelligenceRouter(): Router {
       });
 
       await Promise.all(updatePromises);
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'update_space_allocations',
+        entityType: 'department_space_allocation',
+        entityId: orgId,
+        description: `Updated space allocations for ${allocations.length} department(s)`,
+        afterState: { updated: allocations.length },
+      });
       return ok(res, { updated: allocations.length }, 'Space allocations updated successfully');
     } catch (err: any) {
       console.error('[profitIntelligence.space-allocations] Error:', err);
@@ -589,8 +612,8 @@ export function createProfitIntelligenceRouter(): Router {
     }
   };
 
-  r.patch('/space-allocations', handleSpaceAllocationsUpdate);
-  r.post('/space-allocations', handleSpaceAllocationsUpdate);
+  r.patch('/space-allocations', requirePermission('finance:write_transactions'), handleSpaceAllocationsUpdate);
+  r.post('/space-allocations', requirePermission('finance:write_transactions'), handleSpaceAllocationsUpdate);
 
   // GET /worker-labor-costs - Worker loaded labor cost & fixed 160h/month schedule capacity (§12.1)
   r.get('/worker-labor-costs', async (req: Request, res: Response) => {
@@ -741,7 +764,7 @@ export function createProfitIntelligenceRouter(): Router {
   });
 
   // POST /snapshots - Record an immutable profitability run snapshot (§12.7)
-  r.post('/snapshots', async (req: Request, res: Response) => {
+  r.post('/snapshots', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -778,6 +801,13 @@ export function createProfitIntelligenceRouter(): Router {
         return ok(res, { ...newSnapshot, warning: 'Persisted in local memory fallback' });
       }
 
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'create_profit_snapshot',
+        entityType: 'profitability_snapshot',
+        entityId: snapId,
+        description: `Recorded profitability snapshot ${snapId} (${periodStart} to ${periodEnd})`,
+      });
       return ok(res, data);
     } catch (err) {
       console.error('[profitIntelligence.createSnapshot] Error:', err);

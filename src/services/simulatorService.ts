@@ -104,6 +104,8 @@ export interface SimulatorAIAnalysis {
   model: string;
   executiveSummary: string;
   riskLevel: 'low' | 'moderate' | 'high';
+  scenarioDriversBreakdown?: string[];
+  stressTestAnalysis?: string;
   keyRisks: string[];
   optimizationLevers: string[];
   departmentCommentary: string;
@@ -697,9 +699,8 @@ export function createSimulatorService(organizationId: string) {
       const revenueFromPrice = revenueFromVol * (1 + priceIncreasePct / 100);
       const revenueFromRate = revenueFromPrice * (1 + billingRateChangePct / 100);
       const revenueFromHours = revenueFromRate * (1 + hoursChangePct / 100);
-      const revenueFromUtil = baseline.utilizationRate > 0 
-        ? revenueFromHours * (utilizationRatePct / baseline.utilizationRate)
-        : revenueFromHours;
+      const effectiveBaselineUtil = Math.max(50, baseline.utilizationRate || 75);
+      const revenueFromUtil = revenueFromHours * (utilizationRatePct / effectiveBaselineUtil);
       const revenueFromFx = revenueFromUtil * (1 + fxSensitivityPct / 100);
       const projectedRevenue = Math.round(revenueFromFx);
 

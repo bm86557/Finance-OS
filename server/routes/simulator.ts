@@ -66,6 +66,8 @@ export const APPROVED_SNAPSHOTS: Record<string, {
 import { Router, type Request, type Response } from 'express';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import { getGlobalPlatformSettings } from './platformSettings.js';
 import { convertCurrency } from '../lib/fxConverter.js';
 import { executeAIJSON } from '../lib/aiGateway.js';
@@ -304,15 +306,53 @@ export function createSimulatorRouter(): Router {
         .select('id, name')
         .eq('organization_id', orgId);
 
+      // 4. Current active team and average salary (use select('*') to avoid schema drift across orgs)
+      const { data: members } = await sb
+        .from('organization_members')
+        .select('*')
+        .eq('organization_id', orgId)
+        .neq('status', 'suspended');
+
+      const currentTeam = members?.length || 0;
+      let totalSalary = 0;
+      let salariedCount = 0;
+      const deptSalaryMap = new Map<string, number>();
       const activeDepts = deptRows || [];
+
+      for (const m of (members || [])) {
+        const sal = Number(m.fixed_salary || m.salary || 0);
+        if (sal > 0) {
+          salariedCount++;
+          const sCurr = String(m.salary_currency || orgCurrency).toUpperCase();
+          const convSal = convertCurrency(sal, sCurr, orgCurrency);
+          totalSalary += convSal;
+          const matchedDept = activeDepts.find(
+            (d: any) =>
+              (m.department_id && String(d.id) === String(m.department_id)) ||
+              (m.department && String(d.name || '').toLowerCase() === String(m.department).toLowerCase()),
+          );
+          if (matchedDept) {
+            const dId = String(matchedDept.id);
+            deptSalaryMap.set(dId, (deptSalaryMap.get(dId) || 0) + convSal * effectiveMonths);
+          }
+        }
+      }
+      const avgSalary = salariedCount > 0 ? Math.round(totalSalary / salariedCount) : 0;
+
       const totalAttributedRev = Array.from(deptRevMap.values()).reduce((s, v) => s + v, 0);
-      const totalAttributedExp = Array.from(deptExpMap.values()).reduce((s, v) => s + v, 0);
+      const deptCombinedCostMap = new Map<string, number>();
+      for (const d of activeDepts) {
+        const dId = String(d.id);
+        const combined = (deptExpMap.get(dId) || 0) + (deptSalaryMap.get(dId) || 0);
+        deptCombinedCostMap.set(dId, combined);
+      }
+      const totalAttributedExp = Array.from(deptCombinedCostMap.values()).reduce((s, v) => s + v, 0);
       const equalShare = activeDepts.length > 0 ? 1 / activeDepts.length : 1;
 
       const departments: DepartmentShare[] = activeDepts.map((d: any) => {
         const dId = String(d.id);
         const rVal = deptRevMap.get(dId) || 0;
-        const eVal = deptExpMap.get(dId) || 0;
+        const eVal = deptCombinedCostMap.get(dId) || 0;
         return {
           id: dId,
           name: String(d.name || 'Department'),
@@ -320,26 +360,6 @@ export function createSimulatorRouter(): Router {
           costShare: totalAttributedExp > 0 ? eVal / totalAttributedExp : equalShare,
         };
       });
-
-      // 4. Current active team and average salary
-      const { data: members } = await sb
-        .from('organization_members')
-        .select('fixed_salary, salary_currency')
-        .eq('organization_id', orgId)
-        .neq('status', 'suspended');
-
-      const currentTeam = members?.length || 0;
-      let totalSalary = 0;
-      let salariedCount = 0;
-      for (const m of (members || [])) {
-        const sal = Number(m.fixed_salary || 0);
-        if (sal > 0) {
-          salariedCount++;
-          const sCurr = String(m.salary_currency || orgCurrency).toUpperCase();
-          totalSalary += convertCurrency(sal, sCurr, orgCurrency);
-        }
-      }
-      const avgSalary = salariedCount > 0 ? Math.round(totalSalary / salariedCount) : 0;
 
       // 5. Utilization rate from trailing 90d scheduled active project allocation (Mon–Fri 160h/mo)
       const { data: simProjects } = await sb
@@ -359,8 +379,13 @@ export function createSimulatorRouter(): Router {
 
       const totalScheduled90dHours = schedResult.projects.reduce((s, p) => s + (p.elapsedHours || 0), 0);
       const capacity90dHours = Math.max(1, currentTeam || 1) * 160 * 3;
-      const utilizationRate = totalScheduled90dHours > 0
-        ? Math.min(100, Math.max(10, Math.round((totalScheduled90dHours / capacity90dHours) * 100)))
+      const rawUtilPct = totalScheduled90dHours > 0
+        ? Math.round((totalScheduled90dHours / capacity90dHours) * 100)
+        : 75;
+      // Align baseline utilization with the simulator slider floor [50, 95] when project time-tracking
+      // covers <25% of org revenue/capacity so utilization scaling cannot cause 10x revenue distortion.
+      const utilizationRate = rawUtilPct >= 25
+        ? Math.min(95, Math.max(50, rawUtilPct))
         : 75;
 
       const monthlyRevenue = Math.round(total90dIncome / effectiveMonths);
@@ -533,10 +558,10 @@ export function createSimulatorRouter(): Router {
    * §14 Governance Invariant: Generates a proposed real-world change requiring an explicit separate workflow.
    * NEVER mutates posted ledger, current salary table, official budget or invoice.
    */
-  r.post('/proposals', (req: Request, res: Response) => {
+  r.post('/proposals', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const body = req.body;
-    const user = (req as any).user;
+    const user = (req as any).authUser || (req as any).user;
     const authorName = user?.name || user?.email || 'Finance Planner';
 
     const proposal = {
@@ -552,6 +577,15 @@ export function createSimulatorRouter(): Router {
       justification: body.justification || 'Generated from non-posting what-if simulation scenario to capture target margins.',
       disclaimer: 'INVARIANT (§14): Simulation outputs are strictly non-posting and produce zero ledger entries, salary changes, or invoice mutations. Execution requires formal multi-signature governance approval.',
     };
+
+    await logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'create_simulation_proposal',
+      entityType: 'simulation_proposal',
+      entityId: proposal.id,
+      description: `Created governance change proposal "${proposal.scenarioName}" (non-posting)`,
+      afterState: proposal,
+    });
 
     return created(res, proposal, 'Formal Change Proposal generated for governance workflow');
   });
@@ -652,7 +686,7 @@ export function createSimulatorRouter(): Router {
    * POST /organizations/:organizationId/simulator/scenarios
    * Persists a new scenario directly into Supabase public.what_if_scenarios (§14)
    */
-  r.post('/scenarios', async (req: Request, res: Response) => {
+  r.post('/scenarios', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return res.status(503).json({ success: false, error: 'Database connection not available' });
@@ -745,7 +779,7 @@ export function createSimulatorRouter(): Router {
   /**
    * PUT /organizations/:organizationId/simulator/scenarios/:id
    */
-  r.put('/scenarios/:id', async (req: Request, res: Response) => {
+  r.put('/scenarios/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const scenarioId = req.params.id;
     const sb = getSupabaseAdminClient();
@@ -786,7 +820,7 @@ export function createSimulatorRouter(): Router {
   /**
    * DELETE /organizations/:organizationId/simulator/scenarios/:id
    */
-  r.delete('/scenarios/:id', async (req: Request, res: Response) => {
+  r.delete('/scenarios/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const scenarioId = req.params.id;
     const sb = getSupabaseAdminClient();
@@ -909,35 +943,111 @@ Translate this request into exact hypothetical scenario parameters. Return ONLY 
     const { baseline = {}, scenario = {}, impact = {} } = req.body || {};
     const currency = baseline.currency || 'USD';
 
+    const baseRev = Number(baseline.monthlyRevenue ?? 0);
+    const baseExp = Number(baseline.monthlyExpense ?? 0);
+    const baseProfit = baseRev - baseExp;
+    const baseMargin = baseRev > 0 ? Math.round((baseProfit / baseRev) * 1000) / 10 : 0;
+    const deptBreakdown = Array.isArray(impact.departmentImpact)
+      ? impact.departmentImpact.map((d: any) => ({
+          department: d.departmentName,
+          baselineCost: d.baselineCost,
+          scenarioCost: d.scenarioCost,
+          costDelta: d.costDelta,
+          scenarioProfit: d.scenarioProfit,
+          baselineMarginPct: d.baselineMargin,
+          scenarioMarginPct: d.scenarioMargin,
+        }))
+      : [];
+    const formatRunwayLabel = (burn: number, months: number) =>
+      burn <= 0 || months >= 999 ? 'Cash Generative (net positive, no cash burn)' : `${months} months`;
+
+    const runwayLabel = formatRunwayLabel(Number(impact.monthlyBurnRate ?? 0), Number(impact.runwayMonths ?? 999));
+
+    const uncertaintySummary = impact.uncertainty
+      ? {
+          stressDownside: {
+            ...impact.uncertainty.stressCase,
+            runwayStatus: formatRunwayLabel(
+              impact.uncertainty.stressCase?.profit < 0 ? Math.abs(impact.uncertainty.stressCase.profit) : 0,
+              Number(impact.uncertainty.stressCase?.runwayMonths ?? 999),
+            ),
+            runwayMonths: undefined,
+          },
+          expectedPlan: {
+            ...impact.uncertainty.expectedCase,
+            runwayStatus: formatRunwayLabel(
+              impact.uncertainty.expectedCase?.profit < 0 ? Math.abs(impact.uncertainty.expectedCase.profit) : 0,
+              Number(impact.uncertainty.expectedCase?.runwayMonths ?? 999),
+            ),
+            runwayMonths: undefined,
+          },
+          bullUpside: {
+            ...impact.uncertainty.bullCase,
+            runwayStatus: formatRunwayLabel(
+              impact.uncertainty.bullCase?.profit < 0 ? Math.abs(impact.uncertainty.bullCase.profit) : 0,
+              Number(impact.uncertainty.bullCase?.runwayMonths ?? 999),
+            ),
+            runwayMonths: undefined,
+          },
+        }
+      : null;
+
     try {
-      const aiPrompt = `You are a Chief Financial Officer (CFO) AI analyzing a non-posting What-If Financial Simulation (Handoff §14).
+      const aiPrompt = `You are a Chief Financial Officer (CFO) AI delivering a detailed, board-ready analysis of a non-posting What-If Financial Simulation (Handoff §14).
+
 Organization Baseline (${currency}/month):
-- Baseline Revenue: ${baseline.monthlyRevenue ?? 0}, Baseline Expense: ${baseline.monthlyExpense ?? 0}
-- Baseline Team: ${baseline.currentTeam ?? 1}, Liquid Cash: ${baseline.liquidCash ?? 0}
+- Baseline Revenue: ${baseRev}, Baseline Expense: ${baseExp}, Baseline Profit: ${baseProfit} (${baseMargin}% margin)
+- Baseline Team: ${baseline.currentTeam ?? 1} (Avg Salary: ${baseline.avgSalary ?? 0}/mo), Baseline Utilization: ${baseline.utilizationRate ?? 75}%
+- Liquid Cash Reserve: ${baseline.liquidCash ?? 0}
 
 Scenario Inputs ("${scenario.name || 'Custom Scenario'}"):
-- Revenue Change: ${scenario.revenueChangePct ?? 0}%, Price Increase: ${scenario.priceIncreasePct ?? 0}%, Utilization: ${scenario.utilizationRatePct ?? 75}%
+- Revenue Change: ${scenario.revenueChangePct ?? 0}%, Price Increase: ${scenario.priceIncreasePct ?? 0}%, Utilization Target: ${scenario.utilizationRatePct ?? 75}%
 - Expense Change: ${scenario.expenseChangePct ?? 0}%, New Hires: ${scenario.newHires ?? 0} @ ${scenario.avgSalary ?? 0}/mo
-- Salary Shift: ${scenario.salaryChangePct ?? 0}%, Vendor Cost Shift: ${scenario.vendorCostChangePct ?? 0}%, FX Sensitivity: ${scenario.fxSensitivityPct ?? 0}%
+- Salary Shift: ${scenario.salaryChangePct ?? 0}%, Billing Rate Shift: ${scenario.billingRateChangePct ?? 0}%, Hours Shift: ${scenario.hoursChangePct ?? 0}%
+- Occupancy Cost Shift: ${scenario.occupancyCostPct ?? 0}%, Vendor Cost Shift: ${scenario.vendorCostChangePct ?? 0}%, FX Sensitivity: ${scenario.fxSensitivityPct ?? 0}%
 
-Computed Scenario Output:
-- Projected Revenue: ${impact.revenue ?? 0}, Projected Expense: ${impact.expense ?? 0}, Projected Profit: ${impact.profit ?? 0}
-- Margin: ${impact.margin ?? 0}%, Break-Even Revenue: ${impact.breakEvenRevenue ?? 0}, Coverage Ratio: ${impact.coverageRatio ?? 0}x
-- Monthly Burn Rate: ${impact.monthlyBurnRate ?? 0}, Cash Runway: ${impact.runwayMonths ?? 999} months
+Computed Scenario Output (${currency}/month):
+- Projected Revenue: ${impact.revenue ?? 0} (Delta: ${Number(impact.revenue ?? 0) - baseRev})
+- Projected Expense: ${impact.expense ?? 0} (Delta: ${Number(impact.expense ?? 0) - baseExp})
+- Projected Profit: ${impact.profit ?? 0} (Delta: ${impact.profitChange ?? 0} / ${Math.round(Number(impact.profitChangePercent ?? 0) * 10) / 10}%)
+- Projected Margin: ${impact.margin ?? 0}% (vs ${baseMargin}% baseline)
+- Team Size: ${impact.totalTeam ?? baseline.currentTeam ?? 1}, Revenue/Head: ${impact.revenuePerHead ?? 0}, Profit/Head: ${impact.profitPerHead ?? 0}
+- Break-Even Revenue: ${impact.breakEvenRevenue ?? 0}, Revenue Cushion/Gap: ${impact.revenueGap ?? 0}, Coverage Ratio: ${impact.coverageRatio ?? 0}x
+- Monthly Burn Rate: ${impact.monthlyBurnRate ?? 0}, Cash Runway Status: ${runwayLabel}
+
+Department Impact Breakdown:
+${JSON.stringify(deptBreakdown)}
+
+Uncertainty & Stress-Test Envelope:
+${JSON.stringify(uncertaintySummary)}
+
+STRICT RULES:
+- Cite ONLY exact numbers from the inputs/outputs above formatted in ${currency}. Never invent numbers.
+- NEVER say "999-month runway" — when runwayStatus is Cash Generative, describe it as cash-generative (net positive, no burn).
+- Explicitly analyze the exact current scenario name ("${scenario.name || 'Custom Scenario'}") and its active parameter changes.
+- Be thorough, specific, and practical for an agency CFO / founder.
 
 Return ONLY valid JSON:
 {
-  "executiveSummary": "2-3 sentence CFO verdict with exact numbers in ${currency}",
+  "executiveSummary": "3-4 sentence detailed CFO verdict comparing scenario vs baseline (exact revenue, expense, profit deltas, margin shift, break-even coverage, and liquidity/runway impact in ${currency})",
   "riskLevel": "low" | "moderate" | "high",
-  "keyRisks": ["concise risk 1", "concise risk 2"],
-  "optimizationLevers": ["actionable lever 1", "actionable lever 2", "actionable lever 3"],
-  "departmentCommentary": "1-2 sentence insight on departmental cost/margin pressure",
-  "recommendedAction": "1 concrete next step (remember: simulation is non-posting; real changes require approval workflow)"
+  "scenarioDriversBreakdown": [
+    "Driver 1: exact impact of pricing/volume/utilization changes",
+    "Driver 2: exact impact of hiring/salary/operating expense changes",
+    "Driver 3: impact on revenue/profit per team member and break-even cushion"
+  ],
+  "stressTestAnalysis": "2-3 sentences comparing Stress Downside (-15% Rev, +8% Cost) vs Expected Plan vs Bull Upside (+15% Rev, -4% Cost), citing exact profit/margin/runway figures",
+  "departmentCommentary": "2-3 sentences analyzing exact department cost deltas and margin shifts using the real department names above",
+  "keyRisks": ["specific quantified risk 1", "specific quantified risk 2", "specific quantified risk 3"],
+  "optimizationLevers": ["quantified optimization lever 1", "quantified optimization lever 2", "quantified optimization lever 3"],
+  "recommendedAction": "2 concrete, sequenced next steps (note: simulation is non-posting; real changes require governance approval)"
 }`;
 
       const aiRes = await executeAIJSON<any>(orgId, {
         prompt: aiPrompt,
         temperature: 0.25,
+        maxTokens: 2048,
+        timeoutMs: 20000,
         portalType: 'organization',
         featureArea: 'what_if_simulator',
       });
@@ -949,6 +1059,8 @@ Return ONLY valid JSON:
         model: aiRes.model,
         executiveSummary: String(d.executiveSummary || ''),
         riskLevel: ['low', 'moderate', 'high'].includes(d.riskLevel) ? d.riskLevel : 'moderate',
+        scenarioDriversBreakdown: Array.isArray(d.scenarioDriversBreakdown) ? d.scenarioDriversBreakdown.map(String).slice(0, 5) : [],
+        stressTestAnalysis: String(d.stressTestAnalysis || ''),
         keyRisks: Array.isArray(d.keyRisks) ? d.keyRisks.map(String).slice(0, 4) : [],
         optimizationLevers: Array.isArray(d.optimizationLevers) ? d.optimizationLevers.map(String).slice(0, 4) : [],
         departmentCommentary: String(d.departmentCommentary || ''),
@@ -960,12 +1072,22 @@ Return ONLY valid JSON:
       const profit = Number(impact.profit ?? 0);
       const runway = Number(impact.runwayMonths ?? 999);
       const riskLevel = profit < 0 || margin < 15 ? 'high' : margin < 25 ? 'moderate' : 'low';
+      const stress = impact.uncertainty?.stressCase;
+      const bull = impact.uncertainty?.bullCase;
       return ok(res, {
         aiPowered: false,
         provider: 'deterministic-fallback',
         model: 'cfo-rules',
-        executiveSummary: `Projected monthly profit is ${currency} ${Math.round(profit).toLocaleString()} (${margin.toFixed(1)}% margin) with ${runway >= 999 ? 'cash-generative operations' : `${runway} months of cash runway`}.`,
+        executiveSummary: `Projected monthly profit is ${currency} ${Math.round(profit).toLocaleString()} (${margin.toFixed(1)}% margin vs ${baseMargin}% baseline) on ${currency} ${Math.round(Number(impact.revenue ?? 0)).toLocaleString()} revenue and ${currency} ${Math.round(Number(impact.expense ?? 0)).toLocaleString()} expenses, with ${runway >= 999 ? 'cash-generative operations' : `${runway} months of cash runway`}.`,
         riskLevel,
+        scenarioDriversBreakdown: [
+          `Revenue shifts by ${currency} ${Math.round(Number(impact.revenue ?? 0) - baseRev).toLocaleString()}/mo driven by ${scenario.revenueChangePct ?? 0}% volume, ${scenario.priceIncreasePct ?? 0}% pricing, and ${scenario.utilizationRatePct ?? 75}% utilization.`,
+          `Expenses shift by ${currency} ${Math.round(Number(impact.expense ?? 0) - baseExp).toLocaleString()}/mo including ${scenario.newHires ?? 0} new hire(s) at ${currency} ${Math.round(Number(scenario.avgSalary ?? 0)).toLocaleString()}/mo.`,
+          `Break-even revenue is ${currency} ${Math.round(Number(impact.breakEvenRevenue ?? 0)).toLocaleString()}/mo (${Number(impact.coverageRatio ?? 0).toFixed(2)}x coverage ratio across ${impact.totalTeam ?? baseline.currentTeam ?? 1} team members).`,
+        ],
+        stressTestAnalysis: stress && bull
+          ? `Under Stress Downside (-15% Rev, +8% Cost), monthly profit is ${currency} ${Math.round(stress.profit).toLocaleString()} (${stress.margin.toFixed(1)}% margin); under Bull Upside (+15% Rev, -4% Cost), profit reaches ${currency} ${Math.round(bull.profit).toLocaleString()} (${bull.margin.toFixed(1)}% margin).`
+          : '',
         keyRisks: [
           ...(profit < 0 ? [`Net monthly burn of ${currency} ${Math.abs(Math.round(profit)).toLocaleString()} reduces cash reserves.`] : []),
           ...(Number(impact.coverageRatio ?? 0) < 1.2 ? [`Tight break-even coverage ratio (${Number(impact.coverageRatio ?? 0).toFixed(2)}x).`] : []),
@@ -976,7 +1098,9 @@ Return ONLY valid JSON:
           'Increase billable utilization toward 80%+ before committing to fixed payroll expansion.',
           'Review discretionary operating expenses to widen break-even safety coverage above 1.5x.',
         ],
-        departmentCommentary: 'Monitor department-level cost deltas closely before approving budget or headcount changes.',
+        departmentCommentary: deptBreakdown.length > 0
+          ? deptBreakdown.map((d: any) => `${d.department}: ${currency} ${Math.round(d.scenarioCost).toLocaleString()} cost, ${d.scenarioMarginPct.toFixed(1)}% margin`).join(' · ')
+          : 'Monitor department-level cost deltas closely before approving budget or headcount changes.',
         recommendedAction: 'Save this scenario for management review; submit a formal Change Proposal if approved.',
         disclaimer: `Deterministic CFO fallback (${aiErr?.message || 'AI gateway unavailable'}). Non-posting simulation (§14).`,
       });

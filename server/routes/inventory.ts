@@ -290,20 +290,25 @@ export function createInventoryRouter(): Router {
           return notFound(res, 'Inventory item not found in this organization');
         }
 
+        // VALIDATION: Ensure required fields & movement sign conventions (§15)
+        if (!data.type || !['purchase', 'sale', 'adjustment', 'transfer', 'write_off'].includes(data.type)) {
+          return fail(res, 'Invalid transaction type', 400);
+        }
+        if (data.quantity === 0) {
+          return fail(res, 'Quantity cannot be zero', 400);
+        }
+        if (data.type === 'purchase' && data.quantity < 0) {
+          return fail(res, 'Purchase quantity must be positive', 400);
+        }
+        if ((data.type === 'sale' || data.type === 'write_off') && data.quantity > 0) {
+          data.quantity = -Math.abs(data.quantity);
+        }
+
         // VALIDATION: Check stock levels against negative stock policy
         const policy = item.negative_stock_policy || 'disallow';
         const newStock = item.current_stock + data.quantity;
         if (newStock < 0 && policy === 'disallow') {
           return fail(res, `Insufficient stock for ${item.name} (SKU: ${item.sku}). Available: ${item.current_stock}, Requested: ${Math.abs(data.quantity)}`, 400);
-        }
-
-        if (data.quantity === 0) {
-          return fail(res, 'Quantity cannot be zero', 400);
-        }
-
-        // VALIDATION: Ensure required fields
-        if (!data.type || !['purchase', 'sale', 'adjustment', 'transfer', 'write_off'].includes(data.type)) {
-          return fail(res, 'Invalid transaction type', 400);
         }
 
         // VALIDATION: Verify bank account if provided
@@ -507,7 +512,7 @@ export function createInventoryRouter(): Router {
             } else {
               creditGlId = await resolveGlAccountId(supabase, orgId, 'liability', ['payable', 'accounts_payable']);
             }
-            await postBalancedJournalEntry(supabase, {
+            const purJe = await postBalancedJournalEntry(supabase, {
               organizationId: orgId,
               entryDate: data.date,
               description: `Inventory Purchase - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
@@ -521,21 +526,103 @@ export function createInventoryRouter(): Router {
                 { accountId: creditGlId, bankAccountId: data.bankAccountId || null, debit: 0, credit: totalCost, description: data.bankAccountId ? `Bank payment for ${item.name}` : `Accounts payable for ${item.name}` },
               ],
             });
-          } else if ((data.type === 'sale' || data.type === 'write_off') && totalCost > 0) {
-            await postBalancedJournalEntry(supabase, {
+            if (!purJe.success) console.warn('[inventory] Purchase journal warning:', purJe.error);
+          } else if (data.type === 'sale') {
+            // 1. COGS recognition journal: Dr COGS / Cr Inventory
+            if (totalCost > 0) {
+              const cogsJe = await postBalancedJournalEntry(supabase, {
+                organizationId: orgId,
+                entryDate: data.date,
+                description: `Inventory COGS - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
+                sourceType: 'inventory_cogs',
+                sourceId: String(newTxn.id),
+                currency: orgCurrency,
+                actorUserId: req.authUser?.id || null,
+                entryPrefix: 'COGS',
+                lines: [
+                  { accountId: cogsGlId, debit: totalCost, credit: 0, description: `COGS recognized - ${item.name}` },
+                  { accountId: invAssetGlId, debit: 0, credit: totalCost, description: `Inventory relieved - ${item.name}` },
+                ],
+              });
+              if (!cogsJe.success) console.warn('[inventory] Sale COGS journal warning:', cogsJe.error);
+            }
+            // 2. Sales Revenue journal (§15): Dr Bank or AR / Cr Sales Revenue
+            const saleRevenueAmt = Number(data.totalAmount || (Math.abs(data.quantity) * Number(item.selling_price || 0)) || 0);
+            if (saleRevenueAmt > 0) {
+              let debitGlId = '';
+              if (data.bankAccountId) {
+                const { data: ba } = await supabase
+                  .from('bank_accounts')
+                  .select('account_id')
+                  .eq('id', data.bankAccountId)
+                  .eq('organization_id', orgId)
+                  .maybeSingle();
+                debitGlId = ba?.account_id || '';
+              }
+              if (!debitGlId) {
+                debitGlId = data.bankAccountId
+                  ? await resolveGlAccountId(supabase, orgId, 'asset', ['bank_account', 'cash'])
+                  : await resolveGlAccountId(supabase, orgId, 'asset', ['receivable', 'accounts_receivable']);
+              }
+              const revGlId = await resolveGlAccountId(supabase, orgId, 'income', ['sales', 'revenue', 'income']);
+              const saleJe = await postBalancedJournalEntry(supabase, {
+                organizationId: orgId,
+                entryDate: data.date,
+                description: `Inventory Sale Revenue - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
+                sourceType: 'inventory_sale',
+                sourceId: String(newTxn.id),
+                currency: orgCurrency,
+                actorUserId: req.authUser?.id || null,
+                entryPrefix: 'INVS',
+                lines: [
+                  { accountId: debitGlId, bankAccountId: data.bankAccountId || null, debit: saleRevenueAmt, credit: 0, description: data.bankAccountId ? `Cash sale proceeds - ${item.name}` : `AR for inventory sale - ${item.name}` },
+                  { accountId: revGlId, debit: 0, credit: saleRevenueAmt, description: `Sales revenue - ${item.name}` },
+                ],
+              });
+              if (!saleJe.success) console.warn('[inventory] Sale revenue journal warning:', saleJe.error);
+            }
+          } else if (data.type === 'write_off' && totalCost > 0) {
+            const woJe = await postBalancedJournalEntry(supabase, {
               organizationId: orgId,
               entryDate: data.date,
-              description: `${data.type === 'sale' ? 'Inventory COGS' : 'Inventory Write-Off'} - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
-              sourceType: data.type === 'sale' ? 'inventory_cogs' : 'inventory_write_off',
+              description: `Inventory Write-Off - ${item.name} (${Math.abs(data.quantity)} ${item.unit})`,
+              sourceType: 'inventory_write_off',
               sourceId: String(newTxn.id),
               currency: orgCurrency,
               actorUserId: req.authUser?.id || null,
-              entryPrefix: data.type === 'sale' ? 'COGS' : 'INVW',
+              entryPrefix: 'INVW',
               lines: [
-                { accountId: cogsGlId, debit: totalCost, credit: 0, description: `${data.type === 'sale' ? 'COGS recognized' : 'Write-off loss'} - ${item.name}` },
+                { accountId: cogsGlId, debit: totalCost, credit: 0, description: `Write-off loss - ${item.name}` },
                 { accountId: invAssetGlId, debit: 0, credit: totalCost, description: `Inventory relieved - ${item.name}` },
               ],
             });
+            if (!woJe.success) console.warn('[inventory] Write-off journal warning:', woJe.error);
+          } else if (data.type === 'adjustment' && totalCost > 0) {
+            // Inventory count adjustment journal (§15): surplus Dr Inventory / Cr Gain, shrinkage Dr COGS / Cr Inventory
+            const isSurplus = Number(data.quantity) > 0;
+            const adjOffsetGlId = isSurplus
+              ? await resolveGlAccountId(supabase, orgId, 'income', ['inventory', 'other_income', 'gain'])
+              : cogsGlId;
+            const adjJe = await postBalancedJournalEntry(supabase, {
+              organizationId: orgId,
+              entryDate: data.date,
+              description: `Inventory Adjustment (${isSurplus ? 'Surplus' : 'Shrinkage'}) - ${item.name}`,
+              sourceType: 'inventory_adjustment',
+              sourceId: String(newTxn.id),
+              currency: orgCurrency,
+              actorUserId: req.authUser?.id || null,
+              entryPrefix: 'INVA',
+              lines: isSurplus
+                ? [
+                    { accountId: invAssetGlId, debit: totalCost, credit: 0, description: `Inventory surplus - ${item.name}` },
+                    { accountId: adjOffsetGlId, debit: 0, credit: totalCost, description: `Inventory adjustment gain - ${item.name}` },
+                  ]
+                : [
+                    { accountId: adjOffsetGlId, debit: totalCost, credit: 0, description: `Inventory shrinkage - ${item.name}` },
+                    { accountId: invAssetGlId, debit: 0, credit: totalCost, description: `Inventory reduced - ${item.name}` },
+                  ],
+            });
+            if (!adjJe.success) console.warn('[inventory] Adjustment journal warning:', adjJe.error);
           }
         } catch (jeErr) {
           console.warn('[inventory] Non-fatal journal posting warning:', jeErr);

@@ -61,6 +61,24 @@ export interface BudgetSummary {
   byCategory: Record<string, { budgeted: number; spent: number; count: number; name?: string }>;
 }
 
+export interface BudgetTemplateItem {
+  category: string;
+  categoryId?: string | null;
+  percentage: number;
+}
+
+export interface BudgetTemplateRecord {
+  id: string;
+  organizationId?: string;
+  name: string;
+  description?: string;
+  defaultPeriod: Budget['period'];
+  isDefault?: boolean;
+  categories: BudgetTemplateItem[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export const budgetService = {
   async getAll(organizationId: string): Promise<ServiceResponse<Budget[]>> {
     if (isHttpBackendConfigured()) {
@@ -328,7 +346,7 @@ export const budgetService = {
     organizationId: string,
     templateName: string,
     totalAmount: number,
-    categories: { category: string; percentage: number }[],
+    categories: BudgetTemplateItem[],
     options?: {
       period?: 'monthly' | 'quarterly' | 'yearly';
       startDate?: string;
@@ -343,7 +361,7 @@ export const budgetService = {
         {
           templateName: string;
           totalAmount: number;
-          categories: { category: string; percentage: number }[];
+          categories: BudgetTemplateItem[];
           period?: string;
           startDate?: string;
           endDate?: string;
@@ -432,5 +450,63 @@ export const budgetService = {
     dataStore.budgets.push(newBudget);
     dataStore.notify('budgets');
     return { success: true, data: newBudget, message: 'Budget rolled forward' };
+  },
+
+  async getTemplates(organizationId: string): Promise<ServiceResponse<BudgetTemplateRecord[]>> {
+    const err = requireOrg<BudgetTemplateRecord[]>(organizationId);
+    if (err) return err;
+    if (isHttpBackendConfigured()) {
+      return apiGet<BudgetTemplateRecord[]>(`${BUD(organizationId)}/templates`);
+    }
+    return { success: true, data: [] };
+  },
+
+  async createTemplate(
+    organizationId: string,
+    payload: {
+      name: string;
+      description?: string;
+      defaultPeriod?: Budget['period'];
+      categories: BudgetTemplateItem[];
+    },
+  ): Promise<ServiceResponse<BudgetTemplateRecord>> {
+    const err = requireOrg<BudgetTemplateRecord>(organizationId);
+    if (err) return err;
+    if (isHttpBackendConfigured()) {
+      return apiPostJson<typeof payload, BudgetTemplateRecord>(`${BUD(organizationId)}/templates`, payload);
+    }
+    return { success: false, data: null as any, error: 'Backend required to save templates' };
+  },
+
+  async updateTemplate(
+    organizationId: string,
+    templateId: string,
+    payload: {
+      name?: string;
+      description?: string;
+      defaultPeriod?: Budget['period'];
+      categories?: BudgetTemplateItem[];
+    },
+  ): Promise<ServiceResponse<BudgetTemplateRecord>> {
+    const err = requireOrg<BudgetTemplateRecord>(organizationId);
+    if (err) return err;
+    if (isHttpBackendConfigured()) {
+      return apiRequest<BudgetTemplateRecord>(`${BUD(organizationId)}/templates/${encodeURIComponent(templateId)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(payload),
+      });
+    }
+    return { success: false, data: null as any, error: 'Backend required to update templates' };
+  },
+
+  async deleteTemplate(organizationId: string, templateId: string): Promise<ServiceResponse<{ id: string }>> {
+    const err = requireOrg<{ id: string }>(organizationId);
+    if (err) return err;
+    if (isHttpBackendConfigured()) {
+      return apiRequest<{ id: string }>(`${BUD(organizationId)}/templates/${encodeURIComponent(templateId)}`, {
+        method: 'DELETE',
+      });
+    }
+    return { success: false, data: null as any, error: 'Backend required to delete templates' };
   },
 };

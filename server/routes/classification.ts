@@ -29,6 +29,7 @@ import type { AIConfig } from '../config/aiConfig.js';
 import { requireOrgRole } from '../middleware/auth.js';
 import { recomputeServerBankBalance } from './transactions.js';
 import { postTransactionToJournal } from '../lib/ledgerService.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 import {
   loadFullRules,
   loadTenantPolicy,
@@ -400,9 +401,18 @@ export function createClassificationRouter(): Router {
       void recordRuleMatchUsage(sb, orgId, [ruleResult.matchedRuleId]);
     }
 
-    // 2. If AI is explicitly disabled, return deterministic rule result immediately.
-    // Otherwise consult AI grounded with org rules, human corrections, and departments.
-    if (useAI === false) {
+    // 2. Enforce Handoff §11 deterministic precedence:
+    // Return deterministic rule result immediately if AI is disabled OR if an unambiguous
+    // high-confidence approved organization rule matched (unless forceAI is explicitly requested).
+    const forceAI = Boolean((req.body as any)?.forceAI);
+    const hasDeterministicRuleWin = Boolean(
+      !forceAI &&
+      ruleResult.matchedRuleId &&
+      !(ruleResult.riskFlags || []).includes('rule_conflict') &&
+      ruleResult.categoryId &&
+      ruleResult.confidence >= tenantPolicy.highThreshold
+    );
+    if (useAI === false || hasDeterministicRuleWin) {
       let finalCatId = ruleResult.categoryId;
       let finalCatName = ruleResult.categoryName;
       let proposedNewCategory = ruleResult.proposedNewCategory || null;
@@ -647,7 +657,15 @@ export function createClassificationRouter(): Router {
       ruleResults.set(index, ruleRes);
       if (ruleRes.matchedRuleId) matchedRuleIds.push(ruleRes.matchedRuleId);
 
-      if (useAI !== true) {
+      const hasDeterministicRuleWin = Boolean(
+        !forceAI &&
+        ruleRes.matchedRuleId &&
+        !(ruleRes.riskFlags || []).includes('rule_conflict') &&
+        ruleRes.categoryId &&
+        ruleRes.confidence >= tenantPolicy.highThreshold
+      );
+
+      if (useAI !== true || hasDeterministicRuleWin) {
         const suggestedDeptId =
           ruleRes.suggestedDepartmentId ||
           (await inferDepartment(orgId, txn.narration, ruleRes.categoryName));
@@ -938,7 +956,8 @@ export function createClassificationRouter(): Router {
     const categories = await loadCategories(orgId);
     const previousCategoryId = txn.category_id || txn.categoryId || null;
     const narration = txn.narration || txn.description || '';
-    const effectiveScope: 'row' | 'batch' | 'future' = scope || 'future';
+    // Handoff §11, §33 #12: default to single-row correction unless caller explicitly opts into 'batch' or 'future'
+    const effectiveScope: 'row' | 'batch' | 'future' = scope || 'row';
 
     try {
       const suggestedCatId = txn.suggested_category_id || txn.suggestedCategoryId || null;
@@ -1147,6 +1166,14 @@ export function createClassificationRouter(): Router {
     if (!sb) return fail(res, 503, 'Supabase client is unconfigured');
     try {
       const updated = await updateTenantClassificationPolicy(sb, orgId, req.body || {});
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'update_classification_policy',
+        entityType: 'classification_policy',
+        entityId: orgId,
+        description: `Updated tenant classification policy (v${updated.policyVersion})`,
+        afterState: updated as unknown as Record<string, unknown>,
+      }).catch(() => {});
       return ok(res, updated, 'Classification policy updated');
     } catch (err: any) {
       return fail(res, 400, err?.message || 'Failed to update classification policy');
@@ -1204,6 +1231,15 @@ export function createClassificationRouter(): Router {
       if (resUpsert.skipped) {
         return fail(res, 400, resUpsert.collisionWarning || 'Rule pattern is too generic or invalid');
       }
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'create_classification_rule',
+        entityType: 'classification_rule',
+        entityId: String(resUpsert.ruleId || pattern),
+        description: `Created classification rule "${resUpsert.pattern}" -> ${categoryId} (${world})`,
+        afterState: { ruleId: resUpsert.ruleId, pattern: resUpsert.pattern, categoryId, world, version: resUpsert.version || 1 },
+      }).catch(() => {});
 
       return created(res, {
         id: resUpsert.ruleId || `rule-${Date.now()}`,
@@ -1884,7 +1920,7 @@ export function createClassificationRouter(): Router {
     if (!sb) return fail(res, 503, 'Supabase client is unconfigured');
 
     try {
-      await sb
+      const { data: updatedRule, error: upErr } = await sb
         .from('classification_rules')
         .update({
           status,
@@ -1893,7 +1929,26 @@ export function createClassificationRouter(): Router {
           updated_at: new Date().toISOString(),
         })
         .eq('id', ruleId)
-        .eq('organization_id', orgId);
+        .eq('organization_id', orgId)
+        .select('id, pattern, status')
+        .maybeSingle();
+
+      if (upErr) {
+        console.error('[classification.rules.status] Error updating status:', upErr);
+        return fail(res, 500, upErr.message || 'Failed to update rule status');
+      }
+      if (!updatedRule) {
+        return notFound(res, 'Classification rule');
+      }
+
+      void logAuditEvent(req, {
+        organizationId: orgId,
+        action: 'update_classification_rule_status',
+        entityType: 'classification_rule',
+        entityId: String(ruleId),
+        description: `Set classification rule "${updatedRule.pattern || ruleId}" status to ${status}`,
+        afterState: updatedRule,
+      }).catch(() => {});
     } catch (e) {
       console.error('[classification.rules.status] Error updating status:', e);
       return fail(res, 500, 'Failed to update rule status');

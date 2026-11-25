@@ -75,8 +75,11 @@ export function resolveCostingPeriod(options?: {
   const todayStr = `${yyyy}-${mm}-${String(now.getUTCDate()).padStart(2, '0')}`;
 
   const period = String(options?.period || '').trim().toUpperCase();
+  const isWideAllTimeRange =
+    Boolean(options?.from && options.from.slice(0, 10) <= '2005-01-01') &&
+    (!options?.to || options.to.slice(0, 10) >= '2090-01-01');
 
-  if (period === 'ALL') {
+  if (period === 'ALL' || isWideAllTimeRange) {
     // Compute distinct calendar months covered by valid business transactions (minimum 1)
     const months = new Set<string>();
     for (const t of options?.transactions || []) {
@@ -93,17 +96,43 @@ export function resolveCostingPeriod(options?: {
     };
   }
 
+  if (period === '1M') {
+    return {
+      fromDate: monthStart,
+      toDate: monthEnd,
+      periodLabel: `${monthStart} to ${monthEnd} (1 mo)`,
+      periodMonths: 1,
+      isAllTime: false,
+    };
+  }
+
   if (period === '3M' || period === '1Y' || period === '12M') {
     const monthsBack = period === '3M' ? 3 : 12;
     const startObj = new Date(Date.UTC(yyyy, now.getUTCMonth() - (monthsBack - 1), 1));
     const sY = startObj.getUTCFullYear();
     const sM = String(startObj.getUTCMonth() + 1).padStart(2, '0');
     const fromDate = `${sY}-${sM}-01`;
+
+    // Do not charge phantom overhead/capacity for empty months before the org had transactions in this window
+    let effectiveMonths = monthsBack;
+    if (options?.transactions && options.transactions.length > 0) {
+      const activeMonths = new Set<string>();
+      for (const t of options.transactions) {
+        const fullDate = String(t?.date || '').slice(0, 10);
+        if (fullDate >= fromDate && fullDate <= monthEnd && /^\d{4}-\d{2}/.test(fullDate)) {
+          activeMonths.add(fullDate.slice(0, 7));
+        }
+      }
+      if (activeMonths.size > 0) {
+        effectiveMonths = Math.min(monthsBack, activeMonths.size);
+      }
+    }
+
     return {
       fromDate,
       toDate: monthEnd,
-      periodLabel: `${fromDate} to ${monthEnd} (${monthsBack} mo)`,
-      periodMonths: monthsBack,
+      periodLabel: `${fromDate} to ${monthEnd} (${effectiveMonths} mo)`,
+      periodMonths: effectiveMonths,
       isAllTime: false,
     };
   }
@@ -296,7 +325,9 @@ export function allocateOverheadPools(input: {
       continue;
     }
 
-    let monthlyPool = Number(alloc.amount ?? alloc.allocated_amount ?? 0);
+    const rawMonthlyAmt = Number(alloc.amount ?? alloc.allocated_amount ?? 0);
+    const poolCurrency = String(alloc.currency || orgCurrency).toUpperCase();
+    let monthlyPool = rawMonthlyAmt > 0 ? convertCurrency(rawMonthlyAmt, poolCurrency, orgCurrency) : 0;
     const accIds: string[] = Array.isArray(alloc.accountIds ?? alloc.account_ids)
       ? (alloc.accountIds ?? alloc.account_ids)
       : [];

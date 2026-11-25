@@ -59,6 +59,7 @@ export const ROLE_ALLOWED_VIEWS: Record<MemberAccessRole, readonly OrgView[]> = 
     'transactions', 'recurring', 'accounts', 'payment-methods', 'import', 'logic',
     'integrations', 'budgets', 'forecast', 'projects', 'simulator', 'costing',
     'assets', 'inventory', 'reports', 'loans', 'team', 'payroll', 'settings',
+    'active-sessions', 'audit-log',
   ],
   accountant: [
     'finance-os', 'dashboard', 'profit-intelligence', 'ai-assistant', 'quick-add',

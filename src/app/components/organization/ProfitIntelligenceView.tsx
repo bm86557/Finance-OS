@@ -9,6 +9,7 @@ import { useService } from '@/hooks/useService';
 import type { DepartmentProfitability, SquareFootProfitability } from '@/services/types';
 import { profitIntelligenceService } from '@/services/profitIntelligenceService';
 import { overheadAllocationService } from '@/services/overheadAllocationService';
+import { aiAssistantService, type AIInsight } from '@/services/aiAssistantService';
 
 interface ProjectDetailsModalData {
   project?: {
@@ -120,7 +121,13 @@ import {
   BarChart3,
   PieChart as PieChartIcon,
   Clock,
-  Edit2
+  Edit2,
+  Lightbulb,
+  AlertTriangle,
+  CheckCircle2,
+  Brain,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, ReferenceLine } from 'recharts';
@@ -166,8 +173,8 @@ export function ProfitIntelligenceView() {
     error: deptProfitError,
     refetch: refetchDeptProfit,
   } = useService(
-    () => svc.departments.getProfitability({ from: dateRange.from, to: dateRange.to }),
-    [svc.orgId, dateRange]
+    () => svc.departments.getProfitability({ period }),
+    [svc.orgId, period]
   );
   const liveDepartments: Department[] = (rawDeptProfit || []).map(mapDeptProfitability);
 
@@ -179,6 +186,17 @@ export function ProfitIntelligenceView() {
     () => svc.projects.getProfitability({ period: projectPeriod }),
     [svc.orgId, projectPeriod]
   );
+
+  // AI-Generated Insights & Recommendations (live org financial dossier)
+  const {
+    data: aiAnalysisData,
+    loading: aiAnalysisLoading,
+    refetch: refetchAiAnalysis,
+  } = useService(
+    () => (svc.orgId ? aiAssistantService.getAnalysis(svc.orgId) : Promise.resolve({ success: true as const, data: null })),
+    [svc.orgId]
+  );
+  const aiInsights: AIInsight[] = aiAnalysisData?.insights ?? [];
 
   // Client profitability
   const {
@@ -232,8 +250,8 @@ export function ProfitIntelligenceView() {
     data: orgSummary,
     loading: summaryLoading,
   } = useService(
-    () => svc.profitIntelligence.getSummary({ from: dateRange.from, to: dateRange.to }),
-    [svc.orgId, dateRange]
+    () => svc.profitIntelligence.getSummary({ period }),
+    [svc.orgId, period]
   );
 
   // Space profitability and floor efficiency metrics (§12.5)
@@ -1768,6 +1786,133 @@ export function ProfitIntelligenceView() {
           </motion.div>
         </TabsContent>
       </Tabs>
+
+      {/* AI-Generated Insights & Recommendations */}
+      <motion.div
+        initial={{ opacity: 0, y: 24 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.35 }}
+        className="mt-8 p-8 rounded-3xl"
+        style={{
+          background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.5) 0%, rgba(0, 0, 0, 0.3) 100%)',
+          border: '1px solid rgba(148, 163, 184, 0.1)',
+          boxShadow: '0 20px 60px -20px rgba(0, 0, 0, 0.8)',
+        }}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+          <div className="flex items-center gap-3">
+            <div
+              className="w-12 h-12 rounded-xl bg-gradient-to-br from-yellow-500 to-amber-500 flex items-center justify-center shrink-0"
+              style={{ boxShadow: '0 10px 30px -10px rgba(245, 158, 11, 0.6)' }}
+            >
+              <Lightbulb className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h2 className="text-2xl font-bold text-white">AI-Generated Insights &amp; Recommendations</h2>
+              <p className="text-slate-400 text-sm">Actionable intelligence from your organization&apos;s financial data</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => void refetchAiAnalysis()}
+            disabled={aiAnalysisLoading}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium text-slate-200 bg-slate-800/70 hover:bg-slate-700/80 border border-slate-700/60 transition-colors disabled:opacity-50 cursor-pointer"
+          >
+            <RefreshCw className={`size-3.5 ${aiAnalysisLoading ? 'animate-spin' : ''}`} />
+            {aiAnalysisLoading ? 'Analyzing...' : 'Refresh Insights'}
+          </button>
+        </div>
+
+        <div className="space-y-3">
+          {aiInsights.length === 0 ? (
+            <div className="py-8 text-center text-sm text-slate-400">
+              {aiAnalysisLoading ? (
+                <div className="flex items-center justify-center gap-2">
+                  <Loader2 className="size-4 animate-spin text-purple-400" />
+                  <span>Analyzing profitability, margins, and overhead risks...</span>
+                </div>
+              ) : (
+                'No critical anomalies or insights detected yet. As transactions and projects are recorded, AI will automatically surface risks and profit opportunities.'
+              )}
+            </div>
+          ) : (
+            aiInsights.map((insight, idx) => (
+              <motion.div
+                key={insight.id || idx}
+                initial={{ opacity: 0, x: -16 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: 0.1 + idx * 0.06 }}
+                className={`p-5 rounded-2xl border ${insight.type === 'warning'
+                  ? 'bg-red-900/10 border-red-600/30'
+                  : insight.type === 'opportunity'
+                    ? 'bg-cyan-900/10 border-cyan-600/30'
+                    : insight.type === 'success'
+                      ? 'bg-green-900/10 border-green-600/30'
+                      : 'bg-blue-900/10 border-blue-600/30'
+                  }`}
+              >
+                <div className="flex items-start gap-3">
+                  <div className={`p-2 rounded-lg shrink-0 ${insight.type === 'warning'
+                    ? 'bg-red-600/20'
+                    : insight.type === 'opportunity'
+                      ? 'bg-cyan-600/20'
+                      : insight.type === 'success'
+                        ? 'bg-green-600/20'
+                        : 'bg-blue-600/20'
+                    }`}>
+                    {insight.type === 'warning' && <AlertTriangle className="size-4 text-red-400" />}
+                    {insight.type === 'opportunity' && <TrendingUp className="size-4 text-cyan-400" />}
+                    {insight.type === 'success' && <CheckCircle2 className="size-4 text-green-400" />}
+                    {insight.type === 'info' && <Brain className="size-4 text-blue-400" />}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2 mb-1">
+                      <h3 className="font-semibold text-white">{insight.title}</h3>
+                      {insight.category && (
+                        <div className="px-2 py-0.5 rounded text-xs text-slate-300 border border-slate-600">
+                          {insight.category}
+                        </div>
+                      )}
+                      {insight.impact && (
+                        <div className={`px-2 py-0.5 rounded text-xs font-medium ${insight.impact === 'high'
+                          ? 'bg-red-500/20 text-red-300 border border-red-400/30'
+                          : insight.impact === 'medium'
+                            ? 'bg-yellow-500/20 text-yellow-300 border border-yellow-400/30'
+                            : 'bg-blue-500/20 text-blue-300 border border-blue-400/30'
+                          }`}>
+                          {insight.impact} impact
+                        </div>
+                      )}
+                    </div>
+                    <p className="text-sm text-slate-300 mb-2">{insight.description}</p>
+                    {insight.recommendation && (
+                      <div className={`p-3 rounded-lg mt-2 ${insight.type === 'warning'
+                        ? 'bg-red-950/50'
+                        : insight.type === 'opportunity'
+                          ? 'bg-cyan-950/50'
+                          : 'bg-green-950/50'
+                        }`}>
+                        <div
+                          className={`mb-1 flex items-center gap-1.5 text-xs ${insight.type === 'warning'
+                            ? 'text-red-400'
+                            : insight.type === 'opportunity'
+                              ? 'text-cyan-400'
+                              : 'text-green-400'
+                            }`}
+                        >
+                          <Lightbulb className="size-3.5 shrink-0" aria-hidden />
+                          AI recommendation
+                        </div>
+                        <p className="text-sm text-white">{insight.recommendation}</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            ))
+          )}
+        </div>
+      </motion.div>
 
       {/* Project Transactions Modal */}
       <Dialog open={isProjectModalOpen} onOpenChange={setIsProjectModalOpen}>

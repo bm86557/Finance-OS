@@ -7,6 +7,8 @@ import { Router, type Request, type Response } from 'express';
 import type { Category } from '../../src/services/types.js';
 import { ok, created, notFound, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
+import { requirePermission } from '../middleware/auth.js';
+import { logAuditEvent } from '../lib/auditLogger.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -109,7 +111,7 @@ export function createCategoriesRouter(): Router {
     return ok(res, mapDbToDomainCategory(data));
   });
 
-  r.post('/', async (req: Request, res: Response) => {
+  r.post('/', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const data = req.body as Omit<Category, 'id' | 'organizationId'>;
     const sb = getSupabaseAdminClient();
@@ -172,10 +174,18 @@ export function createCategoriesRouter(): Router {
       return fail(res, 500, `Failed to create category: ${error.message}`);
     }
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'create_category',
+      entityType: 'category',
+      entityId: newId,
+      description: `Created category ${newCat.name} (${newCat.type})`,
+      afterState: insertedData,
+    });
     return created(res, mapDbToDomainCategory(insertedData), 'Category created');
   });
 
-  r.patch('/:id', async (req: Request, res: Response) => {
+  r.patch('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const updates = req.body as Partial<Category>;
     const sb = getSupabaseAdminClient();
@@ -202,10 +212,18 @@ export function createCategoriesRouter(): Router {
       return fail(res, 500, error.message);
     }
     if (!data) return notFound(res, 'Category');
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'update_category',
+      entityType: 'category',
+      entityId: String(req.params.id),
+      description: `Updated category ${data.name || req.params.id}`,
+      afterState: data,
+    });
     return ok(res, mapDbToDomainCategory(data));
   });
 
-  r.delete('/:id', async (req: Request, res: Response) => {
+  r.delete('/:id', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
@@ -231,10 +249,17 @@ export function createCategoriesRouter(): Router {
       return fail(res, 500, error.message);
     }
 
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'delete_category',
+      entityType: 'category',
+      entityId: String(req.params.id),
+      description: `Deleted category ${req.params.id}`,
+    });
     return ok(res, null, 'Category deleted');
   });
 
-  r.post('/:id/patterns', async (req: Request, res: Response) => {
+  r.post('/:id/patterns', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const { pattern } = req.body as { pattern: string };
     const sb = getSupabaseAdminClient();
@@ -264,10 +289,17 @@ export function createCategoriesRouter(): Router {
       .single();
 
     if (updateErr) return fail(res, 500, updateErr.message);
+    void logAuditEvent(req, {
+      organizationId: orgId,
+      action: 'add_category_pattern',
+      entityType: 'category',
+      entityId: String(req.params.id),
+      description: `Added pattern "${pattern}" to category ${existing.name || req.params.id}`,
+    });
     return ok(res, mapDbToDomainCategory(updated));
   });
 
-  r.delete('/:id/patterns', async (req: Request, res: Response) => {
+  r.delete('/:id/patterns', requirePermission('finance:write_transactions'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const pattern = String(req.query.pattern ?? '');
     const sb = getSupabaseAdminClient();

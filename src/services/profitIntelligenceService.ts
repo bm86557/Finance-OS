@@ -72,7 +72,7 @@ export interface BusinessVsPersonal {
 export const profitIntelligenceService = {
   async getSummary(
     organizationId: string,
-    params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' }
+    params?: { from?: string; to?: string; period?: '1M' | '3M' | '1Y' | 'ALL' }
   ): Promise<ServiceResponse<OrganizationSummary>> {
     if (isHttpBackendConfigured()) {
       const err = requireOrg<OrganizationSummary>(organizationId);

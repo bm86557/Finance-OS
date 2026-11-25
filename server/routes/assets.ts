@@ -357,7 +357,11 @@ export function createAssetsRouter(): Router {
   r.post('/:id/dispose', requirePermission('finance:post_ledger'), async (req: Request, res: Response) => {
     const orgId = getOrgId(req);
     const assetId = getParamId(req, 'id');
-    const { disposalDate, disposalAmount } = (req.body || {}) as { disposalDate?: string; disposalAmount?: number };
+    const { disposalDate, disposalAmount, bankAccountId } = (req.body || {}) as {
+      disposalDate?: string;
+      disposalAmount?: number;
+      bankAccountId?: string;
+    };
     const sb = getSupabaseAdminClient();
     if (!sb) return fail(res, 503, 'Database unavailable');
 
@@ -381,6 +385,50 @@ export function createAssetsRouter(): Router {
       const effectiveDisposalDate = disposalDate || new Date().toISOString().slice(0, 10);
       const orgCurrency = await resolveOrgCurrency(sb, orgId);
 
+      // Post balanced disposal journal entry FIRST (§8, §15) so closed periods or GL errors abort cleanly
+      if (costBasis > 0) {
+        let cashGlId = '';
+        if (bankAccountId) {
+          const { data: ba } = await sb
+            .from('bank_accounts')
+            .select('account_id')
+            .eq('id', bankAccountId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          cashGlId = ba?.account_id || '';
+        }
+        if (!cashGlId) {
+          cashGlId = await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']);
+        }
+        const fixedAssetGlId = existing.account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['fixed_asset', 'fixed asset']));
+        const accumDeprGlId = existing.accumulated_depreciation_account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['accumulated_depreciation', 'accumulated depreciation']));
+        const gainGlId = await resolveGlAccountId(sb, orgId, 'income', ['gain', 'other_income']);
+        const lossGlId = await resolveGlAccountId(sb, orgId, 'expense', ['loss', 'disposal', 'operating_expense']);
+
+        const lines = [
+          ...(dispAmt > 0 ? [{ accountId: cashGlId, bankAccountId: bankAccountId || null, debit: dispAmt, credit: 0, description: `Cash proceeds from disposal of ${existing.name}` }] : []),
+          ...(accDepr > 0 ? [{ accountId: accumDeprGlId, debit: accDepr, credit: 0, description: `Remove accumulated depreciation for ${existing.name}` }] : []),
+          ...(gainLoss < 0 ? [{ accountId: lossGlId, debit: Math.abs(gainLoss), credit: 0, description: `Loss on disposal of ${existing.name}` }] : []),
+          { accountId: fixedAssetGlId, debit: 0, credit: costBasis, description: `Derecognize fixed asset ${existing.name}` },
+          ...(gainLoss > 0 ? [{ accountId: gainGlId, debit: 0, credit: gainLoss, description: `Gain on disposal of ${existing.name}` }] : []),
+        ];
+
+        const jeRes = await postBalancedJournalEntry(sb, {
+          organizationId: orgId,
+          entryDate: effectiveDisposalDate,
+          description: `Asset Disposal - ${existing.name || assetId}`,
+          sourceType: 'asset_disposal',
+          sourceId: assetId,
+          currency: orgCurrency,
+          actorUserId: req.authUser?.id || null,
+          entryPrefix: 'DISP',
+          lines,
+        });
+        if (!jeRes.success) {
+          return fail(res, 400, `Disposal journal posting failed: ${jeRes.error || 'Unknown ledger error'}`);
+        }
+      }
+
       const { data, error } = await sb
         .from('assets')
         .update({
@@ -396,46 +444,14 @@ export function createAssetsRouter(): Router {
         .maybeSingle();
       if (error) throw error;
 
-      // Post balanced disposal journal entry (§8, §15)
-      if (costBasis > 0) {
-        try {
-          const cashGlId = await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']);
-          const fixedAssetGlId = existing.account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['fixed_asset', 'fixed asset']));
-          const accumDeprGlId = existing.accumulated_depreciation_account_id || (await resolveGlAccountId(sb, orgId, 'asset', ['accumulated_depreciation', 'accumulated depreciation']));
-          const gainGlId = await resolveGlAccountId(sb, orgId, 'income', ['gain', 'other_income']);
-          const lossGlId = await resolveGlAccountId(sb, orgId, 'expense', ['loss', 'disposal', 'operating_expense']);
-
-          const lines = [
-            ...(dispAmt > 0 ? [{ accountId: cashGlId, debit: dispAmt, credit: 0, description: `Cash proceeds from disposal of ${existing.name}` }] : []),
-            ...(accDepr > 0 ? [{ accountId: accumDeprGlId, debit: accDepr, credit: 0, description: `Remove accumulated depreciation for ${existing.name}` }] : []),
-            ...(gainLoss < 0 ? [{ accountId: lossGlId, debit: Math.abs(gainLoss), credit: 0, description: `Loss on disposal of ${existing.name}` }] : []),
-            { accountId: fixedAssetGlId, debit: 0, credit: costBasis, description: `Derecognize fixed asset ${existing.name}` },
-            ...(gainLoss > 0 ? [{ accountId: gainGlId, debit: 0, credit: gainLoss, description: `Gain on disposal of ${existing.name}` }] : []),
-          ];
-
-          await postBalancedJournalEntry(sb, {
-            organizationId: orgId,
-            entryDate: effectiveDisposalDate,
-            description: `Asset Disposal - ${existing.name || assetId}`,
-            sourceType: 'asset_disposal',
-            sourceId: assetId,
-            currency: orgCurrency,
-            actorUserId: req.authUser?.id || null,
-            entryPrefix: 'DISP',
-            lines,
-          });
-        } catch (jeErr) {
-          console.warn('[assets.dispose] Failed to post disposal journal:', jeErr);
-        }
-      }
-
-      // Post disposal transaction if cash was received
-      if (dispAmt > 0) {
+      // Post disposal transaction & update bank balance if cash was received via bankAccountId
+      if (dispAmt > 0 && bankAccountId) {
         try {
           const txnId = `txn-disposal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           await sb.from('transactions').insert([{
             id: txnId,
             organization_id: orgId,
+            bank_account_id: bankAccountId,
             date: effectiveDisposalDate,
             description: `Asset Disposal Sale - ${existing.name || assetId}`,
             narration: `Disposal proceeds for ${existing.name || assetId}. Book value: ${netBookValue.toFixed(2)}, Gain/Loss: ${gainLoss >= 0 ? '+' : ''}${gainLoss.toFixed(2)}`,
@@ -446,8 +462,21 @@ export function createAssetsRouter(): Router {
             tags: ['asset-disposal', 'investing-cash-flow', `asset:${assetId}`, 'business'],
             created_at: new Date().toISOString(),
           }]);
+          const { data: baRow } = await sb
+            .from('bank_accounts')
+            .select('balance')
+            .eq('id', bankAccountId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          if (baRow) {
+            await sb
+              .from('bank_accounts')
+              .update({ balance: Math.round((Number(baRow.balance || 0) + dispAmt) * 100) / 100 })
+              .eq('id', bankAccountId)
+              .eq('organization_id', orgId);
+          }
         } catch (tErr) {
-          console.warn('[assets.dispose] Failed to insert disposal transaction:', tErr);
+          console.warn('[assets.dispose] Failed to insert disposal bank transaction:', tErr);
         }
       }
 
@@ -564,9 +593,12 @@ export function createAssetsRouter(): Router {
             { accountId: accumDeprGlId, debit: 0, credit: actualDepr, description: `Accumulated depreciation (${targetPeriod}) - ${dbAsset.name}` },
           ],
         });
-        const journalEntryId = jeRes.journalEntryId || `DEP-${dbAsset.asset_code || assetId}-${targetPeriod}`;
+        if (!jeRes.success || !jeRes.journalEntryId) {
+          return fail(res, 400, `Depreciation journal posting failed: ${jeRes.error || 'Unable to post balanced journal entry'}`);
+        }
+        const journalEntryId = jeRes.journalEntryId;
 
-        // 4. Save schedule entry to Supabase
+        // 4. Save schedule entry to Supabase (protected by partial unique index on (asset_id, period) WHERE status='posted')
         const { error: insErr } = await sb.from('depreciation_schedules').insert({
           id: scheduleId,
           organization_id: orgId,
@@ -582,6 +614,9 @@ export function createAssetsRouter(): Router {
         });
 
         if (insErr) {
+          if (insErr.code === '23505') {
+            return fail(res, 409, `Depreciation for period ${targetPeriod} has already been posted for this asset.`);
+          }
           console.error('[assets.postDepreciation] Supabase schedule insert error:', insErr);
           return fail(res, 500, `Failed to post depreciation schedule: ${insErr.message}`);
         }
@@ -593,13 +628,13 @@ export function createAssetsRouter(): Router {
           status: newStatus,
         }).eq('id', assetId).eq('organization_id', orgId);
 
-        // 6. Post non-cash accounting transaction in ledger
+        // 6. Post non-cash accounting transaction in ledger (stamped with targetPeriod date, tagged non-cash-expense)
         try {
           const deprTxnId = `txn-depr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
           await sb.from('transactions').insert([{
             id: deprTxnId,
             organization_id: orgId,
-            date: new Date().toISOString().slice(0, 10),
+            date: `${targetPeriod}-01`,
             description: `Depreciation Run - ${dbAsset.name || dbAsset.asset_code}`,
             narration: `Monthly depreciation for period ${targetPeriod} on ${dbAsset.name} (${journalEntryId})`,
             amount: actualDepr,
@@ -685,8 +720,10 @@ export function createAssetsRouter(): Router {
             purchaseTransactionId: data.purchase_transaction_id,
           });
         }
+        return notFound(res, 'Asset');
       } catch (err) {
         console.error('[assets.getById] Supabase error:', err);
+        return fail(res, 500, 'Failed to fetch asset');
       }
     }
     return fail(res, 503, 'Database unavailable');
@@ -791,6 +828,43 @@ export function createAssetsRouter(): Router {
       const { error } = await sb.from('assets').upsert(mapDomainToDbAsset(newAsset), { onConflict: 'id' });
       if (error) throw error;
 
+      // Post capitalization journal entry (§15): Dr Fixed Asset / Cr Bank or Accounts Payable
+      if (purchasePrice > 0) {
+        const orgCurrency = await resolveOrgCurrency(sb, orgId);
+        let creditGlId = '';
+        if (newAsset.purchaseBankAccountId) {
+          const { data: ba } = await sb
+            .from('bank_accounts')
+            .select('account_id')
+            .eq('id', newAsset.purchaseBankAccountId)
+            .eq('organization_id', orgId)
+            .maybeSingle();
+          creditGlId = ba?.account_id || '';
+        }
+        if (!creditGlId) {
+          creditGlId = newAsset.purchaseBankAccountId
+            ? await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash'])
+            : await resolveGlAccountId(sb, orgId, 'liability', ['payable', 'accounts_payable']);
+        }
+        const capJe = await postBalancedJournalEntry(sb, {
+          organizationId: orgId,
+          entryDate: newAsset.purchaseDate,
+          description: `Fixed Asset Capitalization - ${newAsset.name} (${newAsset.assetCode})`,
+          sourceType: 'asset_purchase',
+          sourceId: newAsset.id,
+          currency: orgCurrency,
+          actorUserId: req.authUser?.id || null,
+          entryPrefix: 'CAP',
+          lines: [
+            { accountId: newAsset.accountId, departmentId: newAsset.departmentId || null, debit: purchasePrice, credit: 0, description: `Capitalize fixed asset ${newAsset.name}` },
+            { accountId: creditGlId, bankAccountId: newAsset.purchaseBankAccountId || null, debit: 0, credit: purchasePrice, description: newAsset.purchaseBankAccountId ? `Bank payment for ${newAsset.name}` : `Payable for ${newAsset.name}` },
+          ],
+        });
+        if (!capJe.success) {
+          console.warn('[assets.post] Capitalization journal warning:', capJe.error);
+        }
+      }
+
       void logAuditEvent(req, {
         organizationId: orgId,
         action: 'create_asset',
@@ -833,15 +907,21 @@ export function createAssetsRouter(): Router {
         accumulatedDepreciationAccountId: existing.accumulated_depreciation_account_id || '',
         depreciationExpenseAccountId: existing.depreciation_expense_account_id || '',
         purchaseDate: existing.purchase_date,
+        placedInServiceDate: existing.placed_in_service_date,
         purchasePrice: existing.purchase_price,
+        costBasis: existing.cost_basis ?? existing.purchase_price,
         salvageValue: existing.salvage_value,
         usefulLifeYears: existing.useful_life_years,
         depreciationMethod: existing.depreciation_method,
+        taxDepreciationMethod: existing.tax_depreciation_method,
+        taxUsefulLifeYears: existing.tax_useful_life_years,
+        accumulatedTaxDepreciation: existing.accumulated_tax_depreciation,
         currentValue: existing.current_value,
         accumulatedDepreciation: existing.accumulated_depreciation,
         status: existing.status,
         disposalDate: existing.disposal_date,
         disposalAmount: existing.disposal_amount,
+        gainLossOnDisposal: existing.gain_loss_on_disposal,
         departmentId: existing.department_id,
         locationDetails: existing.location_details ?? existing.location,
         purchasePaymentMethod: existing.purchase_payment_method,
@@ -849,8 +929,21 @@ export function createAssetsRouter(): Router {
         purchaseTransactionId: existing.purchase_transaction_id,
       } as Asset;
 
-      const patch = req.body as Partial<Asset>;
-      const merged: Asset = { ...current, ...patch, id: current.id, organizationId: current.organizationId };
+      // Guard immutable posted accounting fields (§8, §33 #4): never allow direct overwrite via PATCH
+      const rawPatch = (req.body || {}) as Partial<Asset>;
+      const {
+        accumulatedDepreciation: _ignoredAccDepr,
+        currentValue: _ignoredCurVal,
+        status: _ignoredStatus,
+        disposalDate: _ignoredDispDate,
+        disposalAmount: _ignoredDispAmt,
+        gainLossOnDisposal: _ignoredGainLoss,
+        ...safePatch
+      } = rawPatch as any;
+      if (existing.status === 'disposed') {
+        return fail(res, 400, 'Cannot modify a disposed asset.');
+      }
+      const merged: Asset = { ...current, ...safePatch, id: current.id, organizationId: current.organizationId };
 
       const { error } = await sb.from('assets').upsert(mapDomainToDbAsset(merged), { onConflict: 'id' });
       if (error) throw error;

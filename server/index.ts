@@ -23,6 +23,7 @@ import { getSupabaseAdminClient } from './lib/supabaseAdmin.js';
 import { createApiV1Router } from './routes/apiV1.js';
 import { startOutboxWorker } from './lib/outboxWorker.js';
 import { startRecurringWorker } from './lib/recurringWorker.js';
+import { syncGatewayProvidersFromDb } from './lib/aiGateway.js';
 
 const app = express();
 app.use(helmet());
@@ -67,6 +68,9 @@ if (!process.env.VERCEL) {
 
   app.listen(env.port, () => {
     console.log(`[finance-os] API http://localhost:${env.port} — Supabase PostgreSQL exclusive + /api/v1 REST (§1-§19)`);
+    void syncGatewayProvidersFromDb()
+      .then((nodes) => console.log(`[aiGateway] Hydrated ${nodes.length} platform AI provider(s) from Supabase.`))
+      .catch((e) => console.warn('[aiGateway] Startup sync warning:', e?.message || e));
     startOutboxWorker();
     startRecurringWorker();
   });

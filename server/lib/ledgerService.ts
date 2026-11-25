@@ -21,6 +21,47 @@ export interface LedgerPostingResult {
   error?: string;
 }
 
+/**
+ * Enforce closed fiscal period guard (§7, §8, §23 F-06, §33 #5).
+ * Blocks posting to any period marked 'soft_closed' or 'closed'.
+ */
+export async function assertFiscalPeriodOpen(
+  sb: SupabaseClient,
+  organizationId: string,
+  entryDate: string,
+): Promise<{ open: boolean; error?: string }> {
+  const isoDate = String(entryDate || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return { open: true };
+  try {
+    const { data, error } = await sb
+      .from('fiscal_periods')
+      .select('id, name, status, start_date, end_date')
+      .eq('organization_id', organizationId)
+      .in('status', ['soft_closed', 'closed'])
+      .lte('start_date', isoDate)
+      .gte('end_date', isoDate)
+      .limit(1);
+
+    if (error) {
+      // Gracefully allow if fiscal_periods table does not exist in older schemas
+      if (error.message?.includes('does not exist') || error.code === '42P01') {
+        return { open: true };
+      }
+      return { open: true };
+    }
+    if (data && data.length > 0) {
+      const p = data[0];
+      return {
+        open: false,
+        error: `Posting blocked: fiscal period "${p.name || p.start_date}" is ${p.status} for date ${isoDate} (Handoff §8, §23 F-06).`,
+      };
+    }
+    return { open: true };
+  } catch {
+    return { open: true };
+  }
+}
+
 export async function postTransactionToJournal(
   sb: SupabaseClient,
   txn: {
@@ -45,6 +86,12 @@ export async function postTransactionToJournal(
     const baseAmt = Math.abs(Number(txn.base_amount ?? txn.amount));
     if (baseAmt <= 0) {
       return { success: true }; // Zero-dollar txns do not post journal lines
+    }
+
+    // Closed fiscal period guard (§8, §23 F-06, §33 #5)
+    const periodCheck = await assertFiscalPeriodOpen(sb, orgId, txn.date || new Date().toISOString().slice(0, 10));
+    if (!periodCheck.open) {
+      return { success: false, error: periodCheck.error };
     }
 
     // Idempotency check (§33 #7): If journal entry already exists for this transaction, return early
@@ -431,6 +478,13 @@ export async function postBalancedJournalEntry(
       };
     }
 
+    // Closed fiscal period guard (§8, §23 F-06, §33 #5)
+    const effectiveEntryDate = input.entryDate || new Date().toISOString().slice(0, 10);
+    const periodCheck = await assertFiscalPeriodOpen(sb, input.organizationId, effectiveEntryDate);
+    if (!periodCheck.open) {
+      return { success: false, error: periodCheck.error };
+    }
+
     // Idempotency check (§33 #7)
     const { data: existingJe } = await sb
       .from('journal_entries')
@@ -485,7 +539,9 @@ export async function postBalancedJournalEntry(
 
     const { error: lineErr } = await sb.from('journal_lines').insert(dbLines);
     if (lineErr && !lineErr.message.includes('does not exist')) {
-      console.warn('[ledgerService] postBalancedJournalEntry lines warning:', lineErr.message);
+      console.error('[ledgerService] postBalancedJournalEntry lines failed, rolling back header:', lineErr.message);
+      await sb.from('journal_entries').delete().eq('id', journalEntryId).eq('organization_id', input.organizationId);
+      return { success: false, error: `Journal lines insert failed: ${lineErr.message}` };
     }
 
     return { success: true, journalEntryId };

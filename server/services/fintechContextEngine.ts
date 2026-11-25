@@ -24,6 +24,8 @@
 
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { convertCurrency } from '../lib/fxConverter.js';
+import { allocateOverheadPools, isCoveredByDeclaredOverheadPool, resolveCostingPeriod, type DepartmentDriverStats } from './costingEngine.js';
+import { computeOrgProjectsProfitability } from './projectScheduleCostEngine.js';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -810,65 +812,118 @@ export async function buildOrganizationFinancialDossier(
     .reduce((s, t) => s + t.amount, 0);
   const ownerDrawingsRatio = safePercent(personalExpenses, totalRevenue);
 
-  // Unit Economics & Department Cost Matrix (§12.1-12.3)
-  const totalConfiguredOverhead = (allocRows || []).reduce((s: number, a: any) => s + Number(a.amount || 0), 0);
-  const departments: DepartmentMetric[] = (deptRows || []).map((d: any) => {
+  // Unit Economics & Department Cost Matrix (§12.1-12.3, matched period basis + Hamilton-Hare zero-leakage)
+  const resolvedAllPeriod = resolveCostingPeriod({ period: 'ALL', transactions: plTxns });
+  const deptPeriodMonths = resolvedAllPeriod.periodMonths;
+
+  const deptBaseStats = (deptRows || []).map((d: any) => {
     const deptId = String(d.id);
     const dName = String(d.name || 'Department');
-    const deptMembers = (teamMemberRows || []).filter((m: any) => m.department_id === deptId || m.department === dName);
-    const headcount = deptMembers.length || Number(d.head_count || 1);
+    const deptMembers = (teamMemberRows || []).filter(
+      (m: any) => String(m.department_id || '') === deptId || String(m.department || '').toLowerCase() === dName.toLowerCase(),
+    );
+    // Never fabricate headcount = 1 for an empty department (§12.1, §33 #9)
+    const headcount = deptMembers.length;
     const areaSqft = Number(d.area_sqft || 0);
+    const capacityHours = headcount > 0 ? headcount * 160 * deptPeriodMonths : 0;
 
-    // Standard 160 contracted delivery hours per employee per month
-    const capacityHours = headcount * 160;
-
-    const directLaborCost = canViewPayroll
-      ? deptMembers.reduce((s: number, m: any) => s + convertCurrency(Number(m.salary || 0), m.salary_currency || orgCurrency, orgCurrency), 0)
+    const monthlyLaborCost = canViewPayroll
+      ? deptMembers.reduce(
+          (s: number, m: any) =>
+            s + convertCurrency(Number(m.fixed_salary || m.salary || 0), m.salary_currency || orgCurrency, orgCurrency),
+          0,
+        )
       : 0;
+    const contractedLaborCost = safeRound(monthlyLaborCost * deptPeriodMonths);
 
-    const directExpenses = plTxns
-      .filter(t => t.departmentId === deptId && t.type === 'debit')
-      .reduce((s, t) => s + t.amount, 0);
-
-    // Overhead allocated based on headcount ratio if multiple departments exist
-    const totalHeadcount = (deptRows || []).reduce((s: number, dep: any) => s + Number(dep.head_count || 1), 0) || 1;
-    const allocatedOverhead = totalConfiguredOverhead > 0
-      ? safeRound((headcount / totalHeadcount) * totalConfiguredOverhead)
-      : safeRound((headcount / totalHeadcount) * (totalOperatingExpenses * 0.25));
-
-    const fullLoadedCost = safeRound(directLaborCost + directExpenses + allocatedOverhead);
-    const costPerHour = capacityHours > 0 ? safeRound(fullLoadedCost / capacityHours, 2) : 0;
-    const costPerMinute = safeRound(costPerHour / 60, 4);
-    const costPerSqft = areaSqft > 0 ? safeRound(fullLoadedCost / areaSqft, 2) : 0;
+    // Anti-double-counting guard (§12.1-12.3, §33 #10):
+    // Separate posted salary/payroll debits from non-salary direct expenses,
+    // exclude expenses already covered by declared overhead pools, and reconcile
+    // posted payroll vs contracted fixed salaries (never sum both!).
+    let postedStaffLabor = 0;
+    let directExpenses = 0;
+    for (const t of plTxns) {
+      if (t.departmentId !== deptId || t.type !== 'debit') continue;
+      const desc = `${t.description || ''} ${t.narration || ''}`.toLowerCase();
+      const catName = (t.categoryId ? catMap.get(t.categoryId) || '' : '').toLowerCase();
+      const isDirectSalary = desc.includes('salary') || desc.includes('payroll') || catName.includes('salary') || catName.includes('payroll');
+      if (isDirectSalary) {
+        postedStaffLabor += t.amount;
+      } else if (!isCoveredByDeclaredOverheadPool(catName, desc, allocRows || [])) {
+        directExpenses += t.amount;
+      }
+    }
+    const directLaborCost = postedStaffLabor > 0 ? safeRound(postedStaffLabor) : contractedLaborCost;
 
     const deptRevenue = plTxns
       .filter(t => t.departmentId === deptId && t.type === 'credit')
       .reduce((s, t) => s + t.amount, 0);
 
-    const operatingProfit = safeRound(deptRevenue - fullLoadedCost);
-    const marginPercent = safePercent(operatingProfit, deptRevenue);
-
     return {
-      id: deptId,
-      name: dName,
+      deptId,
+      dName,
       headcount,
       areaSqft,
       capacityHours,
-      directLaborCost: safeRound(directLaborCost),
+      directLaborCost,
       directExpenses: safeRound(directExpenses),
+      deptRevenue: safeRound(deptRevenue),
+    };
+  });
+
+  const driverStats: DepartmentDriverStats[] = deptBaseStats.map((s) => ({
+    departmentId: s.deptId,
+    departmentName: s.dName,
+    headcount: s.headcount,
+    revenue: s.deptRevenue,
+    directCosts: safeRound(s.directLaborCost + s.directExpenses),
+    scheduledHours: s.capacityHours,
+    squareFootage: s.areaSqft,
+    customWeight: 0,
+  }));
+
+  const overheadEngineRes = allocateOverheadPools({
+    departments: driverStats,
+    allocations: allocRows || [],
+    periodMonths: deptPeriodMonths,
+    orgCurrency,
+  });
+
+  const departments: DepartmentMetric[] = deptBaseStats.map((s) => {
+    const allocatedOverhead = safeRound(overheadEngineRes.deptPoolTotals.get(s.deptId) || 0);
+    const fullLoadedCost = safeRound(s.directLaborCost + s.directExpenses + allocatedOverhead);
+    const costPerHour = s.capacityHours > 0 ? safeRound(fullLoadedCost / s.capacityHours, 2) : 0;
+    const costPerMinute = s.capacityHours > 0 ? safeRound(fullLoadedCost / (s.capacityHours * 60), 4) : 0;
+    const costPerSqft = s.areaSqft > 0 ? safeRound(fullLoadedCost / s.areaSqft, 2) : 0;
+    const operatingProfit = safeRound(s.deptRevenue - fullLoadedCost);
+    const marginPercent = s.deptRevenue > 0 ? safePercent(operatingProfit, s.deptRevenue) : 0;
+
+    return {
+      id: s.deptId,
+      name: s.dName,
+      headcount: s.headcount,
+      areaSqft: s.areaSqft,
+      capacityHours: s.capacityHours,
+      directLaborCost: s.directLaborCost,
+      directExpenses: s.directExpenses,
       allocatedOverhead,
       fullLoadedCost,
       costPerHour,
       costPerMinute,
       costPerSqft,
-      revenue: safeRound(deptRevenue),
+      revenue: s.deptRevenue,
       operatingProfit,
       marginPercent,
     };
   });
 
-  // Profit Velocity (§12.6)
-  const earliestDate = plTxns.length > 0 ? new Date(plTxns[0].date) : new Date(now.getTime() - 90 * 86400000);
+  // Profit Velocity (§12.6) — compute true earliest transaction date (plTxns is not guaranteed oldest-first)
+  const validTxnTimestamps = plTxns
+    .map((t) => new Date(t.date).getTime())
+    .filter((ts) => Number.isFinite(ts) && ts > 0);
+  const earliestDate = validTxnTimestamps.length > 0
+    ? new Date(Math.min(...validTxnTimestamps))
+    : new Date(now.getTime() - 90 * 86400000);
   const businessDays = countBusinessDays(earliestDate, now);
   const profitVelocity = {
     velocityAmount: safeRound(netProfit / businessDays, 2),
@@ -876,27 +931,34 @@ export async function buildOrganizationFinancialDossier(
     businessDays,
   };
 
-  // Projects, Quotes & Client Profitability (§12.4, §14)
+  // Projects, Quotes & Client Profitability (§12.4, §14 — authoritative projectScheduleCostEngine, no hardcoded 15% markup)
+  const scheduleProjRes = computeOrgProjectsProfitability({
+    projects: projectRows || [],
+    transactions: txns || [],
+    members: teamMemberRows || [],
+    departments: deptRows || [],
+    overheadAllocations: allocRows || [],
+    orgCurrency,
+  });
+  const computedProjMap = new Map(scheduleProjRes.projects.map((cp) => [String(cp.projectId), cp]));
+
   const projects: ProjectMetric[] = (projectRows || []).map((p: any) => {
     const pId = String(p.id);
+    const cp = computedProjMap.get(pId);
     const quotedAmt = Number(p.quoted_amount || 0);
     const budget = Number(p.budget || quotedAmt || 0);
 
-    const projRev = plTxns.filter(t => t.projectId === pId && t.type === 'credit').reduce((s, t) => s + t.amount, 0);
-    const projDirectExp = plTxns.filter(t => t.projectId === pId && t.type === 'debit').reduce((s, t) => s + t.amount, 0);
-
-    // Timesheet labor integration
-    const projTimesheets = (timesheetRows || []).filter((ts: any) => ts.project_id === pId);
-    const loggedHours = projTimesheets.reduce((s: number, ts: any) => s + Number(ts.hours || 0) + Number(ts.minutes || 0) / 60, 0);
+    const projRev = cp ? cp.revenue : plTxns.filter(t => t.projectId === pId && t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+    const projDirectExp = cp ? cp.directCost : plTxns.filter(t => t.projectId === pId && t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+    const loggedHours = cp ? cp.elapsedHours : (timesheetRows || []).filter((ts: any) => ts.project_id === pId).reduce((s: number, ts: any) => s + Number(ts.hours || 0) + Number(ts.minutes || 0) / 60, 0);
 
     const dept = departments.find(d => d.id === String(p.department_id)) || departments[0];
-    const laborRate = dept?.costPerHour || 50;
-    const laborCost = safeRound(loggedHours * laborRate);
-    const allocatedOverhead = safeRound(projDirectExp * 0.15);
-    const totalBurn = safeRound(projDirectExp + laborCost + allocatedOverhead);
+    const laborCost = cp ? safeRound(cp.laborCost || 0) : 0;
+    const allocatedOverhead = cp ? safeRound(cp.assignedOverhead || 0) : 0;
+    const totalBurn = cp ? safeRound(cp.actualCost) : safeRound(projDirectExp + laborCost + allocatedOverhead);
     const remainingBudget = safeRound(budget - totalBurn);
     const operatingProfit = safeRound(projRev - totalBurn);
-    const marginPercent = safePercent(operatingProfit, projRev);
+    const marginPercent = projRev > 0 ? safePercent(operatingProfit, projRev) : 0;
     const markupPercent = totalBurn > 0 ? safeRound((operatingProfit / totalBurn) * 100, 1) : 0;
 
     return {
@@ -922,7 +984,13 @@ export async function buildOrganizationFinancialDossier(
     };
   });
 
-  const totalQuotedPipeline = safeRound(projects.filter(p => p.status === 'quoted').reduce((s, p) => s + p.quotedAmount, 0));
+  // Unbilled quoted / contracted value across quoted and active projects (§12.4, §14)
+  const unbilledQuotedProjects = projects.filter(
+    (p) => p.status !== 'cancelled' && p.status !== 'completed' && Math.max(0, p.quotedAmount - p.recognizedRevenue) > 0
+  );
+  const totalQuotedPipeline = safeRound(
+    unbilledQuotedProjects.reduce((s, p) => s + Math.max(0, p.quotedAmount - p.recognizedRevenue), 0)
+  );
 
   // Client Profitability Rollup (§12.5)
   const clientMap = new Map<string, ProjectMetric[]>();
@@ -1000,14 +1068,14 @@ export async function buildOrganizationFinancialDossier(
   // Strategic Improvements & Quantified CFO Prescriptions
   const strategicImprovements: StrategicImprovement[] = [];
 
-  // 1. Quoted Pipeline Conversion
+  // 1. Quoted Pipeline Conversion / Unbilled Contracted Backlog
   if (totalQuotedPipeline > 0) {
     const depositAmount = safeRound(totalQuotedPipeline * 0.3);
     strategicImprovements.push({
       id: 'strat-convert-quotes',
       category: 'revenue_acceleration',
-      title: 'Monetize Pending Quoted Pipeline',
-      prescription: `You have ${formatCurrencyValue(totalQuotedPipeline, orgCurrency)} in quoted pipeline across ${projects.filter(p => p.status === 'quoted').map(p => `${p.name} (${formatCurrencyValue(p.quotedAmount, orgCurrency)})`).join(', ')}. Contract these with a standard 30% upfront milestone deposit to immediately inject ${formatCurrencyValue(depositAmount, orgCurrency)} of non-dilutive operating cash into your accounts.`,
+      title: 'Monetize Unbilled Quoted Pipeline',
+      prescription: `You have ${formatCurrencyValue(totalQuotedPipeline, orgCurrency)} in unbilled quoted value across ${unbilledQuotedProjects.map(p => `${p.name} (${formatCurrencyValue(Math.max(0, p.quotedAmount - p.recognizedRevenue), orgCurrency)} unbilled)`).join(', ')}. Invoice milestone deposits (30% upfront) to inject ${formatCurrencyValue(depositAmount, orgCurrency)} of operating cash into your accounts.`,
       quantifiedImpact: {
         monthlySavingsOrRevenue: depositAmount,
         runwayExtensionMonths: monthlyBurnRate > 0 ? safeRound(depositAmount / monthlyBurnRate, 1) : 2,
