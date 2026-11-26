@@ -7,7 +7,7 @@ import crypto from 'node:crypto';
 import { Router, type Request, type Response } from 'express';
 import { ok, fail } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
-import { postTransactionToJournal } from '../lib/ledgerService.js';
+import { postTransactionToJournal, postBalancedJournalEntry, resolveGlAccountId } from '../lib/ledgerService.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { recomputeServerBankBalance } from './transactions.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -942,7 +942,23 @@ export function createImportsRouter(): Router {
 
         if (batchRows && batchRows.length > 0) {
           let glPostedCount = 0;
+          let invoicesMatchedCount = 0;
           const glErrors: string[] = [];
+
+          // Preload open client invoices for imported-bank AR settlement matching (§29 #5, §33 #3, #7)
+          let openInvoices: any[] = [];
+          try {
+            const { data: invRows } = await sb
+              .from('invoices')
+              .select('id, invoice_number, client_name, project_id, currency, total_amount, amount_paid, amount_due, status')
+              .eq('organization_id', orgId)
+              .in('status', ['issued', 'partially_paid', 'overdue'])
+              .gt('amount_due', 0);
+            if (Array.isArray(invRows)) openInvoices = invRows;
+          } catch {
+            /* graceful if invoices table is unavailable */
+          }
+
           for (const txn of batchRows) {
             const narr = (txn.narration || txn.description || '').toLowerCase();
             const isAtm = /\b(atm|cash wdl|cash withdrawal|atm w\/d)\b/i.test(narr);
@@ -957,6 +973,152 @@ export function createImportsRouter(): Router {
                 tags: Array.from(new Set([...existingTags, 'transfer', 'atm-withdrawal', 'pending-transfer'])),
               }).eq('id', txn.id);
             }
+
+            // §29 #5: Imported-bank credit ↔ Open Invoice AR settlement (prevents double-counting revenue)
+            let settledViaInvoice = false;
+            if (
+              txn.type === 'credit' &&
+              (txn.world_scope || 'business') !== 'personal' &&
+              openInvoices.length > 0
+            ) {
+              const txnAmt = Math.abs(Number(txn.amount || 0));
+              const txnCurr = String(txn.currency || 'USD').toUpperCase().trim();
+              const matchedInv =
+                openInvoices.find((inv: any) => {
+                  const invDue = Number(inv.amount_due || 0);
+                  const invCurr = String(inv.currency || 'USD').toUpperCase().trim();
+                  const invNum = String(inv.invoice_number || '').trim().toLowerCase();
+                  return invDue > 0 && invCurr === txnCurr && invNum.length >= 3 && narr.includes(invNum);
+                }) ||
+                openInvoices.find((inv: any) => {
+                  const invDue = Number(inv.amount_due || 0);
+                  const invCurr = String(inv.currency || 'USD').toUpperCase().trim();
+                  const clientName = String(inv.client_name || '').trim().toLowerCase();
+                  return (
+                    invDue > 0 &&
+                    invCurr === txnCurr &&
+                    clientName.length >= 3 &&
+                    narr.includes(clientName) &&
+                    Math.abs(txnAmt - invDue) <= 0.01
+                  );
+                });
+
+              if (matchedInv && txnAmt > 0) {
+                try {
+                  // Idempotency guard: never settle the same bank transaction twice
+                  const { data: existingPay } = await sb
+                    .from('invoice_payments')
+                    .select('id')
+                    .eq('organization_id', orgId)
+                    .eq('settlement_transaction_id', txn.id)
+                    .maybeSingle();
+
+                  if (!existingPay) {
+                    const currentDue = Math.max(0, Number(matchedInv.amount_due || 0));
+                    const appliedAmt = Math.round(Math.min(txnAmt, currentDue) * 100) / 100;
+                    const overpaymentAmt = Math.round(Math.max(0, txnAmt - appliedAmt) * 100) / 100;
+
+                    let bankGlId = '';
+                    if (txn.bank_account_id) {
+                      const { data: ba } = await sb
+                        .from('bank_accounts')
+                        .select('account_id')
+                        .eq('id', txn.bank_account_id)
+                        .eq('organization_id', orgId)
+                        .maybeSingle();
+                      bankGlId = ba?.account_id || '';
+                    }
+                    if (!bankGlId) {
+                      bankGlId = await resolveGlAccountId(sb, orgId, 'asset', ['bank_account', 'cash']);
+                    }
+                    const arGlId = await resolveGlAccountId(sb, orgId, 'asset', ['receivable', 'accounts_receivable']);
+                    const creditLines: Array<{ accountId: string; bankAccountId?: string | null; debit: number; credit: number; description: string }> = [
+                      { accountId: bankGlId, bankAccountId: txn.bank_account_id || null, debit: txnAmt, credit: 0, description: `Bank receipt settling ${matchedInv.invoice_number}` },
+                      { accountId: arGlId, debit: 0, credit: appliedAmt, description: `Accounts Receivable settled (${matchedInv.invoice_number} - ${matchedInv.client_name})` },
+                    ];
+                    if (overpaymentAmt > 0) {
+                      const unearnedGlId = await resolveGlAccountId(sb, orgId, 'liability', ['unearned', 'customer_credit', 'deferred', 'payable']);
+                      creditLines.push({
+                        accountId: unearnedGlId,
+                        debit: 0,
+                        credit: overpaymentAmt,
+                        description: `Client overpayment credit (${matchedInv.invoice_number})`,
+                      });
+                    }
+
+                    const jeRes = await postBalancedJournalEntry(sb, {
+                      organizationId: orgId,
+                      entryDate: txn.date,
+                      description: `Invoice Settlement (${matchedInv.invoice_number}) - ${matchedInv.client_name}`,
+                      sourceType: 'transaction',
+                      sourceId: String(txn.id),
+                      currency: txnCurr,
+                      actorUserId: (req as any).authUser?.id || null,
+                      entryPrefix: 'INVSET',
+                      lines: creditLines,
+                    });
+
+                    if (jeRes.success && jeRes.journalEntryId) {
+                      const payId = `pay-imp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+                      await sb.from('invoice_payments').insert({
+                        id: payId,
+                        invoice_id: matchedInv.id,
+                        organization_id: orgId,
+                        payment_date: txn.date,
+                        amount: appliedAmt,
+                        currency: txnCurr,
+                        payment_method: 'bank_transfer',
+                        reference_number: matchedInv.invoice_number,
+                        settlement_transaction_id: txn.id,
+                        notes: `Auto-matched from imported statement (${safeName})`,
+                        created_by: (req as any).authUser?.id || null,
+                      });
+
+                      const newPaid = Math.round((Number(matchedInv.amount_paid || 0) + appliedAmt) * 100) / 100;
+                      const newDue = Math.max(0, Math.round((Number(matchedInv.total_amount || 0) - newPaid) * 100) / 100);
+                      const newStatus = newDue <= 0 ? 'paid' : 'partially_paid';
+
+                      await sb
+                        .from('invoices')
+                        .update({
+                          amount_paid: newPaid,
+                          amount_due: newDue,
+                          status: newStatus,
+                          updated_at: new Date().toISOString(),
+                        })
+                        .eq('id', matchedInv.id)
+                        .eq('organization_id', orgId);
+
+                      matchedInv.amount_paid = newPaid;
+                      matchedInv.amount_due = newDue;
+                      matchedInv.status = newStatus;
+
+                      const existingTags = Array.isArray(txn.tags) ? txn.tags : [];
+                      await sb
+                        .from('transactions')
+                        .update({
+                          journal_entry_id: jeRes.journalEntryId,
+                          project_id: txn.project_id || matchedInv.project_id || null,
+                          status: 'reconciled',
+                          tags: Array.from(new Set([...existingTags, 'invoice-settlement', `invoice:${matchedInv.invoice_number}`])),
+                        })
+                        .eq('id', txn.id)
+                        .eq('organization_id', orgId);
+
+                      settledViaInvoice = true;
+                      glPostedCount++;
+                      invoicesMatchedCount++;
+                    }
+                  } else {
+                    settledViaInvoice = true;
+                  }
+                } catch (invErr: any) {
+                  console.warn('[imports] Invoice auto-match warning (falling back to standard GL):', invErr?.message);
+                }
+              }
+            }
+
+            if (settledViaInvoice) continue;
 
             // Post classified transactions to General Ledger (§10, idempotent via ledgerService)
             if (txn.status === 'classified' || txn.category_id) {
@@ -984,6 +1146,9 @@ export function createImportsRouter(): Router {
           }
           if (data && typeof data === 'object') {
             data.glPostedCount = glPostedCount;
+            if (invoicesMatchedCount > 0) {
+              data.invoicesMatchedCount = invoicesMatchedCount;
+            }
             if (glErrors.length > 0) {
               data.glErrors = glErrors;
             }

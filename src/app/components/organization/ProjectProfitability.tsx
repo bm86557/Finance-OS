@@ -28,7 +28,9 @@ import {
   ShieldAlert,
   Users,
   Clock,
+  FileText,
 } from 'lucide-react';
+import { apiGet, apiPostJson } from '@/lib/apiClient';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { toast } from 'sonner';
 import { AXIOM } from '../../../styles/axiom-tokens';
@@ -417,6 +419,18 @@ export function ProjectProfitability() {
   const [isSavingForm, setIsSavingForm] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
 
+  // Create & Issue Client Invoice modal (isolated from project profitability math)
+  const [invoiceProject, setInvoiceProject] = useState<(typeof enrichedProjects)[0] | null>(null);
+  const [invoiceNumber, setInvoiceNumber] = useState('');
+  const [invoiceAmount, setInvoiceAmount] = useState('');
+  const [invoiceIssueDate, setInvoiceIssueDate] = useState('');
+  const [invoiceDueDate, setInvoiceDueDate] = useState('');
+  const [invoiceDescription, setInvoiceDescription] = useState('');
+  const [isCreatingInvoice, setIsCreatingInvoice] = useState(false);
+  const [invoiceError, setInvoiceError] = useState<string | null>(null);
+  const [projectInvoices, setProjectInvoices] = useState<any[]>([]);
+  const [loadingProjectInvoices, setLoadingProjectInvoices] = useState(false);
+
   const [selectedProject, setSelectedProject] = useState<(typeof enrichedProjects)[0] | null>(null);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
 
@@ -749,6 +763,110 @@ export function ProjectProfitability() {
   const openCompleteModal = (project: (typeof enrichedProjects)[0]) => {
     setCompletingProject(project);
     setCompletionDateInput(project.completedAt?.slice(0, 10) || todayYmdCalendar());
+  };
+
+  const loadProjectInvoices = async (projectId: string) => {
+    if (!svc.orgId) return;
+    setLoadingProjectInvoices(true);
+    try {
+      const res = await apiGet<{ items?: any[] }>(
+        `/organizations/${encodeURIComponent(svc.orgId)}/invoices?projectId=${encodeURIComponent(projectId)}&pageSize=50`,
+      );
+      if (res.success && Array.isArray(res.data?.items)) {
+        setProjectInvoices(res.data.items);
+      } else {
+        setProjectInvoices([]);
+      }
+    } catch {
+      setProjectInvoices([]);
+    } finally {
+      setLoadingProjectInvoices(false);
+    }
+  };
+
+  const openInvoiceModal = (project: (typeof enrichedProjects)[0]) => {
+    const today = todayYmdCalendar();
+    const due = new Date();
+    due.setDate(due.getDate() + 10);
+    setInvoiceProject(project);
+    setInvoiceNumber('');
+    setInvoiceAmount(project.quotedAmount > 0 ? String(project.quotedAmount) : '');
+    setInvoiceIssueDate(today);
+    setInvoiceDueDate(due.toISOString().slice(0, 10));
+    setInvoiceDescription(`${project.name} - Milestone Invoice`);
+    setInvoiceError(null);
+    setProjectInvoices([]);
+    void loadProjectInvoices(project.id);
+  };
+
+  const handleCreateAndIssueInvoice = async () => {
+    if (!invoiceProject || !svc.orgId) return;
+    setInvoiceError(null);
+    const amt = parseFloat(invoiceAmount);
+    if (Number.isNaN(amt) || amt <= 0) {
+      const msg = 'Enter a valid invoice amount greater than 0.';
+      setInvoiceError(msg);
+      toast.error(msg);
+      return;
+    }
+    if (!invoiceDueDate) {
+      const msg = 'Please select a due date.';
+      setInvoiceError(msg);
+      toast.error(msg);
+      return;
+    }
+
+    setIsCreatingInvoice(true);
+    try {
+      const createRes = await apiPostJson<any, any>(
+        `/organizations/${encodeURIComponent(svc.orgId)}/invoices`,
+        {
+          invoiceNumber: invoiceNumber.trim() || undefined,
+          clientName: invoiceProject.clientName || invoiceProject.name,
+          projectId: invoiceProject.id,
+          issueDate: invoiceIssueDate || todayYmdCalendar(),
+          dueDate: invoiceDueDate,
+          currency: invoiceProject.currency || displayCurrency,
+          lines: [
+            {
+              description: invoiceDescription.trim() || `${invoiceProject.name} - Invoice`,
+              quantity: 1,
+              unitPrice: amt,
+            },
+          ],
+        },
+      );
+      if (!createRes.success || !createRes.data?.id) {
+        const msg = createRes.error || 'Could not create invoice';
+        setInvoiceError(msg);
+        toast.error(msg);
+        return;
+      }
+
+      const invId = String(createRes.data.id);
+      const invNum = String(createRes.data.invoiceNumber || createRes.data.invoice_number || invoiceNumber.trim() || invId);
+      const issueRes = await apiPostJson<any, any>(
+        `/organizations/${encodeURIComponent(svc.orgId)}/invoices/${encodeURIComponent(invId)}/issue`,
+        {},
+      );
+      if (!issueRes.success) {
+        const msg = issueRes.error || 'Invoice created as draft, but could not be issued';
+        setInvoiceError(msg);
+        toast.error(msg);
+        return;
+      }
+
+      toast.success(`Invoice ${invNum} (${formatCurrency(amt, invoiceProject.currency || displayCurrency)}) issued — now visible in Upcoming Payments.`);
+      setInvoiceNumber('');
+      setInvoiceAmount('');
+      await loadProjectInvoices(invoiceProject.id);
+    } catch (err: any) {
+      const msg = err?.message || 'Unexpected error creating invoice';
+      setInvoiceError(msg);
+      toast.error(msg);
+    } finally {
+      setIsCreatingInvoice(false);
+    }
   };
 
   const handleConfirmComplete = async () => {
@@ -1184,6 +1302,15 @@ export function ProjectProfitability() {
                       >
                         <Edit3 className="size-3.5" />
                         Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openInvoiceModal(project)}
+                        className="px-3 py-1.5 rounded-lg flex items-center gap-1.5 text-xs font-medium text-amber-300 hover:text-amber-200 hover:bg-amber-500/15 border border-amber-500/35 transition-all cursor-pointer"
+                        title="Create & issue a client invoice (shows in Upcoming Payments & auto-matches bank statement imports)"
+                      >
+                        <FileText className="size-3.5" />
+                        + Invoice
                       </button>
                       <button
                         type="button"
@@ -1680,6 +1807,178 @@ export function ProjectProfitability() {
                 >
                   Close
                 </button>
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Create & Issue Client Invoice Modal (Feeds Upcoming Payments & Statement Auto-Match; does not alter project profitability) */}
+      <Dialog open={Boolean(invoiceProject)} onOpenChange={open => { if (!open) setInvoiceProject(null); }}>
+        <DialogContent
+          className="sm:max-w-lg max-h-[90vh] overflow-y-auto text-white"
+          style={{ background: '#0b1120', border: AXIOM.containers.list.border }}
+        >
+          <DialogHeader>
+            <DialogTitle className="text-white flex items-center gap-2">
+              <FileText className="size-5 text-amber-400" />
+              Create &amp; Issue Client Invoice
+            </DialogTitle>
+            <DialogDescription className="text-slate-400">
+              Issues an open receivable for {invoiceProject?.clientName || invoiceProject?.name}. Appears in Finance OS Upcoming Payments and auto-settles when matched on a bank statement import.
+            </DialogDescription>
+          </DialogHeader>
+
+          {invoiceProject && (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-slate-200 text-xs font-medium mb-1.5 block">Invoice # (optional)</label>
+                  <input
+                    value={invoiceNumber}
+                    onChange={e => setInvoiceNumber(e.target.value)}
+                    placeholder="e.g. INV-2026-092"
+                    className="w-full px-3 py-2 rounded-xl text-white text-sm font-mono"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  />
+                </div>
+                <div>
+                  <label className="text-slate-200 text-xs font-medium mb-1.5 block">Amount ({invoiceProject.currency || displayCurrency}) *</label>
+                  <input
+                    type="number"
+                    min={0.01}
+                    step="0.01"
+                    value={invoiceAmount}
+                    onChange={e => setInvoiceAmount(e.target.value)}
+                    placeholder="6425"
+                    className="w-full px-3 py-2 rounded-xl text-white text-sm font-mono"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-slate-200 text-xs font-medium mb-1.5 block">Issue Date</label>
+                  <input
+                    type="date"
+                    value={invoiceIssueDate}
+                    onChange={e => setInvoiceIssueDate(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl text-white text-sm"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  />
+                </div>
+                <div>
+                  <label className="text-slate-200 text-xs font-medium mb-1.5 block">Due Date *</label>
+                  <input
+                    type="date"
+                    value={invoiceDueDate}
+                    onChange={e => setInvoiceDueDate(e.target.value)}
+                    className="w-full px-3 py-2 rounded-xl text-white text-sm"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-slate-200 text-xs font-medium mb-1.5 block">Line Description</label>
+                <input
+                  value={invoiceDescription}
+                  onChange={e => setInvoiceDescription(e.target.value)}
+                  placeholder="Milestone description"
+                  className="w-full px-3 py-2 rounded-xl text-white text-sm"
+                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                />
+              </div>
+
+              {invoiceError && (
+                <div
+                  className="p-3 rounded-xl text-xs text-rose-300 flex items-center gap-2"
+                  style={{ background: 'rgba(244, 63, 94, 0.14)', border: '1px solid rgba(244, 63, 94, 0.4)' }}
+                >
+                  <AlertTriangle className="size-4 shrink-0 text-rose-400" />
+                  <span>{invoiceError}</span>
+                </div>
+              )}
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setInvoiceProject(null)}
+                  className="flex-1 px-4 py-2.5 rounded-xl text-sm font-medium cursor-pointer"
+                  style={AXIOM.buttons.secondary}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  disabled={isCreatingInvoice}
+                  onClick={() => void handleCreateAndIssueInvoice()}
+                  className="flex-1 px-4 py-2.5 rounded-xl text-sm font-semibold text-white bg-amber-600 hover:bg-amber-500 transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {isCreatingInvoice ? 'Issuing…' : 'Create & Issue Invoice'}
+                </button>
+              </div>
+
+              {/* Project Invoices List */}
+              <div className="pt-4 border-t border-slate-800 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+                    Project Invoices ({projectInvoices.length})
+                  </span>
+                  {loadingProjectInvoices && (
+                    <span className="text-[11px] text-slate-400">Loading…</span>
+                  )}
+                </div>
+
+                {!loadingProjectInvoices && projectInvoices.length === 0 ? (
+                  <p className="text-xs text-slate-500 py-2">No invoices issued for this project yet.</p>
+                ) : (
+                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                    {projectInvoices.map((inv: any) => {
+                      const invCur = inv.currency || invoiceProject.currency || displayCurrency;
+                      const st = String(inv.status || 'draft');
+                      const badgeCls =
+                        st === 'paid'
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : st === 'partially_paid'
+                            ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                            : st === 'voided'
+                              ? 'bg-slate-700/40 text-slate-400 border-slate-600'
+                              : 'bg-amber-500/20 text-amber-300 border-amber-500/40';
+                      return (
+                        <div
+                          key={inv.id}
+                          className="p-3 rounded-xl bg-slate-900/70 border border-slate-800 flex items-center justify-between gap-3 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono font-semibold text-white truncate">
+                                {inv.invoice_number}
+                              </span>
+                              <span className={`px-2 py-0.5 rounded-md border text-[10px] font-semibold uppercase ${badgeCls}`}>
+                                {st.replace('_', ' ')}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-400 mt-0.5">
+                              Issued {inv.issue_date ? formatDate(inv.issue_date) : '—'} · Due {inv.due_date ? formatDate(inv.due_date) : '—'}
+                            </p>
+                          </div>
+                          <div className="text-right shrink-0 tabular-nums">
+                            <p className="font-semibold text-white">
+                              {formatCurrency(Number(inv.total_amount || 0), invCur)}
+                            </p>
+                            <p className="text-[11px] text-slate-400">
+                              {Number(inv.amount_due || 0) > 0
+                                ? `Due ${formatCurrency(Number(inv.amount_due || 0), invCur)}`
+                                : `Paid ${formatCurrency(Number(inv.amount_paid || 0), invCur)}`}
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             </div>
           )}

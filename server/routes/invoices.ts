@@ -8,6 +8,7 @@ import { ok, fail, notFound, created } from '../lib/http.js';
 import { getSupabaseAdminClient } from '../lib/supabaseAdmin.js';
 import { logAuditEvent } from '../lib/auditLogger.js';
 import { requirePermission } from '../middleware/auth.js';
+import { postBalancedJournalEntry, resolveGlAccountId } from '../lib/ledgerService.js';
 
 function getOrgId(req: Request): string {
   const p = req.params.organizationId;
@@ -249,6 +250,32 @@ export function createInvoicesRouter(): Router {
     if (!inv) return notFound(res, 'Invoice not found');
 
     const nextStatus = inv.amount_paid > 0 ? (inv.amount_paid >= inv.total_amount ? 'paid' : 'partially_paid') : 'issued';
+    const totalAmt = Number(inv.total_amount || 0);
+    let journalEntryId: string | null = null;
+
+    // §8 L373 & §33 #3: Post balanced accrual journal (Dr Accounts Receivable / Cr Revenue) once on draft -> issued
+    if (inv.status === 'draft' && totalAmt > 0) {
+      const arGlId = await resolveGlAccountId(sb, orgId, 'asset', ['receivable', 'accounts_receivable']);
+      const revGlId = await resolveGlAccountId(sb, orgId, 'income', ['service_revenue', 'revenue', 'sales', 'income']);
+      const jeRes = await postBalancedJournalEntry(sb, {
+        organizationId: orgId,
+        entryDate: String(inv.issue_date || new Date().toISOString().slice(0, 10)),
+        description: `Invoice Issued (${inv.invoice_number}) - ${inv.client_name}`,
+        sourceType: 'transaction',
+        sourceId: `invoice:${inv.id}`,
+        currency: String(inv.currency || 'USD').toUpperCase(),
+        actorUserId: req.authUser?.id || null,
+        entryPrefix: 'INVISS',
+        lines: [
+          { accountId: arGlId, debit: totalAmt, credit: 0, description: `Accounts Receivable (${inv.invoice_number} - ${inv.client_name})` },
+          { accountId: revGlId, debit: 0, credit: totalAmt, description: `Invoiced revenue (${inv.invoice_number} - ${inv.client_name})` },
+        ],
+      });
+      if (!jeRes.success) {
+        return fail(res, 400, `Invoice issue journal posting failed: ${jeRes.error || 'Unable to post balanced AR journal'}`);
+      }
+      journalEntryId = jeRes.journalEntryId || null;
+    }
 
     const { data: updated, error: updErr } = await sb
       .from('invoices')
@@ -263,10 +290,10 @@ export function createInvoicesRouter(): Router {
       action: 'update',
       entity: 'invoice',
       entityId: req.params.id,
-      details: { fromStatus: inv.status, toStatus: nextStatus },
+      details: { fromStatus: inv.status, toStatus: nextStatus, journalEntryId },
     });
 
-    return ok(res, updated, `Invoice issued successfully as '${nextStatus}'`);
+    return ok(res, { ...updated, journalEntryId }, `Invoice issued successfully as '${nextStatus}'`);
   });
 
   // POST /:id/payments — Record collection payment against invoice (X-12)
