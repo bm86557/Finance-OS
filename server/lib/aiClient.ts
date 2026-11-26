@@ -794,10 +794,11 @@ export async function classifyBatchWithAI(
   const uniqueKeys = Array.from(dedupeMap.keys());
   console.log(`[aiClient] Deduplicated ${needsAI.length} → ${uniqueKeys.length} unique transactions for LLM`);
 
-  // ═══ PHASE 2: Parallel AI classification in compact chunks via Unified AI Gateway ═══
-  // Keep chunks compact (5 rows) so JSON output never truncates on reasoning models and runs fast in parallel.
-  const CHUNK_SIZE = 5;
-  const MAX_PARALLEL = 3;
+  // ═══ PHASE 2: Sequential AI classification in 7-row chunks via Unified AI Gateway ═══
+  // 7 rows fit comfortably within Groq's 1,400-token output cap while avoiding concurrent
+  // burst 429/503 drops on Gemini/Groq free tiers so 100% of rows classify via AI.
+  const CHUNK_SIZE = 7;
+  const MAX_PARALLEL = 1;
 
   const startAI = Date.now();
   const chunks: number[][] = [];
@@ -954,8 +955,10 @@ async function classifyChunkWithAI(
 Existing Categories: ${categoryList}${learningBlock}
 Rules:
 1. Match type (exp=expense, inc=income).
-2. ${personalEnabled ? 'Classify world as "business" (company/agency operations, inventory/restock, hardware/equipment, SaaS, payroll, client revenue) or "personal" (groceries, gym, pharmacy, cinema, family, personal shopping/draw).' : 'Always set world="business".'}
-3. Understand FULL meaning (e.g., "Purchase: Nokia Mobile - Restock PO" is Inventory & Stock / Cost of Goods Sold, NOT generic "Debit Purchases" or "Buffer").
+2. ${personalEnabled ? 'Classify world as "business" (company/agency operations, inventory/restock, hardware/equipment, SaaS, payroll, client revenue) or "personal" (groceries, gym, pharmacy, cinema, streaming, family, personal shopping/draw). Whenever you pick a Personal* category (e.g. Personal Wellness, Personal Groceries, Personal Medical, Personal Entertainment), world MUST be "personal".' : 'Always set world="business".'}
+3. Understand FULL meaning:
+   - Employee salary/payroll/payslip/wages (e.g. "Monthly Salary - John (Marketing Manager)") is ALWAYS "Payroll & Salaries" (world="business"), NEVER "Advertising & Marketing" or a department expense category.
+   - "Purchase: Nokia Mobile - Restock PO" is Inventory & Stock / Cost of Goods Sold, NOT generic "Debit Purchases" or "Buffer".
 4. Follow Organization Confirmed Rules and Recent Human Corrections when applicable.
 5. Prefer an existing SPECIFIC category when it accurately fits. NEVER dump specialized commercial transactions (inventory/restock POs, hardware/equipment, utilities, legal/professional services, bank fees) into vague catch-all categories like "Debit Purchases", "Buffer", "General", "Misc", or "Other" — instead set createNewCategory:true, newCategoryName:"Canonical Name" (e.g. "Inventory & Stock"), suggestedCategory:"Canonical Name", and place the generic category in "alternatives" with confidence <= 55.
 6. ALWAYS include up to 2 sensible "alternatives" from Existing Categories with confidence and short reasoning.
@@ -1034,17 +1037,45 @@ Return ONLY valid JSON:
               }))
           : [];
         const txnForIdx = allTransactions[item.index];
+        let resolvedCategory = String(item.suggestedCategory || newCatName || '').trim();
+        let resolvedCreateNew = createNew;
+        let resolvedNewCatName = newCatName;
+        let resolvedWorld: 'business' | 'personal' = item.world === 'personal' && personalEnabled ? 'personal' : 'business';
+
+        if (txnForIdx) {
+          const narrLower = txnForIdx.narration.toLowerCase();
+          // Guard 1: Salary/Payroll transactions must map to Payroll & Salaries (not Advertising/Marketing because of job title)
+          if (txnForIdx.type === 'debit' && /\b(monthly salary|salary|payroll|payslip|wages)\b/i.test(narrLower)) {
+            const payrollCat = availableCategories.find(
+              c => c.type === 'expense' && /\b(payroll|salar)/i.test(c.name)
+            );
+            if (payrollCat && !/\b(payroll|salar)/i.test(resolvedCategory)) {
+              resolvedCategory = payrollCat.name;
+              resolvedCreateNew = false;
+              resolvedNewCatName = undefined;
+            }
+            resolvedWorld = 'business';
+          } else if (personalEnabled) {
+            // Guard 2: Keep world consistent with Personal* categories or explicit personal narrations
+            const catLooksPersonal = /\bpersonal\b/i.test(resolvedCategory);
+            const narrLooksPersonal = /\b(personal\s+(gym|grocery|groceries|pharmacy|medical|streaming|shopping|expense)|grocery shopping|gym membership|family cinema|whole foods|trader joe|equinox|walgreens|cvs pharmacy|netflix|spotify family)\b/i.test(narrLower);
+            if (catLooksPersonal || narrLooksPersonal) {
+              resolvedWorld = 'personal';
+            }
+          }
+        }
+
         const baseClassified: BatchItemClassification = {
           index: item.index,
-          suggestedCategory: String(item.suggestedCategory || newCatName || '').trim(),
+          suggestedCategory: resolvedCategory,
           confidence: Math.max(30, Math.min(95, Math.round(Number(item.confidence) || 75))),
           reasoning: String(item.reasoning || 'AI classified').substring(0, 150),
-          world: item.world === 'personal' && personalEnabled ? 'personal' : 'business',
+          world: resolvedWorld,
           worldReason: item.worldReason ? String(item.worldReason).substring(0, 120) : undefined,
           suggestedDepartment: item.suggestedDepartment ? String(item.suggestedDepartment).trim() : undefined,
           alternatives: alts,
-          createNewCategory: createNew,
-          newCategoryName: newCatName,
+          createNewCategory: resolvedCreateNew,
+          newCategoryName: resolvedNewCatName,
           usedAI: true,
           modelUsed,
         };

@@ -401,18 +401,10 @@ export function createClassificationRouter(): Router {
       void recordRuleMatchUsage(sb, orgId, [ruleResult.matchedRuleId]);
     }
 
-    // 2. Enforce Handoff §11 deterministic precedence:
-    // Return deterministic rule result immediately if AI is disabled OR if an unambiguous
-    // high-confidence approved organization rule matched (unless forceAI is explicitly requested).
-    const forceAI = Boolean((req.body as any)?.forceAI);
-    const hasDeterministicRuleWin = Boolean(
-      !forceAI &&
-      ruleResult.matchedRuleId &&
-      !(ruleResult.riskFlags || []).includes('rule_conflict') &&
-      ruleResult.categoryId &&
-      ruleResult.confidence >= tenantPolicy.highThreshold
-    );
-    if (useAI === false || hasDeterministicRuleWin) {
+    // 2. AI-first priority: when useAI !== false, always consult AI grounded with org rules,
+    // human corrections, and departments so AI accurately determines business vs personal world
+    // and commercial intent. Return deterministic rules directly only when useAI === false.
+    if (useAI === false) {
       let finalCatId = ruleResult.categoryId;
       let finalCatName = ruleResult.categoryName;
       let proposedNewCategory = ruleResult.proposedNewCategory || null;
@@ -478,7 +470,7 @@ export function createClassificationRouter(): Router {
         );
 
         const inferredWorld: 'business' | 'personal' =
-          personalWorldEnabled && (aiResult.world === 'personal' || ruleResult.world === 'personal')
+          personalWorldEnabled && aiResult.world === 'personal'
             ? 'personal'
             : 'business';
 
@@ -657,15 +649,9 @@ export function createClassificationRouter(): Router {
       ruleResults.set(index, ruleRes);
       if (ruleRes.matchedRuleId) matchedRuleIds.push(ruleRes.matchedRuleId);
 
-      const hasDeterministicRuleWin = Boolean(
-        !forceAI &&
-        ruleRes.matchedRuleId &&
-        !(ruleRes.riskFlags || []).includes('rule_conflict') &&
-        ruleRes.categoryId &&
-        ruleRes.confidence >= tenantPolicy.highThreshold
-      );
-
-      if (useAI !== true || hasDeterministicRuleWin) {
+      // AI-first priority: when useAI === true, route all rows through AI (grounded with org rules & corrections
+      // in learningContext) so AI accurately classifies business vs personal world and categories.
+      if (useAI !== true) {
         const suggestedDeptId =
           ruleRes.suggestedDepartmentId ||
           (await inferDepartment(orgId, txn.narration, ruleRes.categoryName));
@@ -713,14 +699,18 @@ export function createClassificationRouter(): Router {
 
             if (!item) continue;
 
-            const inferredWorld: 'business' | 'personal' =
-              personalWorldEnabled && (item.world === 'personal' || ruleRes.world === 'personal')
-                ? 'personal'
-                : 'business';
-
             const exactCat = item.createNewCategory
               ? undefined
               : findExactOrCloseCategory(item.suggestedCategory, categories, txn.type);
+
+            const catNameLooksPersonal = /\bpersonal\b/i.test(exactCat?.name || item.newCategoryName || item.suggestedCategory || '');
+            const inferredWorld: 'business' | 'personal' =
+              personalWorldEnabled && (
+                catNameLooksPersonal ||
+                (item.usedAI !== false ? item.world === 'personal' : (item.world === 'personal' || ruleRes.world === 'personal'))
+              )
+                ? 'personal'
+                : 'business';
 
             let categoryId = exactCat?.id || '';
             let categoryName = exactCat?.name || '';
@@ -748,7 +738,7 @@ export function createClassificationRouter(): Router {
 
             const riskFlags = Array.from(new Set([
               ...(ruleRes.riskFlags || []),
-              ...(inferredWorld === 'personal' && (world || 'business') === 'business' ? ['CROSS_WORLD_AMBIGUITY'] : []),
+              ...(inferredWorld === 'personal' && world === 'business' ? ['CROSS_WORLD_AMBIGUITY'] : []),
             ]));
 
             const confidenceBand =

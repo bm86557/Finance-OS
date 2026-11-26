@@ -646,9 +646,10 @@ export function createInventoryRouter(): Router {
 
           console.log('[inventory] ✅ Found bank account, balance:', bankAccount.balance);
 
-          const amount = data.type === 'purchase' ? -Math.abs(data.totalAmount) : Math.abs(data.totalAmount);
+          const absTotal = Math.abs(Number(data.totalAmount || 0));
+          const signedDelta = data.type === 'purchase' ? -absTotal : absTotal;
 
-          // Insert financial transaction
+          // Insert financial transaction (always store positive amount with explicit debit/credit type)
           const { data: financialTxn, error: finTxnError } = await supabase
             .from('transactions')
             .insert({
@@ -657,13 +658,12 @@ export function createInventoryRouter(): Router {
               date: data.date,
               description: `${data.type === 'purchase' ? 'Inventory Purchase' : data.type === 'sale' ? 'Inventory Sale' : 'Inventory Adjustment'} - ${item.name}`,
               narration: `${data.type === 'purchase' ? 'Purchase' : data.type === 'sale' ? 'Sale' : 'Adjustment'}: ${item.name} (${Math.abs(data.quantity)} ${item.unit})${data.referenceNumber ? ` - Ref: ${data.referenceNumber}` : ''}${data.notes ? ` - ${data.notes}` : ''}`,
-              amount: amount,
+              amount: absTotal,
               currency: bankAccount.currency || 'USD',
               type: data.type === 'purchase' ? 'debit' : 'credit',
               category_id: null,
-              status: 'classified', // Use 'classified' instead of 'completed'
-              tags: ['inventory', `inv-item:${item.id}`],
-              // Note: metadata is not a column in the schema, removed
+              status: 'classified',
+              tags: ['inventory', `inv-item:${item.id}`, 'business'],
             })
             .select()
             .single();
@@ -676,7 +676,7 @@ export function createInventoryRouter(): Router {
           console.log(`[inventory] ✅ Created financial transaction ${financialTxn.id} for inventory ${data.type}`);
 
           // Update bank account balance
-          const newBalance = Math.round((bankAccount.balance + amount) * 100) / 100;
+          const newBalance = Math.round((Number(bankAccount.balance || 0) + signedDelta) * 100) / 100;
           const { error: balanceError } = await supabase
             .from('bank_accounts')
             .update({ balance: newBalance, current_balance: newBalance })
@@ -777,17 +777,37 @@ export function createInventoryRouter(): Router {
 
     try {
       if (supabase) {
-        const { data, error } = await supabase
-          .from('inventory_items')
-          .select('*')
-          .eq('organization_id', orgId);
+        const [{ data, error }, { data: layerRows }] = await Promise.all([
+          supabase.from('inventory_items').select('*').eq('organization_id', orgId),
+          supabase
+            .from('inventory_layers')
+            .select('inventory_item_id, quantity_remaining, unit_cost')
+            .eq('organization_id', orgId)
+            .gt('quantity_remaining', 0),
+        ]);
 
         if (error) throw error;
 
-        console.log('[inventory] GET /items - Supabase returned:', data?.length, 'items');
+        const layersByItem = new Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>();
+        for (const l of layerRows || []) {
+          const key = String((l as any).inventory_item_id);
+          const arr = layersByItem.get(key) || [];
+          arr.push({
+            quantity_remaining: Number((l as any).quantity_remaining || 0),
+            unit_cost: Number((l as any).unit_cost || 0),
+          });
+          layersByItem.set(key, arr);
+        }
 
-        // Transform snake_case to camelCase for frontend (includes negativeStockPolicy)
-        const items = (data || []).map(mapDbToDomainItem);
+        // Transform snake_case to camelCase and attach exact costing-method valuation (FIFO layers or weighted avg)
+        const items = (data || []).map((row: any) => {
+          const mapped = mapDbToDomainItem(row);
+          const stockValue = Math.round(computeItemValuation(mapped, layersByItem) * 100) / 100;
+          return {
+            ...mapped,
+            stockValue,
+          };
+        });
 
         return ok(res, items);
       } else {
@@ -1000,15 +1020,24 @@ export function createInventoryRouter(): Router {
     fromDate.setMonth(fromDate.getMonth() - months);
     const from = fromDate.toISOString().slice(0, 10);
 
-    const [salesRes, itemsRes] = await Promise.all([
+    const [salesRes, itemsRes, layersRes] = await Promise.all([
       sb.from('inventory_transactions').select('total_cost').eq('organization_id', orgId).eq('type', 'sale').gte('date', from),
-      sb.from('inventory_items').select('current_stock, average_cost').eq('organization_id', orgId).eq('is_active', true),
+      sb.from('inventory_items').select('id, costing_method, current_stock, average_cost').eq('organization_id', orgId).eq('is_active', true),
+      sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
     ]);
     if (salesRes.error) return fail(res, 500, salesRes.error.message);
     if (itemsRes.error) return fail(res, 500, itemsRes.error.message);
 
+    const layersByItem = new Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>();
+    for (const l of layersRes.data || []) {
+      const key = String((l as any).inventory_item_id);
+      const arr = layersByItem.get(key) || [];
+      arr.push({ quantity_remaining: Number((l as any).quantity_remaining || 0), unit_cost: Number((l as any).unit_cost || 0) });
+      layersByItem.set(key, arr);
+    }
+
     const cogs = (salesRes.data || []).reduce((s: number, t: any) => s + Math.abs(Number(t.total_cost || 0)), 0);
-    const inventoryValue = (itemsRes.data || []).reduce((s: number, i: any) => s + Number(i.current_stock || 0) * Number(i.average_cost || 0), 0);
+    const inventoryValue = (itemsRes.data || []).reduce((s: number, i: any) => s + computeItemValuation(i, layersByItem), 0);
     const turnoverRatio = inventoryValue > 0 ? cogs / inventoryValue : 0;
     return ok(res, {
       periodMonths: months,

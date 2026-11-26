@@ -34,6 +34,49 @@ function advancePaymentDate(currentDateStr?: string, frequency: string = 'monthl
 }
 
 /**
+ * Computes exact reducing-balance amortization PMT and total interest so
+ * loan headers, default installments, and repayment schedules always reconcile to the cent.
+ */
+function computeAmortizingTerms(
+  principal: number,
+  annualRatePct: number,
+  termMonths: number,
+  explicitInstallment = 0,
+): { installmentAmount: number; totalInterest: number } {
+  if (principal <= 0) return { installmentAmount: 0, totalInterest: 0 };
+  const monthlyRate = annualRatePct > 0 ? (annualRatePct / 100) / 12 : 0;
+
+  if (termMonths <= 0) {
+    const simpleInterest = annualRatePct > 0 ? Math.round(principal * (annualRatePct / 100) * 100) / 100 : 0;
+    return { installmentAmount: explicitInstallment, totalInterest: simpleInterest };
+  }
+
+  let installmentAmount = explicitInstallment;
+  if (installmentAmount <= 0) {
+    if (monthlyRate > 0) {
+      const factor = Math.pow(1 + monthlyRate, termMonths);
+      installmentAmount = Math.round(((principal * monthlyRate * factor) / (factor - 1)) * 100) / 100;
+    } else {
+      installmentAmount = Math.round((principal / termMonths) * 100) / 100;
+    }
+  }
+
+  let balance = principal;
+  let totalInterest = 0;
+  for (let i = 1; i <= termMonths && balance > 0; i++) {
+    const interestPart = Math.round(balance * monthlyRate * 100) / 100;
+    const principalPart =
+      i === termMonths || balance + interestPart <= installmentAmount
+        ? balance
+        : Math.min(balance, Math.max(0, Math.round((installmentAmount - interestPart) * 100) / 100));
+    totalInterest = Math.round((totalInterest + interestPart) * 100) / 100;
+    balance = Math.max(0, Math.round((balance - principalPart) * 100) / 100);
+  }
+
+  return { installmentAmount, totalInterest };
+}
+
+/**
  * Derives financial metrics and auto-transitions overdue status
  */
 function normalizeBalances(
@@ -57,27 +100,20 @@ function normalizeBalances(
     }
   }
 
-  // Compute total interest if principal and rate are present
-  let totalInterest = Number(data.totalInterest ?? existing?.totalInterest ?? 0);
-  if (totalInterest === 0 && interestRate > 0 && principal > 0) {
-    if (termMonths > 0) {
-      totalInterest = Math.round((principal * (interestRate / 100) * (termMonths / 12)) * 100) / 100;
-    } else {
-      totalInterest = Math.round((principal * (interestRate / 100)) * 100) / 100;
-    }
-  }
+  // Compute reducing-balance PMT installment & exact schedule-matched total interest
+  const requestedInstallment = Number(data.installmentAmount ?? existing?.installmentAmount ?? 0);
+  const amort = computeAmortizingTerms(principal, interestRate, termMonths, requestedInstallment);
+  const installmentAmount = requestedInstallment > 0 ? requestedInstallment : amort.installmentAmount;
+  const totalInterest =
+    data.totalInterest != null && Number(data.totalInterest) > 0 && requestedInstallment > 0
+      ? Number(data.totalInterest)
+      : amort.totalInterest;
 
   const totalObligation = Math.round((principal + totalInterest) * 100) / 100;
 
   const remaining = data.remainingBalance != null
     ? Number(data.remainingBalance)
     : Math.max(0, Math.round((principal - paid) * 100) / 100);
-
-  // Calculate installment amount if frequency and term are given
-  let installmentAmount = Number(data.installmentAmount ?? existing?.installmentAmount ?? 0);
-  if (installmentAmount === 0 && termMonths > 0 && principal > 0) {
-    installmentAmount = Math.round((totalObligation / termMonths) * 100) / 100;
-  }
 
   // Calculate payments count if not explicitly set
   let paymentsCount = Number(data.paymentsCount ?? existing?.paymentsCount ?? 0);
@@ -512,7 +548,10 @@ export function createLoansRouter(): Router {
       const monthStr = dateStr.substring(0, 7);
 
       const interestPortion = Math.round(balance * rateMonthly * 100) / 100;
-      const principalPortion = Math.min(balance, Math.round((monthlyInstallment - interestPortion) * 100) / 100);
+      const principalPortion =
+        i === termMonths || balance + interestPortion <= monthlyInstallment
+          ? balance
+          : Math.min(balance, Math.max(0, Math.round((monthlyInstallment - interestPortion) * 100) / 100));
       const installment = Math.round((principalPortion + interestPortion) * 100) / 100;
       const closingBalance = Math.max(0, Math.round((balance - principalPortion) * 100) / 100);
 

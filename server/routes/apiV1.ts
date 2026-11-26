@@ -725,7 +725,8 @@ export function createApiV1Router(): Router {
 
       const userMeta = invitedAuthUser?.user_metadata || {};
       const assignedRole = userMeta.role || (membership.role === 'owner' ? 'Owner / Lead' : membership.role === 'admin' ? 'Admin' : 'Team Member');
-      const assignedDept = userMeta.department || membership.department || 'Development';
+      // Handoff §12.1 / §33 #9: Never auto-assign owners/admins or unassigned members to 'Development'
+      const assignedDept = userMeta.department || membership.department || null;
       const assignedName = fullName || userMeta.full_name || emailNorm.split('@')[0];
 
       try {

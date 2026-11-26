@@ -415,6 +415,7 @@ export function ProjectProfitability() {
   const [formDialogOpen, setFormDialogOpen] = useState(false);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [isSavingForm, setIsSavingForm] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
 
   const [selectedProject, setSelectedProject] = useState<(typeof enrichedProjects)[0] | null>(null);
   const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
@@ -535,6 +536,7 @@ export function ProjectProfitability() {
 
   const openCreateModal = () => {
     setEditingProjectId(null);
+    setFormError(null);
     setProjectForm({
       name: '',
       clientName: '',
@@ -556,6 +558,7 @@ export function ProjectProfitability() {
 
   const openEditModal = (project: (typeof enrichedProjects)[0]) => {
     setEditingProjectId(project.id);
+    setFormError(null);
     setProjectForm({
       name: project.name,
       clientName: project.clientName || '',
@@ -606,26 +609,37 @@ export function ProjectProfitability() {
   };
 
   const handleSaveProject = async () => {
+    setFormError(null);
     if (!projectForm.name.trim() || !projectForm.clientName.trim() || !projectForm.startDate) {
-      toast.error('Please fill in project name, client, and start date.');
+      const msg = 'Please fill in project name, client, and start date.';
+      setFormError(msg);
+      toast.error(msg);
       return;
     }
     if (!projectForm.departmentId) {
-      toast.error('Please select a department.');
+      const msg = 'Please select a department.';
+      setFormError(msg);
+      toast.error(msg);
       return;
     }
     const quoted = parseFloat(projectForm.quotedAmount);
     if (Number.isNaN(quoted) || quoted < 0) {
-      toast.error('Quoted amount must be a valid number.');
+      const msg = 'Quoted amount must be a valid number.';
+      setFormError(msg);
+      toast.error(msg);
       return;
     }
     const baseline = parseFloat(projectForm.actualCost || '0');
     if (Number.isNaN(baseline) || baseline < 0) {
-      toast.error('Opening baseline cost must be a valid number.');
+      const msg = 'Opening baseline cost must be a valid number.';
+      setFormError(msg);
+      toast.error(msg);
       return;
     }
     if (projectForm.endDate && projectForm.endDate < projectForm.startDate) {
-      toast.error('End date cannot be earlier than start date.');
+      const msg = 'End date cannot be earlier than start date.';
+      setFormError(msg);
+      toast.error(msg);
       return;
     }
 
@@ -665,7 +679,9 @@ export function ProjectProfitability() {
           completedAt: projectForm.status === 'completed' ? (projectForm.completedAt || todayYmdCalendar()) : undefined,
         });
         if (!res.success) {
-          toast.error(res.error || 'Could not update project');
+          const msg = res.error || 'Could not update project';
+          setFormError(msg);
+          toast.error(msg);
           return;
         }
         toast.success('Project updated');
@@ -690,7 +706,9 @@ export function ProjectProfitability() {
           currency: displayCurrency,
         });
         if (!res.success) {
-          toast.error(res.error || 'Could not create project');
+          const msg = res.error || 'Could not create project';
+          setFormError(msg);
+          toast.error(msg);
           return;
         }
         if (res.data) {
@@ -700,8 +718,13 @@ export function ProjectProfitability() {
       }
 
       await Promise.all([refetchProjects(), refetchProfitability()]);
+      setFormError(null);
       setFormDialogOpen(false);
       setEditingProjectId(null);
+    } catch (err: any) {
+      const msg = err?.message || 'Unexpected error while saving project';
+      setFormError(msg);
+      toast.error(msg);
     } finally {
       setIsSavingForm(false);
     }
@@ -2082,6 +2105,16 @@ export function ProjectProfitability() {
                   </p>
                 )}
               </div>
+
+              {formError && (
+                <div
+                  className="p-3 rounded-xl text-xs text-rose-300 flex items-center gap-2"
+                  style={{ background: 'rgba(244, 63, 94, 0.14)', border: '1px solid rgba(244, 63, 94, 0.4)' }}
+                >
+                  <AlertTriangle className="size-4 shrink-0 text-rose-400" />
+                  <span>{formError}</span>
+                </div>
+              )}
 
               <div className="flex gap-3 pt-2 border-t border-slate-800">
                 <button

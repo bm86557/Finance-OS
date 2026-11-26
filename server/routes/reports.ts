@@ -8,6 +8,8 @@ import { canViewConfidentialPayroll, requirePermission } from '../middleware/aut
 import { logAuditEvent } from '../lib/auditLogger.js';
 import {
   computeBalanceSheetSnapshot,
+  buildInventoryLayerMap,
+  computeFifoAwareInventoryValue,
   computeCashFlowSnapshot,
   computeProfitLossSnapshot,
   computeUpcomingObligations,
@@ -60,6 +62,7 @@ export function createReportsRouter(): Router {
       { data: payslipRows },
       { data: employeeExpenseRows },
       { data: invoiceRows },
+      { data: invLayerRows },
     ] = await Promise.all([
       sb.from('organizations').select('*').eq('id', orgId),
       sb.from('transactions').select('*').eq('organization_id', orgId),
@@ -79,6 +82,7 @@ export function createReportsRouter(): Router {
       sb.from('employee_payslips').select('*').eq('organization_id', orgId),
       sb.from('employee_expenses').select('*').eq('organization_id', orgId).eq('status', 'approved'),
       sb.from('invoices').select('id, invoice_number, client_name, due_date, total_amount, amount_paid, amount_due, currency, status').eq('organization_id', orgId),
+      sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
     ]);
 
     const orgRow = orgRows?.[0];
@@ -216,6 +220,7 @@ export function createReportsRouter(): Router {
       loanRows: loanRows ?? [],
       assetRows: assetRows ?? [],
       invRows: invRows ?? [],
+      invLayerRows: invLayerRows ?? [],
     });
 
     const {
@@ -1334,6 +1339,7 @@ export function createReportsRouter(): Router {
         { data: loanRows },
         { data: assetRows },
         { data: invRows },
+        { data: invLayerRows },
       ] = await Promise.all([
         sb.from('organizations').select('currency, base_currency').eq('id', orgId).maybeSingle(),
         sb.from('bank_accounts').select('*').eq('organization_id', orgId).eq('is_active', true),
@@ -1342,6 +1348,7 @@ export function createReportsRouter(): Router {
         sb.from('loans').select('*').eq('organization_id', orgId),
         sb.from('assets').select('*').eq('organization_id', orgId),
         sb.from('inventory_items').select('*').eq('organization_id', orgId),
+        sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
       ]);
 
       const orgCurrency = String(orgRow?.base_currency || orgRow?.currency || 'USD').toUpperCase().trim();
@@ -1362,6 +1369,7 @@ export function createReportsRouter(): Router {
         loanRows: loanRows ?? [],
         assetRows: assetRows ?? [],
         invRows: invRows ?? [],
+        invLayerRows: invLayerRows ?? [],
         asOfDate,
       });
 
@@ -1655,6 +1663,7 @@ export function createReportsRouter(): Router {
         { data: txns },
         { data: assets },
         { data: inventoryItems },
+        { data: invLayerRows },
         { data: loans },
         { data: overheadRows },
       ] = await Promise.all([
@@ -1662,6 +1671,7 @@ export function createReportsRouter(): Router {
         sb.from('transactions').select('*').eq('organization_id', orgId),
         sb.from('assets').select('*').eq('organization_id', orgId),
         sb.from('inventory_items').select('*').eq('organization_id', orgId).eq('is_active', true),
+        sb.from('inventory_layers').select('inventory_item_id, quantity_remaining, unit_cost').eq('organization_id', orgId).gt('quantity_remaining', 0),
         sb.from('loans').select('*').eq('organization_id', orgId),
         sb.from('overhead_allocations').select('*').eq('organization_id', orgId),
       ]);
@@ -1682,8 +1692,9 @@ export function createReportsRouter(): Router {
         }
       }
 
+      const reconLayerMap = buildInventoryLayerMap(invLayerRows ?? []);
       const totalInventoryValuation = (inventoryItems || []).reduce(
-        (sum, item) => sum + (Number(item.current_stock || 0) * Number(item.average_cost || 0)), 0
+        (sum, item) => sum + computeFifoAwareInventoryValue(item, reconLayerMap), 0
       );
 
       const totalFixedAssets = (assets || []).reduce((sum, a) => {

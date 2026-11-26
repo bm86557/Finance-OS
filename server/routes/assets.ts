@@ -608,8 +608,6 @@ export function createAssetsRouter(): Router {
           depreciation_amount: actualDepr,
           closing_value: closingValue,
           status: 'posted',
-          posted_at: new Date().toISOString(),
-          posted_by: req.authUser?.id || null,
           journal_entry_id: journalEntryId,
         });
 

@@ -557,9 +557,15 @@ export function TransactionsLedger() {
     const tags = Array.isArray(t.tags) ? t.tags : [];
     return (
       cat.includes('loan repayment') ||
+      cat.includes('loan disbursement') ||
       tags.includes('loan-principal') ||
+      tags.includes('loan-disbursement') ||
+      tags.includes('loan-payment') ||
       (narr.includes('monthly installment') && narr.includes('loan')) ||
-      narr.includes('loan repayment')
+      narr.includes('loan repayment') ||
+      narr.includes('principal disbursement') ||
+      narr.includes('loan received') ||
+      narr.includes('loan issued')
     );
   };
 
@@ -576,7 +582,8 @@ export function TransactionsLedger() {
       .filter((t) =>
         t.type === 'income' &&
         !['reversed', 'cancelled', 'draft', 'pending', 'rejected'].includes(String(t.status || '').toLowerCase()) &&
-        !isTransferTxn(t)
+        !isTransferTxn(t) &&
+        !isLoanPrincipalTxn(t)
       )
       .reduce((sum, t) => {
         const raw = Math.abs(Number(t.amount || 0));

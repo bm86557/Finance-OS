@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router';
 import React, { Suspense, Component, useEffect, type ErrorInfo, type ReactNode } from 'react';
+import { Toaster } from 'sonner';
 import { useAuth, AuthProvider } from '@/contexts/AuthContext';
 import { logErrorBoundary, logSilentUiFailure } from '../lib/diagnostics';
 import { ThemeProvider } from '../contexts/ThemeContext';
@@ -374,6 +375,7 @@ export default function App() {
                     <AppRoutes />
                   </ErrorBoundary>
                 </Suspense>
+                <Toaster richColors position="top-right" theme="dark" />
               </OnboardingProvider>
             </NotificationProvider>
           </ThemeProvider>

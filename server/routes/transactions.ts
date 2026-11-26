@@ -244,11 +244,21 @@ export async function recomputeServerBankBalance(orgId: string, bankAccountId: s
           .select('*')
           .eq('bank_account_id', bankAccountId)
           .eq('organization_id', orgId)
-          .not('status', 'in', '("draft","pending","rejected","reversed","cancelled")');
+          .not('status', 'in', '("draft","rejected","reversed","cancelled")');
 
-        const eligibleTxns = (txns || []).filter(
-          (t: any) => !['draft', 'pending', 'rejected', 'reversed', 'cancelled'].includes(String(t.status || 'classified').toLowerCase())
-        );
+        const eligibleTxns = (txns || []).filter((t: any) => {
+          const st = String(t.status || 'classified').toLowerCase();
+          if (['draft', 'rejected', 'reversed', 'cancelled'].includes(st)) return false;
+          // Cleared bank statement imports already settled at the bank even while awaiting category review
+          if (st === 'pending') {
+            return Boolean(
+              t.import_batch_id ||
+              t.source === 'import' ||
+              (Array.isArray(t.tags) && t.tags.includes('imported'))
+            );
+          }
+          return true;
+        });
 
         const newBal = eligibleTxns.reduce((sum: number, t: any) => {
           const rawAmt = Number(t.amount || 0);

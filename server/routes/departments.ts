@@ -213,6 +213,10 @@ export async function calculateDepartmentProfitability(
 
   for (const dept of departments) {
     const deptMembers = activeMembers.filter(m => {
+      // Handoff §12.1 / §33 #9: Do not count an org owner in a delivery department unless explicitly assigned via department_id
+      if (String(m.role || '').toLowerCase() === 'owner' && !(m.department_id || m.departmentId)) {
+        return false;
+      }
       const resolved = matchDepartmentId(m.department_id || m.departmentId) || matchDepartmentId(m.department);
       return resolved === dept.id;
     });

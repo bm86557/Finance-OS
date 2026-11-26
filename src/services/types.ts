@@ -140,7 +140,7 @@ export interface Transaction {
   categoryId?: string;
   departmentId?: string;
   projectId?: string;
-  status: 'pending' | 'classified' | 'reviewed' | 'reconciled';
+  status: 'draft' | 'pending' | 'submitted' | 'classified' | 'reviewed' | 'approved' | 'posted' | 'reconciled' | 'reversed' | 'cancelled' | 'rejected';
   confidence?: number; // AI classification confidence 0-100
   tags: string[];
   attachments: string[];

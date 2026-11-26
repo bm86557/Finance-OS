@@ -47,6 +47,8 @@ export function InventoryManagementView() {
   const [formDescription, setFormDescription] = useState('');
   const [formCategory, setFormCategory] = useState('');
   const [formUnit, setFormUnit] = useState('unit');
+  const [formCostingMethod, setFormCostingMethod] = useState<'weighted_average' | 'fifo'>('weighted_average');
+  const [formNegativeStockPolicy, setFormNegativeStockPolicy] = useState<'disallow' | 'warn' | 'allow_with_backorder'>('disallow');
   const [formReorderLevel, setFormReorderLevel] = useState<number | ''>('');
   const [formReorderQuantity, setFormReorderQuantity] = useState<number | ''>('');
   const [formSellingPrice, setFormSellingPrice] = useState<number | ''>('');
@@ -58,7 +60,6 @@ export function InventoryManagementView() {
   const [purchaseDate, setPurchaseDate] = useState(new Date().toISOString().slice(0, 10));
   const [purchaseReference, setPurchaseReference] = useState('');
   const [purchaseNotes, setPurchaseNotes] = useState('');
-  const [purchaseBankAccountId, setPurchaseBankAccountId] = useState(''); // NEW
   
   // Sale form states
   const [saleItemId, setSaleItemId] = useState('');
@@ -67,9 +68,9 @@ export function InventoryManagementView() {
   const [saleDate, setSaleDate] = useState(new Date().toISOString().slice(0, 10));
   const [saleReference, setSaleReference] = useState('');
   const [saleNotes, setSaleNotes] = useState('');
-  const [saleBankAccountId, setSaleBankAccountId] = useState(''); // NEW
   
-  // Adjustment form states
+  // Adjustment / Write-Off form states
+  const [adjustmentType, setAdjustmentType] = useState<'adjustment' | 'write_off'>('adjustment');
   const [adjustmentItemId, setAdjustmentItemId] = useState('');
   const [adjustmentQuantity, setAdjustmentQuantity] = useState<number | ''>('');
   const [adjustmentReason, setAdjustmentReason] = useState('');
@@ -106,10 +107,15 @@ export function InventoryManagementView() {
 
   const loadError = itemsError || txnError;
 
-  // Derive summary from items list (avoids a second network round-trip)
+  // Derive summary using authoritative costing-method valuation (FIFO layers or weighted average)
+  const getItemStockValue = (item: InventoryItem) =>
+    typeof (item as any).stockValue === 'number'
+      ? Number((item as any).stockValue)
+      : item.currentStock * item.averageCost;
+
   const inventorySummary = {
     totalItems: inventoryItems.length,
-    totalValue: inventoryItems.reduce((sum, i) => sum + i.currentStock * i.averageCost, 0),
+    totalValue: inventoryItems.reduce((sum, i) => sum + getItemStockValue(i), 0),
     lowStockCount: inventoryItems.filter(i => i.currentStock <= i.reorderLevel).length,
     totalUnits: inventoryItems.reduce((sum, i) => sum + i.currentStock, 0),
   };
@@ -147,17 +153,18 @@ export function InventoryManagementView() {
       description: formDescription.trim() || undefined,
       category: formCategory.trim() || '',
       unit: formUnit || 'unit',
-      costingMethod: 'weighted_average',
+      costingMethod: formCostingMethod,
+      negativeStockPolicy: formNegativeStockPolicy,
       currentStock: 0,
       reorderLevel: Number(formReorderLevel) || 0,
       reorderQuantity: Number(formReorderQuantity) || 0,
       averageCost: 0,
       lastCost: 0,
       sellingPrice: Number(formSellingPrice) || 0,
-      assetAccountId: '', // TODO: Link to accounts
-      cogsAccountId: '', // TODO: Link to accounts
+      assetAccountId: '',
+      cogsAccountId: '',
       isActive: true,
-    });
+    } as any);
     
     setIsSubmitting(false);
     
@@ -175,6 +182,8 @@ export function InventoryManagementView() {
     setFormDescription('');
     setFormCategory('');
     setFormUnit('unit');
+    setFormCostingMethod('weighted_average');
+    setFormNegativeStockPolicy('disallow');
     setFormReorderLevel('');
     setFormReorderQuantity('');
     setFormSellingPrice('');
@@ -182,18 +191,13 @@ export function InventoryManagementView() {
     refetchItems();
   };
   
-  // Handler: Record new purchase transaction
+  // Handler: Record new purchase transaction (§15: inventory receipt is distinct from cash payment)
   const handleNewPurchase = async (e: React.FormEvent) => {
     e.preventDefault();
     setActionError(null);
     
     if (!purchaseItemId || !purchaseQuantity || !purchaseUnitCost) {
       setActionError('Item, quantity, and unit cost are required');
-      return;
-    }
-    
-    if (!purchaseBankAccountId) {
-      setActionError('Please select a bank account for payment');
       return;
     }
     
@@ -212,8 +216,6 @@ export function InventoryManagementView() {
     
     setIsSubmitting(true);
     
-    console.log('[handleNewPurchase] Submitting with bankAccountId:', purchaseBankAccountId);
-    
     const res = await svc.inventory.recordTransaction({
       inventoryItemId: purchaseItemId,
       date: purchaseDate,
@@ -223,11 +225,8 @@ export function InventoryManagementView() {
       totalAmount: quantity * unitCost,
       referenceNumber: purchaseReference.trim() || undefined,
       notes: purchaseNotes.trim() || undefined,
-      bankAccountId: purchaseBankAccountId, // NEW: Include bank account
       idempotencyKey: `purchase-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     });
-    
-    console.log('[handleNewPurchase] Response:', res);
     
     setIsSubmitting(false);
     
@@ -237,8 +236,7 @@ export function InventoryManagementView() {
     }
     
     const item = inventoryItems.find(i => i.id === purchaseItemId);
-    const account = bankAccounts.find(a => a.id === purchaseBankAccountId);
-    setActionSuccess(`Purchase recorded for "${item?.name}"! Stock updated and expense recorded in ${account?.bankName || 'selected account'}.`);
+    setActionSuccess(`Purchase recorded for "${item?.name}"! Stock & GL updated (Dr Inventory Asset / Cr Accounts Payable).`);
     setTimeout(() => setActionSuccess(null), 4000);
     
     // Reset form and close modal
@@ -248,7 +246,6 @@ export function InventoryManagementView() {
     setPurchaseDate(new Date().toISOString().slice(0, 10));
     setPurchaseReference('');
     setPurchaseNotes('');
-    setPurchaseBankAccountId('');
     setIsNewPurchaseModalOpen(false);
     refetchItems();
     refetchTransactions();
@@ -272,10 +269,12 @@ export function InventoryManagementView() {
       description: formDescription.trim() || undefined,
       category: formCategory.trim() || '',
       unit: formUnit || 'unit',
+      costingMethod: formCostingMethod,
+      negativeStockPolicy: formNegativeStockPolicy,
       reorderLevel: Number(formReorderLevel) || 0,
       reorderQuantity: Number(formReorderQuantity) || 0,
       sellingPrice: Number(formSellingPrice) || 0,
-    });
+    } as any);
     
     setIsSubmitting(false);
     
@@ -325,18 +324,13 @@ export function InventoryManagementView() {
     refetchItems();
   };
   
-  // Handler: Record new sale transaction
+  // Handler: Record new sale transaction (§15: sale/COGS movement is distinct from cash receipt)
   const handleNewSale = async (e: React.FormEvent) => {
     e.preventDefault();
     setActionError(null);
     
     if (!saleItemId || !saleQuantity || !saleUnitPrice) {
       setActionError('Item, quantity, and unit price are required');
-      return;
-    }
-    
-    if (!saleBankAccountId) {
-      setActionError('Please select a bank account to receive payment');
       return;
     }
     
@@ -353,36 +347,31 @@ export function InventoryManagementView() {
       return;
     }
     
-    // Validate stock availability
+    // Validate stock availability against item negative-stock policy (§15)
     const item = inventoryItems.find(i => i.id === saleItemId);
     if (!item) {
       setActionError('Item not found');
       return;
     }
-    
-    if (item.currentStock < quantity) {
-      setActionError(`Insufficient stock. Available: ${item.currentStock}, Requested: ${quantity}`);
+    const negPolicy = (item as any).negativeStockPolicy || 'disallow';
+    if (item.currentStock < quantity && negPolicy === 'disallow') {
+      setActionError(`Insufficient stock (Policy: Disallow Negative Stock). Available: ${item.currentStock}, Requested: ${quantity}`);
       return;
     }
     
     setIsSubmitting(true);
     
-    console.log('[handleNewSale] Submitting with bankAccountId:', saleBankAccountId);
-    
     const res = await svc.inventory.recordTransaction({
       inventoryItemId: saleItemId,
       date: saleDate,
       type: 'sale',
-      quantity: -quantity, // Negative for sales
-      unitCost: item.averageCost, // Freeze cost basis at sale time
-      totalAmount: quantity * unitPrice, // Revenue
+      quantity: -quantity,
+      unitCost: item.averageCost,
+      totalAmount: quantity * unitPrice,
       referenceNumber: saleReference.trim() || undefined,
       notes: saleNotes.trim() || undefined,
-      bankAccountId: saleBankAccountId, // NEW: Include bank account for income
       idempotencyKey: `sale-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     });
-    
-    console.log('[handleNewSale] Response:', res);
     
     setIsSubmitting(false);
     
@@ -391,8 +380,7 @@ export function InventoryManagementView() {
       return;
     }
     
-    const account = bankAccounts.find(a => a.id === saleBankAccountId);
-    setActionSuccess(`Sale recorded for "${item.name}"! Stock updated and revenue recorded in ${account?.bankName || 'selected account'}.`);
+    setActionSuccess(`Sale recorded for "${item.name}"! Stock relieved, COGS & Accounts Receivable posted.`);
     setTimeout(() => setActionSuccess(null), 4000);
     
     // Reset form and close modal
@@ -402,13 +390,12 @@ export function InventoryManagementView() {
     setSaleDate(new Date().toISOString().slice(0, 10));
     setSaleReference('');
     setSaleNotes('');
-    setSaleBankAccountId('');
     setIsNewSaleModalOpen(false);
     refetchItems();
     refetchTransactions();
   };
   
-  // Handler: Record adjustment (correction)
+  // Handler: Record adjustment or write-off (§15)
   const handleNewAdjustment = async (e: React.FormEvent) => {
     e.preventDefault();
     setActionError(null);
@@ -418,12 +405,12 @@ export function InventoryManagementView() {
       return;
     }
     
-    const quantity = Number(adjustmentQuantity);
-    
-    if (quantity === 0) {
-      setActionError('Adjustment quantity cannot be zero');
+    const rawQty = Number(adjustmentQuantity);
+    if (rawQty === 0) {
+      setActionError('Quantity cannot be zero');
       return;
     }
+    const quantity = adjustmentType === 'write_off' ? -Math.abs(rawQty) : rawQty;
     
     const item = inventoryItems.find(i => i.id === adjustmentItemId);
     if (!item) {
@@ -431,9 +418,9 @@ export function InventoryManagementView() {
       return;
     }
     
-    // Validate negative adjustments don't create negative stock
-    if (quantity < 0 && item.currentStock + quantity < 0) {
-      setActionError(`Invalid adjustment. Current stock: ${item.currentStock}, Adjustment: ${quantity}`);
+    const negPolicy = (item as any).negativeStockPolicy || 'disallow';
+    if (quantity < 0 && item.currentStock + quantity < 0 && negPolicy === 'disallow') {
+      setActionError(`Insufficient stock (Policy: Disallow Negative Stock). Current: ${item.currentStock}, Change: ${quantity}`);
       return;
     }
     
@@ -442,26 +429,31 @@ export function InventoryManagementView() {
     const res = await svc.inventory.recordTransaction({
       inventoryItemId: adjustmentItemId,
       date: adjustmentDate,
-      type: 'adjustment',
-      quantity: quantity,
+      type: adjustmentType,
+      quantity,
       unitCost: item.averageCost,
-      totalAmount: 0, // Adjustments don't affect financials directly
+      totalAmount: 0,
       referenceNumber: adjustmentReason.trim() || undefined,
       notes: adjustmentNotes.trim() || undefined,
-      idempotencyKey: `adjustment-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      idempotencyKey: `${adjustmentType}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     });
     
     setIsSubmitting(false);
     
     if (!res.success) {
-      setActionError(res.error || 'Failed to record adjustment');
+      setActionError(res.error || `Failed to record ${adjustmentType === 'write_off' ? 'write-off' : 'adjustment'}`);
       return;
     }
     
-    setActionSuccess(`Adjustment recorded for "${item.name}"! Stock ${quantity > 0 ? 'increased' : 'decreased'}.`);
+    setActionSuccess(
+      adjustmentType === 'write_off'
+        ? `Write-off recorded for "${item.name}"! Non-cash COGS/loss journal posted.`
+        : `Adjustment recorded for "${item.name}"! Stock ${quantity > 0 ? 'increased' : 'decreased'}.`,
+    );
     setTimeout(() => setActionSuccess(null), 3000);
     
     // Reset form and close modal
+    setAdjustmentType('adjustment');
     setAdjustmentItemId('');
     setAdjustmentQuantity('');
     setAdjustmentReason('');
@@ -480,6 +472,8 @@ export function InventoryManagementView() {
     setFormDescription(item.description || '');
     setFormCategory(item.category);
     setFormUnit(item.unit);
+    setFormCostingMethod(item.costingMethod === 'fifo' ? 'fifo' : 'weighted_average');
+    setFormNegativeStockPolicy(((item as any).negativeStockPolicy as any) || 'disallow');
     setFormReorderLevel(item.reorderLevel);
     setFormReorderQuantity(item.reorderQuantity);
     setFormSellingPrice(item.sellingPrice);
@@ -859,7 +853,7 @@ export function InventoryManagementView() {
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {filteredItems.map((item, index) => {
               const stockStatus = getStockStatus(item);
-              const stockValue = item.currentStock * item.averageCost;
+              const stockValue = getItemStockValue(item);
               return (
                 <motion.div
                   key={item.id}
@@ -910,6 +904,12 @@ export function InventoryManagementView() {
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-slate-500">Reorder Level</span>
                       <span className="text-sm font-medium text-orange-400">{item.reorderLevel} {item.unit}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-slate-500">Costing / Neg. Stock</span>
+                      <span className="text-xs font-mono text-slate-300">
+                        {item.costingMethod === 'fifo' ? 'FIFO' : 'Weighted Avg'} · {((item as any).negativeStockPolicy || 'disallow').replace(/_/g, ' ')}
+                      </span>
                     </div>
                   </div>
 
@@ -1483,6 +1483,34 @@ export function InventoryManagementView() {
               
               <div className="grid grid-cols-2 gap-4">
                 <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-2">Costing Method</label>
+                  <select
+                    value={formCostingMethod}
+                    onChange={(e) => setFormCostingMethod(e.target.value as 'weighted_average' | 'fifo')}
+                    className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  >
+                    <option value="weighted_average">Weighted Average</option>
+                    <option value="fifo">FIFO (First-In, First-Out)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-2">Negative Stock Policy</label>
+                  <select
+                    value={formNegativeStockPolicy}
+                    onChange={(e) => setFormNegativeStockPolicy(e.target.value as 'disallow' | 'warn' | 'allow_with_backorder')}
+                    className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  >
+                    <option value="disallow">Disallow (Strict)</option>
+                    <option value="warn">Warn Only</option>
+                    <option value="allow_with_backorder">Allow with Backorder</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
                   <label className="block text-sm font-medium text-slate-300 mb-2">Reorder Level</label>
                   <input
                     type="number"
@@ -1621,27 +1649,10 @@ export function InventoryManagementView() {
                 </div>
               )}
               
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Bank Account * <span className="text-xs text-slate-500">(Payment Method)</span></label>
-                <select
-                  value={purchaseBankAccountId}
-                  onChange={(e) => setPurchaseBankAccountId(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
-                  required
-                >
-                  <option value="">Select payment account...</option>
-                  {bankAccounts.map(account => (
-                    <option key={account.id} value={account.id}>
-                      {account.bankName} - {account.accountType} ({formatCurrency(account.balance, account.currency)})
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1.5 text-xs text-slate-500">
-                  💡 This purchase will be recorded as an expense in the selected account's transactions
-                </p>
+              <div className="px-3.5 py-2.5 rounded-xl text-xs text-cyan-200/90" style={{ background: 'rgba(6, 182, 212, 0.08)', border: '1px solid rgba(6, 182, 212, 0.25)' }}>
+                Stock receipt posts <strong>Dr Inventory Asset / Cr Accounts Payable</strong>. Cash payment stays separate from inventory movement (§15).
               </div>
-              
+
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-2">Date</label>
                 <input
@@ -1804,6 +1815,34 @@ export function InventoryManagementView() {
                 </div>
               </div>
               
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-2">Costing Method</label>
+                  <select
+                    value={formCostingMethod}
+                    onChange={(e) => setFormCostingMethod(e.target.value as 'weighted_average' | 'fifo')}
+                    className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  >
+                    <option value="weighted_average">Weighted Average</option>
+                    <option value="fifo">FIFO (First-In, First-Out)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-300 mb-2">Negative Stock Policy</label>
+                  <select
+                    value={formNegativeStockPolicy}
+                    onChange={(e) => setFormNegativeStockPolicy(e.target.value as 'disallow' | 'warn' | 'allow_with_backorder')}
+                    className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                  >
+                    <option value="disallow">Disallow (Strict)</option>
+                    <option value="warn">Warn Only</option>
+                    <option value="allow_with_backorder">Allow with Backorder</option>
+                  </select>
+                </div>
+              </div>
+
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-slate-300 mb-2">Reorder Level</label>
@@ -1984,7 +2023,9 @@ export function InventoryManagementView() {
                   required
                 >
                   <option value="">Choose an item...</option>
-                  {inventoryItems.filter(i => i.isActive && i.currentStock > 0).map(item => (
+                  {inventoryItems
+                    .filter(i => i.isActive && (i.currentStock > 0 || ((i as any).negativeStockPolicy && (i as any).negativeStockPolicy !== 'disallow')))
+                    .map(item => (
                     <option key={item.id} value={item.id}>
                       {item.name} ({item.sku}) - Stock: {item.currentStock}
                     </option>
@@ -2003,7 +2044,12 @@ export function InventoryManagementView() {
                     style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
                     placeholder="e.g., 5"
                     min="1"
-                    max={saleItemId ? inventoryItems.find(i => i.id === saleItemId)?.currentStock : undefined}
+                    max={(() => {
+                      const sel = saleItemId ? inventoryItems.find(i => i.id === saleItemId) : undefined;
+                      if (!sel) return undefined;
+                      const pol = (sel as any).negativeStockPolicy || 'disallow';
+                      return pol === 'disallow' ? sel.currentStock : undefined;
+                    })()}
                     required
                   />
                 </div>
@@ -2055,27 +2101,10 @@ export function InventoryManagementView() {
                 </div>
               )}
               
-              <div>
-                <label className="block text-sm font-medium text-slate-300 mb-2">Bank Account * <span className="text-xs text-slate-500">(Revenue Destination)</span></label>
-                <select
-                  value={saleBankAccountId}
-                  onChange={(e) => setSaleBankAccountId(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
-                  required
-                >
-                  <option value="">Select account to receive payment...</option>
-                  {bankAccounts.map(account => (
-                    <option key={account.id} value={account.id}>
-                      {account.bankName} - {account.accountType} ({formatCurrency(account.balance, account.currency)})
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1.5 text-xs text-slate-500">
-                  💰 This sale will be recorded as income in the selected account's transactions
-                </p>
+              <div className="px-3.5 py-2.5 rounded-xl text-xs text-emerald-200/90" style={{ background: 'rgba(16, 185, 129, 0.08)', border: '1px solid rgba(16, 185, 129, 0.25)' }}>
+                Sale posts <strong>Dr COGS / Cr Inventory Asset</strong> and <strong>Dr Accounts Receivable / Cr Sales Revenue</strong>. Cash collection stays separate (§15).
               </div>
-              
+
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-2">Date</label>
                 <input
@@ -2171,6 +2200,19 @@ export function InventoryManagementView() {
             </div>
             
             <form onSubmit={handleNewAdjustment} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-300 mb-2">Movement Type *</label>
+                <select
+                  value={adjustmentType}
+                  onChange={(e) => setAdjustmentType(e.target.value as 'adjustment' | 'write_off')}
+                  className="w-full px-4 py-2.5 rounded-xl text-sm text-white focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border }}
+                >
+                  <option value="adjustment">Stock Count Adjustment (+/-)</option>
+                  <option value="write_off">Write-Off (Spoilage / Damage / Loss → COGS)</option>
+                </select>
+              </div>
+
               <div>
                 <label className="block text-sm font-medium text-slate-300 mb-2">Select Item *</label>
                 <select

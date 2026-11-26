@@ -499,7 +499,17 @@ export function EnhancedStatementImport({
       return;
     }
 
-    const rowsToCommit = parsedTransactions
+    // Ensure 3-tier exception review decisions and rule learning are submitted prior to final commit,
+    // and use the freshly resolved transaction list (with newly created categories & cleared needsReview)
+    let latestTransactions = parsedTransactions;
+    if (!reviewCompleted) {
+      const updated = await handleSubmitBulkReview(false);
+      if (Array.isArray(updated)) {
+        latestTransactions = updated;
+      }
+    }
+
+    const rowsToCommit = latestTransactions
       .filter(txn => {
         if (filterDuplicates && txn.isDuplicate) return false;
         if (searchQuery && !txn.narration.toLowerCase().includes(searchQuery.toLowerCase())) {
@@ -515,20 +525,19 @@ export function EnhancedStatementImport({
             || categories.find(c => c.name.toLowerCase().includes(catName) || catName.includes(c.name.toLowerCase()));
           if (match) catId = match.id;
         }
+        const hasResolvedCat = Boolean(catId || t.proposedNewCategory?.name);
         return {
           ...t,
           importCategoryId: catId,
+          worldScope: t.usage === 'personal' ? 'personal' : 'business',
+          needsReview: hasResolvedCat ? false : Boolean(t.needsReview),
+          classifiedBy: t.classifiedBy || (t.classificationSource === 'ai' ? 'ai' : 'auto'),
         };
       });
 
     if (rowsToCommit.length === 0) {
       toast.error('No rows to import. Adjust filters or mapping.');
       return;
-    }
-
-    // Ensure 3-tier exception review decisions and rule learning are submitted prior to final commit
-    if (!reviewCompleted) {
-      await handleSubmitBulkReview(false);
     }
 
     setProcessing(true);
@@ -883,7 +892,8 @@ export function EnhancedStatementImport({
 
   const handleConfirmGroup = useCallback((token: string) => {
     const group = tier2Groups.find(g => g.vendorToken === token);
-    const chosenCatId = groupOverrides[token]?.selectedCategoryId || group?.suggestedCategoryId || categories[0]?.id || '';
+    const hasProposedNew = Boolean(group?.transactions.some(t => !t.importCategoryId && t.proposedNewCategory?.name));
+    const chosenCatId = groupOverrides[token]?.selectedCategoryId || group?.suggestedCategoryId || (hasProposedNew ? '' : (categories[0]?.id || ''));
     
     setGroupOverrides(prev => ({
       ...prev,
@@ -895,21 +905,22 @@ export function EnhancedStatementImport({
       },
     }));
 
-    // Apply category to all transactions in group
+    // Apply category to all transactions in group (preserve proposedNewCategory if creating a new category)
     setParsedTransactions(prev =>
       prev.map(t => {
         if (extractVendorToken(t.narration) === token) {
-          const cat = categories.find(c => c.id === chosenCatId);
+          const cat = chosenCatId ? categories.find(c => c.id === chosenCatId) : undefined;
           return {
             ...t,
-            importCategoryId: chosenCatId,
-            category: cat?.name || t.category,
+            importCategoryId: chosenCatId || t.importCategoryId,
+            category: cat?.name || t.proposedNewCategory?.name || t.category,
+            needsReview: false,
           };
         }
         return t;
       })
     );
-    toast.success(`Group "${token}" confirmed with category`);
+    toast.success(`Group "${token}" confirmed${chosenCatId ? ' with category' : ' (will create proposed category)'}`);
   }, [tier2Groups, groupOverrides, categories]);
 
   const toggleGroupExpanded = useCallback((token: string) => {
@@ -1024,47 +1035,57 @@ export function EnhancedStatementImport({
       }
 
       // Apply group decisions and any newly created category IDs back to parsedTransactions
-      setParsedTransactions(prev =>
-        prev.map(t => {
-          const token = extractVendorToken(t.narration);
-          const state = groupOverrides[token];
-          if (state?.selectedCategoryId) {
+      const updatedTransactions = parsedTransactions.map(t => {
+        const token = extractVendorToken(t.narration);
+        const state = groupOverrides[token];
+        if (state?.selectedCategoryId) {
+          const cat = categories.find(c => c.id === state.selectedCategoryId);
+          return {
+            ...t,
+            importCategoryId: state.selectedCategoryId,
+            category: cat?.name || t.category,
+            suggestedCategory: cat?.name || t.suggestedCategory,
+            needsReview: false,
+          };
+        }
+        if (!t.importCategoryId && t.proposedNewCategory?.name) {
+          const key = `${t.proposedNewCategory.type}:${t.proposedNewCategory.name.toLowerCase()}`;
+          const createdCat = createdCategoryMap.get(key);
+          if (createdCat) {
             return {
               ...t,
-              importCategoryId: state.selectedCategoryId,
+              importCategoryId: createdCat.id,
+              category: createdCat.name,
+              suggestedCategory: createdCat.name,
               needsReview: false,
             };
           }
-          if (!t.importCategoryId && t.proposedNewCategory?.name) {
-            const key = `${t.proposedNewCategory.type}:${t.proposedNewCategory.name.toLowerCase()}`;
-            const createdCat = createdCategoryMap.get(key);
-            if (createdCat) {
-              return {
-                ...t,
-                importCategoryId: createdCat.id,
-                category: createdCat.name,
-                suggestedCategory: createdCat.name,
-                needsReview: false,
-              };
-            }
-          }
-          return t;
-        })
-      );
+        }
+        if (t.importCategoryId) {
+          return {
+            ...t,
+            needsReview: false,
+          };
+        }
+        return t;
+      });
+      setParsedTransactions(updatedTransactions);
 
       setReviewCompleted(true);
       if (notify) {
         toast.success(`Reviewed ${decisions.length} transactions across 3 tiers${summaryMsg}. Ready to commit.`);
       }
+      return updatedTransactions;
     } catch (e: any) {
       console.error('[bulk-review] Error submitting bulk review:', e);
       if (notify) {
         toast.error('Failed to submit review decisions: ' + (e.message || 'Unknown error'));
       }
+      return null;
     } finally {
       setReviewSubmitting(false);
     }
-  }, [reviewSubmitting, tier1List, tier2Groups, tier3List, groupOverrides, svc.orgId]);
+  }, [reviewSubmitting, tier1List, tier2Groups, tier3List, groupOverrides, parsedTransactions, categories, svc.orgId]);
 
   const stepIndex = ['upload', 'mapping', 'review', 'complete'].indexOf(currentStep);
 
@@ -1080,6 +1101,9 @@ export function EnhancedStatementImport({
     setImportCurrencyOverride('');
     setSearchQuery('');
     setFilterDuplicates(true);
+    setReviewCompleted(false);
+    setGroupOverrides({});
+    setCommitSummary(null);
   }, []);
 
   const handleNewImport = useCallback(() => {

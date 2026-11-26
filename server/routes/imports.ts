@@ -728,6 +728,7 @@ export function createImportsRouter(): Router {
                     if (ruleRes.matchedRuleId) matchedRuleIds.push(ruleRes.matchedRuleId);
 
                     if (
+                      !platformSettings.feature_flags.ai_category_suggestions &&
                       ruleRes.placement === 'auto_approved' &&
                       ruleRes.categoryId &&
                       (!ruleRes.riskFlags || ruleRes.riskFlags.length === 0)

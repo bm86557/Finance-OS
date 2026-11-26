@@ -295,6 +295,37 @@ export interface BalanceSheetSnapshot {
   equity: BalanceSheetLine[];
 }
 
+export function computeFifoAwareInventoryValue(
+  item: Record<string, any>,
+  layersByItem: Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>,
+): number {
+  const method = String(item.costing_method ?? item.costingMethod ?? 'weighted_average');
+  if (method === 'fifo') {
+    const layers = layersByItem.get(String(item.id));
+    if (layers && layers.length > 0) {
+      return layers.reduce((s, l) => s + Number(l.quantity_remaining || 0) * Number(l.unit_cost || 0), 0);
+    }
+  }
+  const stock = Number(item.current_stock ?? item.currentStock ?? 0);
+  const cost = Number(item.average_cost ?? item.averageCost ?? item.unit_cost ?? item.unit_price ?? 0);
+  return stock * cost;
+}
+
+export function buildInventoryLayerMap(
+  invLayerRows?: Record<string, any>[],
+): Map<string, Array<{ quantity_remaining: number; unit_cost: number }>> {
+  const map = new Map<string, Array<{ quantity_remaining: number; unit_cost: number }>>();
+  for (const l of invLayerRows || []) {
+    const qty = Number(l.quantity_remaining || 0);
+    if (qty <= 0) continue;
+    const key = String(l.inventory_item_id);
+    const arr = map.get(key) || [];
+    arr.push({ quantity_remaining: qty, unit_cost: Number(l.unit_cost || 0) });
+    map.set(key, arr);
+  }
+  return map;
+}
+
 export function computeBalanceSheetSnapshot(params: {
   orgCurrency: string;
   worldFilter: WorldFilter;
@@ -305,6 +336,7 @@ export function computeBalanceSheetSnapshot(params: {
   loanRows: Record<string, any>[];
   assetRows: Record<string, any>[];
   invRows: Record<string, any>[];
+  invLayerRows?: Record<string, any>[];
   asOfDate?: string;
 }): BalanceSheetSnapshot {
   const {
@@ -317,6 +349,7 @@ export function computeBalanceSheetSnapshot(params: {
     loanRows,
     assetRows,
     invRows,
+    invLayerRows,
     asOfDate,
   } = params;
 
@@ -417,13 +450,13 @@ export function computeBalanceSheetSnapshot(params: {
   }
   totalFixedAssets = Math.round(totalFixedAssets * 100) / 100;
 
-  // Inventory Valuation
+  // Inventory Valuation (FIFO layers for FIFO items, weighted average otherwise)
   const activeInv = worldFilter === 'personal' ? [] : (invRows || []).filter((i) => i.is_active !== false);
+  const invLayersByItem = buildInventoryLayerMap(invLayerRows);
   let totalInventory = 0;
   for (const item of activeInv) {
-    const stock = Number(item.current_stock || 0);
-    const cost = Number(item.average_cost || item.unit_cost || item.unit_price || 0);
-    const val = Math.round(convertCurrency(stock * cost, item.currency || orgCurrency, orgCurrency) * 100) / 100;
+    const rawVal = computeFifoAwareInventoryValue(item, invLayersByItem);
+    const val = Math.round(convertCurrency(rawVal, item.currency || orgCurrency, orgCurrency) * 100) / 100;
     totalInventory += val;
     if (val > 0) {
       assets.push({ accountId: String(item.id), name: `Inventory: ${item.name}`, balance: val, type: 'current' });

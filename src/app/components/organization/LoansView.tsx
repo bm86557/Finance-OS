@@ -38,11 +38,11 @@ const defaultForm = () => ({
   dueDate: '',
   startDate: '',
   interestRate: '',
+  rateType: 'fixed' as 'fixed' | 'variable',
   installmentAmount: '',
   frequency: 'monthly' as 'monthly' | 'quarterly' | 'annual',
   termMonths: '12',
   status: 'active' as LoanRecordStatus,
-  bankAccountId: '',
 });
 
 export function LoansView() {
@@ -84,8 +84,8 @@ export function LoansView() {
   const [paymentModalOpen, setPaymentModalOpen] = useState(false);
   const [selectedLoanForPayment, setSelectedLoanForPayment] = useState<Loan | null>(null);
   const [paymentAmount, setPaymentAmount] = useState('');
+  const [paymentFee, setPaymentFee] = useState('');
   const [paymentMethod, setPaymentMethod] = useState('bank_transfer');
-  const [paymentBankAccountId, setPaymentBankAccountId] = useState('');
   const [paymentDate, setPaymentDate] = useState(() => new Date().toISOString().split('T')[0]);
   const [paymentReference, setPaymentReference] = useState('');
   const [paymentNotes, setPaymentNotes] = useState('');
@@ -135,11 +135,11 @@ export function LoansView() {
       dueDate: loan.dueDate,
       startDate: loan.startDate ?? '',
       interestRate: loan.interestRate != null ? String(loan.interestRate) : '',
+      rateType: loan.rateType === 'variable' ? 'variable' : 'fixed',
       installmentAmount: loan.installmentAmount != null ? String(loan.installmentAmount) : '',
       frequency: loan.frequency || 'monthly',
       termMonths: loan.termMonths ? String(loan.termMonths) : (loan.paymentsCount ? String(loan.paymentsCount) : '12'),
       status: loan.status,
-      bankAccountId: (loan as any).bankAccountId || (loan as any).bank_account_id || '',
     });
     setFormOpen(true);
   }, []);
@@ -163,13 +163,13 @@ export function LoansView() {
       ? String(Math.min(loan.installmentAmount, rem))
       : String(rem);
     setPaymentAmount(defaultAmt);
+    setPaymentFee('');
     setPaymentMethod('bank_transfer');
-    setPaymentBankAccountId(bankAccounts[0]?.id || '');
     setPaymentDate(new Date().toISOString().split('T')[0]);
     setPaymentReference(`PMT-${loan.party.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase()}-${currentMonthKey.replace('-', '')}`);
     setPaymentNotes(`Monthly installment for ${currentMonthName}`);
     setPaymentModalOpen(true);
-  }, [isLoanPaidThisMonth, currentMonthName, currentMonthKey, bankAccounts, getLoanRemaining]);
+  }, [isLoanPaidThisMonth, currentMonthName, currentMonthKey, getLoanRemaining]);
 
   const openHistory = useCallback((loan: Loan) => {
     setSelectedLoanForHistory(loan);
@@ -185,14 +185,15 @@ export function LoansView() {
       return;
     }
 
+    const fee = Math.max(0, Number(paymentFee) || 0);
     const res = await recordPaymentMutation.execute({
       loanId: selectedLoanForPayment.id,
       paymentData: {
         amount: amt,
+        feePart: fee > 0 ? fee : undefined,
         paymentMonth: currentMonthKey,
         paidOn: paymentDate,
         method: paymentMethod,
-        bankAccountId: paymentBankAccountId || undefined,
         reference: paymentReference,
         notes: paymentNotes,
       },
@@ -272,19 +273,33 @@ export function LoansView() {
     const termMonths = form.termMonths.trim() === '' ? 12 : Number(form.termMonths);
     let installmentAmount = form.installmentAmount.trim() === '' ? 0 : Number(form.installmentAmount);
 
-    let totalInterest = 0;
-    if (interestRate > 0 && principal > 0) {
-      if (termMonths > 0) {
-        totalInterest = Math.round((principal * (interestRate / 100) * (termMonths / 12)) * 100) / 100;
+    // Reducing-balance PMT & exact schedule-matched total interest
+    const monthlyRate = interestRate > 0 ? (interestRate / 100) / 12 : 0;
+    if (installmentAmount <= 0 && termMonths > 0 && principal > 0) {
+      if (monthlyRate > 0) {
+        const factor = Math.pow(1 + monthlyRate, termMonths);
+        installmentAmount = Math.round(((principal * monthlyRate * factor) / (factor - 1)) * 100) / 100;
       } else {
-        totalInterest = Math.round((principal * (interestRate / 100)) * 100) / 100;
+        installmentAmount = Math.round((principal / termMonths) * 100) / 100;
       }
     }
 
-    const totalObligation = Math.round((principal + totalInterest) * 100) / 100;
-
-    if (installmentAmount === 0 && termMonths > 0) {
-      installmentAmount = Math.round((totalObligation / termMonths) * 100) / 100;
+    let totalInterest = 0;
+    if (interestRate > 0 && principal > 0) {
+      if (termMonths > 0) {
+        let bal = principal;
+        for (let i = 1; i <= termMonths && bal > 0; i++) {
+          const intPart = Math.round(bal * monthlyRate * 100) / 100;
+          const prinPart =
+            i === termMonths || bal + intPart <= installmentAmount
+              ? bal
+              : Math.min(bal, Math.max(0, Math.round((installmentAmount - intPart) * 100) / 100));
+          totalInterest = Math.round((totalInterest + intPart) * 100) / 100;
+          bal = Math.max(0, Math.round((bal - prinPart) * 100) / 100);
+        }
+      } else {
+        totalInterest = Math.round((principal * (interestRate / 100)) * 100) / 100;
+      }
     }
 
     const paymentsCount = termMonths > 0 ? termMonths : (installmentAmount > 0 ? Math.ceil(principal / installmentAmount) : 1);
@@ -307,6 +322,7 @@ export function LoansView() {
       };
       if (form.startDate.trim()) updates.startDate = form.startDate.trim();
       if (form.interestRate.trim() !== '') updates.interestRate = interestRate;
+      updates.rateType = form.rateType;
 
       const res = await updateLoan.execute({ id: editingId, updates });
       if (res.success) {
@@ -316,7 +332,7 @@ export function LoansView() {
     } else {
       const nextPaymentDate = form.startDate.trim() || form.dueDate.trim();
 
-      const payload: Omit<Loan, 'id' | 'organizationId'> & { bankAccountId?: string } = {
+      const payload: Omit<Loan, 'id' | 'organizationId'> = {
         type: form.type,
         party: form.party.trim(),
         description: form.description.trim() || 'Loan',
@@ -327,6 +343,7 @@ export function LoansView() {
         startDate: form.startDate.trim() || undefined,
         status: form.status,
         interestRate: form.interestRate.trim() === '' ? undefined : interestRate,
+        rateType: form.rateType,
         installmentAmount,
         totalInterest,
         frequency: form.frequency,
@@ -336,7 +353,6 @@ export function LoansView() {
         nextPaymentDate,
         amountPaid: 0,
         remainingBalance: principal,
-        bankAccountId: form.bankAccountId || undefined,
       };
 
       const res = await createLoan.execute(payload as any);
@@ -1469,16 +1485,6 @@ export function LoansView() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="mb-1 block text-xs text-slate-400">Due date</label>
-                <input
-                  type="date"
-                  value={form.dueDate}
-                  onChange={(e) => setForm(f => ({ ...f, dueDate: e.target.value }))}
-                  className="w-full rounded-xl px-3 py-2.5 text-sm"
-                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
-                />
-              </div>
-              <div>
                 <label className="mb-1 block text-xs text-slate-400">Start date (optional)</label>
                 <input
                   type="date"
@@ -1488,8 +1494,18 @@ export function LoansView() {
                   style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
                 />
               </div>
+              <div>
+                <label className="mb-1 block text-xs text-slate-400">Due date</label>
+                <input
+                  type="date"
+                  value={form.dueDate}
+                  onChange={(e) => setForm(f => ({ ...f, dueDate: e.target.value }))}
+                  className="w-full rounded-xl px-3 py-2.5 text-sm"
+                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
+                />
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="mb-1 block text-xs text-slate-400">Interest % (optional)</label>
                 <input
@@ -1501,6 +1517,18 @@ export function LoansView() {
                   className="w-full rounded-xl px-3 py-2.5 text-sm"
                   style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
                 />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs text-slate-400">Rate Type</label>
+                <select
+                  value={form.rateType}
+                  onChange={(e) => setForm(f => ({ ...f, rateType: e.target.value as 'fixed' | 'variable' }))}
+                  className="w-full rounded-xl px-3 py-2.5 text-sm"
+                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
+                >
+                  <option value="fixed">Fixed</option>
+                  <option value="variable">Variable</option>
+                </select>
               </div>
               <div>
                 <label className="mb-1 block text-xs text-slate-400">Status</label>
@@ -1526,7 +1554,7 @@ export function LoansView() {
                   type="number"
                   min={0}
                   step="0.01"
-                  placeholder="e.g. 500"
+                  placeholder="Auto PMT"
                   value={form.installmentAmount}
                   onChange={(e) => setForm(f => ({ ...f, installmentAmount: e.target.value }))}
                   className="w-full rounded-xl px-3 py-2.5 text-sm"
@@ -1561,32 +1589,6 @@ export function LoansView() {
                 />
               </div>
             </div>
-            {!editingId && (
-              <div className="p-3 rounded-xl border border-cyan-500/30 bg-cyan-950/20">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <Wallet className="size-4 text-cyan-400" />
-                  <label className="text-xs font-bold text-white">
-                    {form.type === 'to_pay' ? 'Deposit Into Bank Account (Optional)' : 'Disburse From Bank Account (Optional)'}
-                  </label>
-                </div>
-                <select
-                  value={form.bankAccountId}
-                  onChange={(e) => setForm(f => ({ ...f, bankAccountId: e.target.value }))}
-                  className="w-full rounded-xl px-3 py-2 text-xs"
-                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
-                >
-                  <option value="">-- Outside Bank / Unlinked Cash --</option>
-                  {bankAccounts.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.bankName} • {b.accountType ? b.accountType.replace('_', ' ') : 'Account'} (••••{b.accountNumber ? b.accountNumber.slice(-4) : '0000'}) — {formatCurrency(b.balance, b.currency)}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[10px] text-cyan-300/80 mt-1.5">
-                  Selecting a bank account will post an initial ledger transaction and update the bank account balance.
-                </p>
-              </div>
-            )}
           </div>
           <DialogFooter className="gap-2 sm:gap-2">
             <button
@@ -1725,37 +1727,6 @@ export function LoansView() {
                 </div>
               </div>
 
-              {/* Bank Account Selection (Requested specifically by user) */}
-              <div className="p-3.5 rounded-xl border border-cyan-500/20 bg-cyan-950/10">
-                <div className="flex items-center gap-2 mb-1.5">
-                  <Wallet className="size-4 text-cyan-400" />
-                  <label className="text-xs font-bold text-white">
-                    Select Bank Account (Creates Ledger Transaction)
-                  </label>
-                </div>
-                <select
-                  value={paymentBankAccountId}
-                  onChange={(e) => setPaymentBankAccountId(e.target.value)}
-                  className="w-full rounded-xl px-3 py-2.5 text-sm"
-                  style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
-                >
-                  <option value="">-- No bank account (External / Unlinked Cash) --</option>
-                  {bankAccounts.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.bankName} • {b.accountType ? b.accountType.replace('_', ' ') : 'Account'} (••••{b.accountNumber ? b.accountNumber.slice(-4) : '0000'}) — {b.currency || 'USD'} {formatCurrency(b.balance)}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-cyan-300/80 mt-2 flex items-start gap-1.5">
-                  <ShieldCheck className="size-3.5 shrink-0 mt-0.5 text-cyan-400" />
-                  <span>
-                    {paymentBankAccountId 
-                      ? `Selecting this bank account will automatically post a verified ${selectedLoanForPayment.type === 'to_pay' ? 'debit (expense)' : 'credit (income)'} transaction of ${formatCurrency(Number(paymentAmount) || 0)} and update its balance.`
-                      : 'Tip: Select a bank account to automatically generate financial transactions and keep your cash balances reconciled.'}
-                  </span>
-                </p>
-              </div>
-
               {/* Date & Payment Method */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -1786,8 +1757,21 @@ export function LoansView() {
                 </div>
               </div>
 
-              {/* Reference & Notes */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {/* Reference, Fees & Notes */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs text-slate-400">Fees (optional)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="0.01"
+                    placeholder="0.00"
+                    value={paymentFee}
+                    onChange={(e) => setPaymentFee(e.target.value)}
+                    className="w-full rounded-xl px-3 py-2 text-sm"
+                    style={{ background: AXIOM.inputs.background, border: AXIOM.inputs.border, color: AXIOM.inputs.color }}
+                  />
+                </div>
                 <div>
                   <label className="mb-1 block text-xs text-slate-400">Reference / Check #</label>
                   <input
@@ -1812,30 +1796,48 @@ export function LoansView() {
                 </div>
               </div>
 
-              {/* Dynamic Calculation & Double-Payment Lock Banner */}
-              {Number(paymentAmount) > 0 && (
+              {/* Dynamic Principal / Interest / Fees Split & Double-Payment Lock Banner (§15) */}
+              {Number(paymentAmount) > 0 && (() => {
+                const cur = selectedLoanForPayment.currency || 'USD';
+                const rem = getLoanRemaining(selectedLoanForPayment);
+                const payAmt = Number(paymentAmount) || 0;
+                const feeVal = Math.min(payAmt, Math.max(0, Number(paymentFee) || 0));
+                const monthlyRate = Number(selectedLoanForPayment.interestRate || 0) > 0
+                  ? (Number(selectedLoanForPayment.interestRate) / 100) / 12
+                  : 0;
+                const estInterest = Math.min(Math.max(0, payAmt - feeVal), Math.round(rem * monthlyRate * 100) / 100);
+                const estPrincipal = Math.min(rem, Math.max(0, Math.round((payAmt - feeVal - estInterest) * 100) / 100));
+                const newRemaining = Math.max(0, Math.round((rem - estPrincipal) * 100) / 100);
+                return (
                 <div 
                   className="p-3.5 rounded-xl border border-emerald-500/30 text-xs space-y-1.5"
                   style={{ background: 'rgba(16, 185, 129, 0.08)' }}
                 >
                   <div className="flex items-center justify-between text-slate-200">
-                    <span>New Remaining Balance:</span>
-                    <span className="font-bold text-emerald-400">
-                      {formatCurrency(Math.max(0, getLoanRemaining(selectedLoanForPayment) - Number(paymentAmount)))}
-                    </span>
+                    <span>Principal ({selectedLoanForPayment.type === 'to_pay' ? 'reduces liability' : 'reduces receivable'}):</span>
+                    <span className="font-semibold text-cyan-300">{formatCurrency(estPrincipal, cur)}</span>
                   </div>
                   <div className="flex items-center justify-between text-slate-200">
-                    <span>Next Due Date:</span>
-                    <span className="font-medium text-white">
-                      {selectedLoanForPayment.nextPaymentDate ? formatDate(selectedLoanForPayment.nextPaymentDate) : 'Advancing by 1 month'}
-                    </span>
+                    <span>Interest ({selectedLoanForPayment.type === 'to_pay' ? 'P&L interest expense' : 'P&L interest income'}):</span>
+                    <span className="font-semibold text-amber-300">{formatCurrency(estInterest, cur)}</span>
+                  </div>
+                  {feeVal > 0 && (
+                    <div className="flex items-center justify-between text-slate-200">
+                      <span>Fees:</span>
+                      <span className="font-semibold text-slate-300">{formatCurrency(feeVal, cur)}</span>
+                    </div>
+                  )}
+                  <div className="flex items-center justify-between text-slate-200 pt-1 border-t border-emerald-500/20">
+                    <span>New Remaining Principal:</span>
+                    <span className="font-bold text-emerald-400">{formatCurrency(newRemaining, cur)}</span>
                   </div>
                   <div className="flex items-center gap-1.5 text-emerald-300 pt-1 border-t border-emerald-500/20">
                     <Lock className="size-3 text-emerald-400" />
                     <span>Enforced Lock: Loan will be marked as paid for {currentMonthName} to prevent duplicate payments.</span>
                   </div>
                 </div>
-              )}
+                );
+              })()}
             </div>
           )}
 
@@ -1891,25 +1893,39 @@ export function LoansView() {
             </DialogDescription>
           </DialogHeader>
 
-          {selectedLoanForHistory && (
+          {selectedLoanForHistory && (() => {
+            const loanCur = selectedLoanForHistory.currency || 'USD';
+            const scheduleTotalInterest = Math.round(
+              amortizationSchedule.reduce((s, r) => s + r.interestPart, 0) * 100,
+            ) / 100;
+            const displayTotalInterest =
+              amortizationSchedule.length > 0
+                ? scheduleTotalInterest
+                : (selectedLoanForHistory.totalInterest ?? 0);
+            const displayTotalRepayment = Math.round(
+              (selectedLoanForHistory.principal + displayTotalInterest) * 100,
+            ) / 100;
+            return (
             <div className="space-y-4 py-2">
               {/* Loan Summary Metrics Banner */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-3.5 rounded-xl bg-slate-900/70 border border-slate-800 text-xs">
                 <div>
                   <span className="text-slate-400 block text-[10px] uppercase tracking-wider">Loan Principal</span>
-                  <span className="font-bold text-white text-sm">{formatCurrency(selectedLoanForHistory.principal)}</span>
+                  <span className="font-bold text-white text-sm">{formatCurrency(selectedLoanForHistory.principal, loanCur)}</span>
                 </div>
                 <div>
-                  <span className="text-slate-400 block text-[10px] uppercase tracking-wider">12% Total Interest</span>
-                  <span className="font-bold text-amber-400 text-sm">{formatCurrency(selectedLoanForHistory.totalInterest || 6618.55)}</span>
+                  <span className="text-slate-400 block text-[10px] uppercase tracking-wider">
+                    {selectedLoanForHistory.interestRate ?? 0}% Total Interest
+                  </span>
+                  <span className="font-bold text-amber-400 text-sm">{formatCurrency(displayTotalInterest, loanCur)}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block text-[10px] uppercase tracking-wider">Total Repayment</span>
-                  <span className="font-bold text-cyan-400 text-sm">{formatCurrency(selectedLoanForHistory.principal + (selectedLoanForHistory.totalInterest || 6618.55))}</span>
+                  <span className="font-bold text-cyan-400 text-sm">{formatCurrency(displayTotalRepayment, loanCur)}</span>
                 </div>
                 <div>
                   <span className="text-slate-400 block text-[10px] uppercase tracking-wider">Remaining Principal</span>
-                  <span className="font-bold text-emerald-400 text-sm">{formatCurrency(selectedLoanForHistory.remainingBalance ?? 92115.12)}</span>
+                  <span className="font-bold text-emerald-400 text-sm">{formatCurrency(getLoanRemaining(selectedLoanForHistory), loanCur)}</span>
                 </div>
               </div>
 
@@ -2016,17 +2032,21 @@ export function LoansView() {
                       >
                         <div className="space-y-1">
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-bold text-white">{formatCurrency(p.amount)}</span>
+                            <span className="text-sm font-bold text-white">{formatCurrency(p.amount, loanCur)}</span>
                             <span className="text-[10px] bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-semibold">
                               Month: {p.paymentMonth}
                             </span>
-                            <span className="text-xs text-cyan-400 font-medium">Principal: {formatCurrency(p.principalPart || 7884.88)}</span>
-                            <span className="text-xs text-amber-400 font-medium">• Interest: {formatCurrency(p.interestPart || 1000)}</span>
+                            <span className="text-xs text-cyan-400 font-medium">Principal: {formatCurrency(p.principalPart ?? p.amount, loanCur)}</span>
+                            <span className="text-xs text-amber-400 font-medium">• Interest: {formatCurrency(p.interestPart ?? 0, loanCur)}</span>
+                            {!!p.feePart && p.feePart > 0 && (
+                              <span className="text-xs text-slate-300 font-medium">• Fees: {formatCurrency(p.feePart, loanCur)}</span>
+                            )}
                             <span className="text-xs text-slate-400 capitalize">• {p.method?.replace('_', ' ') || 'Bank Transfer'}</span>
                           </div>
                           <p className="text-xs text-slate-400">
                             Paid on: <span className="text-slate-200">{formatDate(p.paidOn)}</span>
                             {p.reference && <span className="ml-2">| Ref: <code className="text-cyan-400">{p.reference}</code></span>}
+                            {p.journalEntryId && <span className="ml-2">| Journal: <code className="text-emerald-400">{p.journalEntryId}</code></span>}
                           </p>
                           {p.notes && <p className="text-xs text-slate-500 italic">"{p.notes}"</p>}
                         </div>
@@ -2041,7 +2061,8 @@ export function LoansView() {
                 </div>
               )}
             </div>
-          )}
+            );
+          })()}
 
           <DialogFooter>
             <button

@@ -329,7 +329,9 @@ export const organizationService = {
           accessRole,
           portalType: m.portal_type,
           status: m.status || 'pending',
-          department: m.role === 'owner' ? (tm?.department || m.department || 'Management') : (tm?.department || m.department || 'Development'),
+          department: m.role === 'owner' || m.role === 'admin'
+            ? (tm?.department || m.department || 'Owner / Admin')
+            : (tm?.department || m.department || ''),
           customRole: tm?.role || (m.role === 'owner' ? 'Organization Owner' : undefined),
           fixedSalary,
           assignedProjects,

@@ -708,7 +708,7 @@ export function createOrganizationRouter(): Router {
             name: profile?.full_name || 'Member',
             email: profile?.email || '',
             role: resolvedAccessRole || 'employee',
-            department: updates.department || 'Development',
+            department: updates.department || null,
             status: 'active',
             joined_at: new Date().toISOString(),
             salary: Number(targetSalary || 0),
@@ -847,7 +847,8 @@ export function createOrganizationRouter(): Router {
       return { email: '', success: false, error: 'Email is required' };
     }
 
-    const assignedDept = item.department?.trim() || 'Development';
+    // Handoff §12.1 / §33 #9: Do not fabricate 'Development' department when invitee has no department assigned
+    const assignedDept = item.department?.trim() || null;
     const positionTitle = item.position?.trim() || ''; // Job title (UI/UX Designer, etc.)
     const roleInput = item.role?.trim() || 'employee';
 
@@ -908,23 +909,26 @@ export function createOrganizationRouter(): Router {
 
         // Resolve real department_id so headcount for overhead allocation is automatically linked
         let matchedDeptId: string | null = null;
-        try {
-          const { data: deptRows } = await sb
-            .from('departments')
-            .select('id, name')
-            .eq('organization_id', orgKey);
-          if (deptRows && deptRows.length > 0) {
-            const match = deptRows.find(
-              (d: any) =>
-                d.id === assignedDept ||
-                d.name.toLowerCase() === assignedDept.toLowerCase() ||
-                d.name.toLowerCase().includes(assignedDept.toLowerCase()) ||
-                assignedDept.toLowerCase().includes(d.name.toLowerCase())
-            );
-            if (match) matchedDeptId = match.id;
+        if (assignedDept) {
+          try {
+            const { data: deptRows } = await sb
+              .from('departments')
+              .select('id, name')
+              .eq('organization_id', orgKey);
+            if (deptRows && deptRows.length > 0) {
+              const lowerAssigned = assignedDept.toLowerCase();
+              const match = deptRows.find(
+                (d: any) =>
+                  d.id === assignedDept ||
+                  d.name.toLowerCase() === lowerAssigned ||
+                  d.name.toLowerCase().includes(lowerAssigned) ||
+                  lowerAssigned.includes(d.name.toLowerCase())
+              );
+              if (match) matchedDeptId = match.id;
+            }
+          } catch {
+            /* ignore */
           }
-        } catch {
-          /* ignore */
         }
 
         if (existingSbUser) {
@@ -1507,7 +1511,7 @@ export function createOrganizationRouter(): Router {
             email: m.email,
             phone: m.phone || '',
             role: m.role,
-            department: m.department || 'Development',
+            department: m.department || '',
             joinedAt: m.joined_at || new Date().toISOString(),
             status: m.status || 'active',
             isPending: m.status === 'pending',
@@ -1535,7 +1539,7 @@ export function createOrganizationRouter(): Router {
               email: profile?.email || '',
               phone: resolvedPhone,
               role: m.role === 'owner' ? 'Organization Owner' : m.role === 'admin' ? 'Admin' : (m.position || 'Team Member'),
-              department: m.department || (m.role === 'owner' ? 'Management' : 'Development'),
+              department: m.department || (m.role === 'owner' || m.role === 'admin' ? 'Owner / Admin' : ''),
               joinedAt: m.joined_at || new Date().toISOString(),
               status: m.status || 'active',
               isPending: m.status === 'pending',

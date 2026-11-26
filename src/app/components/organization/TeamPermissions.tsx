@@ -1250,11 +1250,15 @@ export function TeamPermissions() {
                     {member.customRole}
                   </span>
                 )}
-                {member.department && (
+                {member.orgRole === 'owner' || member.orgRole === 'admin' ? (
+                  <span className="px-2.5 py-0.5 rounded-lg text-xs font-mono font-semibold text-purple-300 bg-purple-500/15 border border-purple-500/30">
+                    {member.orgRole === 'owner' ? 'Owner / Admin' : 'Admin'}
+                  </span>
+                ) : member.department ? (
                   <span className="px-2.5 py-0.5 rounded-lg text-xs font-mono text-slate-300 bg-slate-800/80 border border-slate-700/60">
                     {member.department}
                   </span>
-                )}
+                ) : null}
               </div>
 
               {/* Monthly Logged Hours for this member (not shown for Organization Owner) */}
